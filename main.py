@@ -59,7 +59,7 @@ conn.commit()
 @bot.command(name='gif')
 async def gif(ctx):
     if not ctx.message.attachments:
-        await ctx.send("❌ Пожалуйста, прикрепи изображение или видео к команде.")
+        await ctx.send("Пожалуйста, прикрепи изображение или видео к команде.")
         return
 
     image_files = []
