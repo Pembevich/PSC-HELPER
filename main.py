@@ -14,6 +14,7 @@ from datetime import datetime
 import requests
 from moviepy.editor import VideoFileClip, ImageSequenceClip
 
+allowed_role_ids = [1340596390614532127, 1341204231419461695]  # <- замени на ID ролей
 allowed_guild_ids = [1340594372596469872]  # Укажи нужные ID серверов
 sbor_channels = {}  # guild_id -> channel_id
 
@@ -114,11 +115,16 @@ async def gif(ctx):
 
 
 # --- /sbor ---
-@bot.tree.command(name="sbor", description="Начать сбор: создаёт голосовой канал и пингует роль")
+@app_commands.command(name="sbor", description="Начать сбор: создаёт голосовой канал и пингует роль")
 @app_commands.describe(role="Роль, которую нужно пинговать")
 async def sbor(interaction: discord.Interaction, role: discord.Role):
     if interaction.guild.id not in allowed_guild_ids:
         await interaction.response.send_message("❌ Команда недоступна на этом сервере.", ephemeral=True)
+        return
+
+    # Проверка ролей пользователя
+    if not any(role.id in allowed_role_ids for role in interaction.user.roles):
+        await interaction.response.send_message("❌ У тебя нет прав для этой команды.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -152,12 +158,17 @@ async def sbor(interaction: discord.Interaction, role: discord.Role):
     await webhook.delete()
 
     await interaction.followup.send("✅ Сбор создан!")
-
+    
 # --- /sbor_end ---
-@bot.tree.command(name="sbor_end", description="Завершить сбор и удалить голосовой канал")
+@app_commands.command(name="sbor_end", description="Завершить сбор и удалить голосовой канал")
 async def sbor_end(interaction: discord.Interaction):
     if interaction.guild.id not in allowed_guild_ids:
         await interaction.response.send_message("❌ Команда недоступна на этом сервере.", ephemeral=True)
+        return
+
+    # Проверка ролей пользователя
+    if not any(role.id in allowed_role_ids for role in interaction.user.roles):
+        await interaction.response.send_message("❌ У тебя нет прав для этой команды.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
