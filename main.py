@@ -20,6 +20,7 @@ sbor_channels = {}  # guild_id -> channel_id
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
+tree = app_commands.CommandTree(bot)
 
 # --- База данных ---
 conn = sqlite3.connect("bot_data.db")
@@ -158,7 +159,7 @@ async def sbor(interaction: discord.Interaction, role: discord.Role):
     await webhook.delete()
 
     await interaction.followup.send("✅ Сбор создан!")
-bot.tree.add_command(sbor)
+tree.add_command(sbor)
 
 # --- /sbor_end ---
 @app_commands.command(name="sbor_end", description="Завершить сбор и удалить голосовой канал")
@@ -193,7 +194,7 @@ async def sbor_end(interaction: discord.Interaction):
 
     sbor_channels.pop(interaction.guild.id, None)
     await interaction.followup.send("✅ Сбор завершён.")
-bot.tree.add_command(sbor_end)
+tree.add_command(sbor_end)
 
 # --- on_ready ---
 @bot.event
@@ -202,7 +203,7 @@ async def on_ready():
     for guild_id in allowed_guild_ids:
         try:
             guild = discord.Object(id=guild_id)
-            await bot.tree.sync(guild=guild)
+            await tree.sync(guild=guild)
             print(f"✅ Команды синхронизированы с сервером {guild_id}")
         except Exception as e:
             print(f"❌ Ошибка при синхронизации: {e}")
