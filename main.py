@@ -158,7 +158,8 @@ async def sbor(interaction: discord.Interaction, role: discord.Role):
     await webhook.delete()
 
     await interaction.followup.send("✅ Сбор создан!")
-    
+bot.tree.add_command(sbor)
+
 # --- /sbor_end ---
 @app_commands.command(name="sbor_end", description="Завершить сбор и удалить голосовой канал")
 async def sbor_end(interaction: discord.Interaction):
@@ -192,13 +193,19 @@ async def sbor_end(interaction: discord.Interaction):
 
     sbor_channels.pop(interaction.guild.id, None)
     await interaction.followup.send("✅ Сбор завершён.")
+bot.tree.add_command(sbor_end)
 
 # --- on_ready ---
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
     print(f"✅ Бот запущен как {bot.user}")
-
+    for guild_id in allowed_guild_ids:
+        try:
+            guild = discord.Object(id=guild_id)
+            await bot.tree.sync(guild=guild)
+            print(f"✅ Команды синхронизированы с сервером {guild_id}")
+        except Exception as e:
+            print(f"❌ Ошибка при синхронизации: {e}")
 # --- Проверка шаблона и бан ---
 target_channel_id = 1349726325052538900
 
@@ -291,5 +298,5 @@ async def on_message(message):
             await send_error_embed(message.channel, message.author, f"Не удалось забанить пользователя: {e}", template)
 
     await bot.process_commands(message)
-
+    
 bot.run(os.getenv("DISCORD_TOKEN"))
