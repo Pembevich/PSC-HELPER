@@ -122,8 +122,8 @@ async def sbor(interaction: discord.Interaction, role: discord.Role):
         await interaction.response.send_message("❌ Команда недоступна на этом сервере.", ephemeral=True)
         return
 
-    # Проверка ролей пользователя
-    if not any(role.id in allowed_role_ids for role in interaction.user.roles):
+    member = interaction.guild.get_member(interaction.user.id)
+    if not member or not any(r.id in allowed_role_ids for r in member.roles):
         await interaction.response.send_message("❌ У тебя нет прав для этой команды.", ephemeral=True)
         return
 
@@ -166,8 +166,8 @@ async def sbor_end(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Команда недоступна на этом сервере.", ephemeral=True)
         return
 
-    # Проверка ролей пользователя
-    if not any(role.id in allowed_role_ids for role in interaction.user.roles):
+    member = interaction.guild.get_member(interaction.user.id)
+    if not member or not any(r.id in allowed_role_ids for r in member.roles):
         await interaction.response.send_message("❌ У тебя нет прав для этой команды.", ephemeral=True)
         return
 
