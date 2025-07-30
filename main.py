@@ -11,51 +11,45 @@ import re
 import asyncio
 from discord import Embed, Color
 from datetime import datetime
-import requests
 from moviepy.editor import VideoFileClip, ImageSequenceClip
 
-allowed_role_ids = [1340596390614532127, 1341204231419461695]  # <- замени на ID ролей
-allowed_guild_ids = [1340594372596469872]  # Укажи нужные ID серверов
-sbor_channels = {}  # guild_id -> channel_id
+# Конфиги
+allowed_role_ids = [1340596390614532127, 1341204231419461695]
+allowed_guild_ids = [1340594372596469872]
+sbor_channels = {}
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = app_commands.CommandTree(bot)
 
-# --- База данных ---
+# База данных
+os.makedirs("temp", exist_ok=True)
 conn = sqlite3.connect("bot_data.db")
 c = conn.cursor()
 
-c.execute('''
-CREATE TABLE IF NOT EXISTS entries (
+c.execute('''CREATE TABLE IF NOT EXISTS entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT,
     description TEXT
-)
-''')
+)''')
 
-c.execute('''
-CREATE TABLE IF NOT EXISTS private_chats (
+c.execute('''CREATE TABLE IF NOT EXISTS private_chats (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user1_id INTEGER,
     user2_id INTEGER,
     password TEXT
-)
-''')
+)''')
 
-c.execute('''
-CREATE TABLE IF NOT EXISTS chat_messages (
+c.execute('''CREATE TABLE IF NOT EXISTS chat_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER,
     sender_id INTEGER,
     message TEXT,
     file BLOB,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-)
-''')
+)''')
 
 conn.commit()
-
 
 # --- Команда !gif ---
 @bot.command(name='gif')
@@ -67,18 +61,14 @@ async def gif(ctx):
     image_files = []
     video_files = []
 
-    os.makedirs("temp", exist_ok=True)
-
     for attachment in ctx.message.attachments:
         filename = attachment.filename
         ext = os.path.splitext(filename)[1].lower().strip(".")
-
-        # Генерируем уникальное имя файла
         unique_name = f"{uuid.uuid4().hex}.{ext}"
         file_path = os.path.join("temp", unique_name)
         await attachment.save(file_path)
 
-        if ext in ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'heic']:
+        if ext in ['jpg', 'jpeg', 'png', 'webp', 'bmp']:
             image_files.append(file_path)
         elif ext in ['mp4', 'mov', 'webm', 'avi', 'mkv']:
             video_files.append(file_path)
@@ -95,7 +85,7 @@ async def gif(ctx):
             clip.write_gif(output_path, fps=1)
         elif video_files:
             clip = VideoFileClip(video_files[0])
-            clip = clip.subclip(0, min(5, clip.duration))  # максимум 5 сек
+            clip = clip.subclip(0, min(5, clip.duration))
             clip.write_gif(output_path)
         else:
             await ctx.send("❌ Не удалось обработать вложения.")
@@ -107,16 +97,14 @@ async def gif(ctx):
         await ctx.send(f"❌ Ошибка при создании GIF: {e}")
 
     finally:
-        # Удаляем все временные файлы
         for f in image_files + video_files:
             if os.path.exists(f):
                 os.remove(f)
         if os.path.exists(output_path):
             os.remove(output_path)
 
-
 # --- /sbor ---
-@app_commands.command(name="sbor", description="Начать сбор: создаёт голосовой канал и пингует роль")
+@tree.command(name="sbor", description="Начать сбор: создаёт голосовой канал и пингует роль")
 @app_commands.describe(role="Роль, которую нужно пинговать")
 async def sbor(interaction: discord.Interaction, role: discord.Role):
     if interaction.guild.id not in allowed_guild_ids:
@@ -129,10 +117,9 @@ async def sbor(interaction: discord.Interaction, role: discord.Role):
         return
 
     await interaction.response.defer(ephemeral=True)
-
-    existing = discord.utils.get(interaction.guild.voice_channels, name="сбор")
+    existing = discord.utils.get(interaction.guild.voice_channels, name="Сбор")
     if existing:
-        await interaction.followup.send("❗ Канал 'сбор' уже существует.")
+        await interaction.followup.send("❗ Канал 'Сбор' уже существует.")
         return
 
     overwrites = {
@@ -159,10 +146,9 @@ async def sbor(interaction: discord.Interaction, role: discord.Role):
     await webhook.delete()
 
     await interaction.followup.send("✅ Сбор создан!")
-tree.add_command(sbor)
 
 # --- /sbor_end ---
-@app_commands.command(name="sbor_end", description="Завершить сбор и удалить голосовой канал")
+@tree.command(name="sbor_end", description="Завершить сбор и удалить голосовой канал")
 async def sbor_end(interaction: discord.Interaction):
     if interaction.guild.id not in allowed_guild_ids:
         await interaction.response.send_message("❌ Команда недоступна на этом сервере.", ephemeral=True)
@@ -194,7 +180,6 @@ async def sbor_end(interaction: discord.Interaction):
 
     sbor_channels.pop(interaction.guild.id, None)
     await interaction.followup.send("✅ Сбор завершён.")
-tree.add_command(sbor_end)
 
 # --- on_ready ---
 @bot.event
@@ -207,12 +192,12 @@ async def on_ready():
             print(f"✅ Команды синхронизированы с сервером {guild_id}")
         except Exception as e:
             print(f"❌ Ошибка при синхронизации: {e}")
+
 # --- Проверка шаблона и бан ---
 target_channel_id = 1349726325052538900
 
 async def send_error_embed(channel, author, error_text, example_template):
     now = datetime.now().strftime("%d.%m.%Y %H:%M:%S МСК")
-
     embed = Embed(
         title="❌ Ошибка отправки отчёта",
         description=error_text,
@@ -220,7 +205,6 @@ async def send_error_embed(channel, author, error_text, example_template):
     )
     embed.add_field(name="📝 Как оформить правильно", value=f"```{example_template}```", inline=False)
     embed.set_footer(text=f"Вызвал: {author.name} | ID: {author.id} | {now}")
-
     await channel.send(embed=embed)
 
 @bot.event
@@ -240,8 +224,7 @@ async def on_message(message):
         lines = [line.strip() for line in message.content.strip().split("\n") if line.strip()]
         if len(lines) != 5:
             await send_error_embed(message.channel, message.author, "Неверное количество строк.", template)
-            await bot.process_commands(message)
-            return
+            return await bot.process_commands(message)
 
         nickname_line, id_line, time_line, reason_line, evidence_line = lines
 
@@ -251,22 +234,19 @@ async def on_message(message):
             or not reason_line.lower().startswith("причина:") \
             or not evidence_line.lower().startswith("док-ва:"):
             await send_error_embed(message.channel, message.author, "Некорректный шаблон.", template)
-            await bot.process_commands(message)
-            return
+            return await bot.process_commands(message)
 
         try:
             user_id = int(id_line.split(":", 1)[1].strip())
         except ValueError:
             await send_error_embed(message.channel, message.author, "`Дс айди` должен быть числом.", template)
-            await bot.process_commands(message)
-            return
+            return await bot.process_commands(message)
 
         time_text = time_line.split(":", 1)[1].strip().lower()
         reason = reason_line.split(":", 1)[1].strip()
 
-        # Поддержка Perm
         if time_text == "perm":
-            total_seconds = None  # Перманентный бан
+            total_seconds = None
         else:
             h_match = re.search(r"(\d+)\s*h", time_text)
             m_match = re.search(r"(\d+)\s*min", time_text)
@@ -278,26 +258,22 @@ async def on_message(message):
                 total_seconds += int(m_match.group(1)) * 60
 
             if total_seconds == 0:
-                await send_error_embed(message.channel, message.author, "Некорректное время. Укажи `Perm` или формат вида `1h 30min`.", template)
-                await bot.process_commands(message)
-                return
+                await send_error_embed(message.channel, message.author, "Некорректное время.", template)
+                return await bot.process_commands(message)
 
         try:
-            # Бан по ID, даже если пользователя нет на сервере
             await message.guild.ban(discord.Object(id=user_id), reason=reason)
             await message.add_reaction("✅")
 
-            # Отложенный разбан (если не перманентный)
             if total_seconds:
                 async def unban_later():
                     await asyncio.sleep(total_seconds)
                     await message.guild.unban(discord.Object(id=user_id), reason="Время бана истекло")
-
                 bot.loop.create_task(unban_later())
 
         except Exception as e:
-            await send_error_embed(message.channel, message.author, f"Не удалось забанить пользователя: {e}", template)
+            await send_error_embed(message.channel, message.author, f"Не удалось забанить: {e}", template)
 
     await bot.process_commands(message)
-    
+
 bot.run(os.getenv("DISCORD_TOKEN"))
