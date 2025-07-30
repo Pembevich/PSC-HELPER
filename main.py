@@ -211,7 +211,7 @@ async def on_message(message):
         return
 
     if message.channel.id == FORM_CHANNEL_ID:
-        template = "1. Ваш никнейм\n2. Ваш ID\n3. got или cesu"
+        template = "1. Ваш никнейм\n2. Ваш Дискорд Ник\n3. got или cesu"
         lines = [line.strip() for line in message.content.strip().split("\n") if line.strip()]
         if len(lines) != 3:
             await message.reply(embed=Embed(title="❌ Неверный шаблон", description="Форма должна содержать 3 строки.", color=Color.red()).add_field(name="Пример", value=f"```{template}```"))
