@@ -289,99 +289,136 @@ async def on_message(message):
             await send_error_embed(message.channel, message.author, f"Не удалось забанить пользователя: {e}", template)
 
     await bot.process_commands(message)
-# ID канала с формами
-form_channel_id = 1394506194890260612
+# Константы
+FORM_CHANNEL_ID = 1394506194890260612
+GOT_CHANNEL_ID = 1394635110665556009
+GOT_ROLE_ID = 1341041194733670401
+GOT_ROLE_REWARDS = [1341040784723411017, 1341040871562285066]
 
+CESU_CHANNEL_ID = 1394635216986964038
+CESU_ROLE_ID = 1341040607728107591
+CESU_ROLE_REWARDS = [1341100562783014965, 1341039967555551333]
 # --- Обработка форм (got / cesu) ---
-class ConfirmationView(View):
-    def __init__(self, target_user_id, keyword, message):
+class ConfirmView(ui.View):
+    def __init__(self, user_id, target_message, squad_name, role_ids, interaction_channel, target_user_id):
         super().__init__(timeout=None)
+        self.user_id = user_id
+        self.message = target_message
+        self.squad_name = squad_name
+        self.role_ids = role_ids
+        self.interaction_channel = interaction_channel
         self.target_user_id = target_user_id
-        self.keyword = keyword
-        self.message = message
 
-    @discord.ui.button(label="Принять", style=discord.ButtonStyle.success, emoji="✅")
-    async def accept(self, interaction: discord.Interaction, button: Button):
-        guild = interaction.guild
-        member = guild.get_member(self.target_user_id)
-        if not member:
-            await interaction.response.send_message("❌ Участник не найден.", ephemeral=True)
-            return
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if any(role.id == self.user_id for role in interaction.user.roles):
+            return True
+        await interaction.response.send_message("❌ У тебя нет прав нажимать эту кнопку.", ephemeral=True)
+        return False
 
-        # Выдача ролей
-        if self.keyword == "got":
-            role_ids = [1341040784723411017, 1341040871562285066]
-            team_name = "G.o.T"
-        else:
-            role_ids = [1341100562783014965, 1341039967555551333]
-            team_name = "C.E.S.U."
+    @ui.button(label="Принять", style=discord.ButtonStyle.green)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        target_member = interaction.guild.get_member(self.target_user_id)
+        if target_member:
+            for role_id in self.role_ids:
+                role = interaction.guild.get_role(role_id)
+                if role:
+                    await target_member.add_roles(role)
 
-        for role_id in role_ids:
-            role = guild.get_role(role_id)
-            if role:
-                await member.add_roles(role)
-
-        embed = Embed(
-            title="✅ Принятие в отряд",
-            description=f"Вы зачислены в отряд **{team_name}**!",
-            color=discord.Color.green()
-        )
-        await self.message.reply(embed=embed)
-        await interaction.response.send_message("Успешно принято.", ephemeral=True)
+            await self.message.reply(embed=Embed(
+                title="✅ Принято",
+                description=f"Вы зачислены в отряд **{self.squad_name}**!",
+                color=Color.green()
+            ))
+        await interaction.response.send_message("Участник принят.", ephemeral=True)
         self.stop()
 
-    @discord.ui.button(label="Отказать", style=discord.ButtonStyle.danger, emoji="❌")
-    async def decline(self, interaction: discord.Interaction, button: Button):
-        await self.message.add_reaction("❌")
-        await interaction.response.send_message("Отказано.", ephemeral=True)
+    @ui.button(label="Отказать", style=discord.ButtonStyle.red)
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await self.message.add_reaction("❌")
+        except:
+            pass
+        await interaction.response.send_message("Отказ зарегистрирован.", ephemeral=True)
         self.stop()
 
-# Функция для проверки слова
-def extract_keyword(text):
-    cleaned = re.sub(r'[^a-zA-Z]', '', text).lower()
-    return cleaned if cleaned in ['got', 'cesu'] else None
+
+def extract_clean_keyword(text: str):
+    cleaned = re.sub(r"[^a-z]", "", text.lower())
+    return cleaned
+
+
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    # Обработка форм в канале
-    if message.channel.id == form_channel_id:
-        lines = [line.strip() for line in message.content.split("\n") if line.strip()]
-        if len(lines) < 3:
-            embed = Embed(
-                title="❌ Ошибка формы",
-                description="Недостаточно пунктов. Убедитесь, что вы указали минимум 3 строки.",
-                color=discord.Color.red()
-            )
-            embed.add_field(name="Пример", value="1. Текст\n2. Текст\n3. got", inline=False)
-            await message.reply(embed=embed)
-            return
+    if message.channel.id != FORM_CHANNEL_ID:
+        return
 
-        keyword = extract_keyword(lines[2])
-        if keyword not in ['got', 'cesu']:
-            embed = Embed(
-                title="❌ Ошибка в третьем пункте",
-                description="Указано неверное значение. Разрешены только `got` или `cesu` (без других букв).",
-                color=discord.Color.red()
-            )
-            embed.add_field(name="Пример", value="3. got\nили\n3. cesu", inline=False)
-            await message.reply(embed=embed)
-            return
+    template = (
+        "1. Ваш никнейм\n"
+        "2. Ваш ID\n"
+        "3. got или cesu"
+    )
 
-        # Отряд и роль для пинга
-        ping_role_id = 1341041194733670401 if keyword == "got" else 1341040607728107591
-        ping_role = message.guild.get_role(ping_role_id)
+    lines = [line.strip() for line in message.content.strip().split("\n") if line.strip()]
+    if len(lines) != 3:
+        await message.reply(embed=Embed(
+            title="❌ Неверный шаблон",
+            description="Форма должна содержать 3 строки.",
+            color=Color.red()
+        ).add_field(name="Пример", value=f"```{template}```"))
+        return
 
-        embed = Embed(
-            title="📥 Подтверждение зачисления",
-            description=f"Подтвердите зачисление <@{message.author.id}> в отряд.",
-            color=discord.Color.blurple()
-        )
-        view = ConfirmationView(message.author.id, keyword, message)
-        await message.channel.send(content=f"{ping_role.mention}", embed=embed, view=view)
+    user_line = lines[0]
+    id_line = lines[1]
+    choice_line = extract_clean_keyword(lines[2])
 
-    await bot.process_commands(message)
+    if choice_line == "got":
+        role_id = GOT_ROLE_ID
+        view_channel_id = GOT_CHANNEL_ID
+        role_rewards = GOT_ROLE_REWARDS
+        squad = "G.o.T"
+    elif choice_line == "cesu":
+        role_id = CESU_ROLE_ID
+        view_channel_id = CESU_CHANNEL_ID
+        role_rewards = CESU_ROLE_REWARDS
+        squad = "C.E.S.U"
+    else:
+        await message.reply(embed=Embed(
+            title="❌ Неизвестный отряд",
+            description="Третий пункт должен содержать **только** `got` или `cesu`.",
+            color=Color.red()
+        ).add_field(name="Пример", value=f"```{template}```"))
+        return
+
+    target_channel = message.guild.get_channel(view_channel_id)
+    role_ping = message.guild.get_role(role_id)
+
+    if not target_channel or not role_ping:
+        await message.reply("❌ Ошибка конфигурации канала или роли.")
+        return
+
+    embed = Embed(
+        title=f"📋 Подтверждение вступления в отряд {squad}",
+        description=(
+            f"Пользователь {message.author.mention} подал заявку на вступление в отряд **{squad}**.\n"
+            f"Никнейм: `{user_line}`\nID: `{id_line}`"
+        ),
+        color=Color.blue()
+    )
+    embed.set_footer(text=f"ID пользователя: {message.author.id} | {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
+
+    view = ConfirmView(
+        user_id=role_id,
+        target_message=message,
+        squad_name=squad,
+        role_ids=role_rewards,
+        interaction_channel=target_channel,
+        target_user_id=message.author.id
+    )
+
+    await target_channel.send(content=role_ping.mention, embed=embed, view=view)
 
 bot.run(os.getenv("DISCORD_TOKEN"))
