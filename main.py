@@ -11,6 +11,7 @@ import asyncio
 from discord import Embed, Color
 from datetime import datetime
 from moviepy.editor import VideoFileClip, ImageSequenceClip
+from discord.ui import View, Button
 
 allowed_role_ids = [1340596390614532127, 1341204231419461695]
 allowed_guild_ids = [1340594372596469872]
@@ -286,6 +287,100 @@ async def on_message(message):
 
         except Exception as e:
             await send_error_embed(message.channel, message.author, f"Не удалось забанить пользователя: {e}", template)
+
+    await bot.process_commands(message)
+# ID канала с формами
+form_channel_id = 1394506194890260612
+
+# --- Обработка форм (got / cesu) ---
+class ConfirmationView(View):
+    def __init__(self, target_user_id, keyword, message):
+        super().__init__(timeout=None)
+        self.target_user_id = target_user_id
+        self.keyword = keyword
+        self.message = message
+
+    @discord.ui.button(label="Принять", style=discord.ButtonStyle.success, emoji="✅")
+    async def accept(self, interaction: discord.Interaction, button: Button):
+        guild = interaction.guild
+        member = guild.get_member(self.target_user_id)
+        if not member:
+            await interaction.response.send_message("❌ Участник не найден.", ephemeral=True)
+            return
+
+        # Выдача ролей
+        if self.keyword == "got":
+            role_ids = [1341040784723411017, 1341040871562285066]
+            team_name = "G.o.T"
+        else:
+            role_ids = [1341100562783014965, 1341039967555551333]
+            team_name = "C.E.S.U."
+
+        for role_id in role_ids:
+            role = guild.get_role(role_id)
+            if role:
+                await member.add_roles(role)
+
+        embed = Embed(
+            title="✅ Принятие в отряд",
+            description=f"Вы зачислены в отряд **{team_name}**!",
+            color=discord.Color.green()
+        )
+        await self.message.reply(embed=embed)
+        await interaction.response.send_message("Успешно принято.", ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="Отказать", style=discord.ButtonStyle.danger, emoji="❌")
+    async def decline(self, interaction: discord.Interaction, button: Button):
+        await self.message.add_reaction("❌")
+        await interaction.response.send_message("Отказано.", ephemeral=True)
+        self.stop()
+
+# Функция для проверки слова
+def extract_keyword(text):
+    cleaned = re.sub(r'[^a-zA-Z]', '', text).lower()
+    return cleaned if cleaned in ['got', 'cesu'] else None
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    # Обработка форм в канале
+    if message.channel.id == form_channel_id:
+        lines = [line.strip() for line in message.content.split("\n") if line.strip()]
+        if len(lines) < 3:
+            embed = Embed(
+                title="❌ Ошибка формы",
+                description="Недостаточно пунктов. Убедитесь, что вы указали минимум 3 строки.",
+                color=discord.Color.red()
+            )
+            embed.add_field(name="Пример", value="1. Текст\n2. Текст\n3. got", inline=False)
+            await message.reply(embed=embed)
+            return
+
+        keyword = extract_keyword(lines[2])
+        if keyword not in ['got', 'cesu']:
+            embed = Embed(
+                title="❌ Ошибка в третьем пункте",
+                description="Указано неверное значение. Разрешены только `got` или `cesu` (без других букв).",
+                color=discord.Color.red()
+            )
+            embed.add_field(name="Пример", value="3. got\nили\n3. cesu", inline=False)
+            await message.reply(embed=embed)
+            return
+
+        # Отряд и роль для пинга
+        ping_role_id = 1341041194733670401 if keyword == "got" else 1341040607728107591
+        ping_role = message.guild.get_role(ping_role_id)
+
+        embed = Embed(
+            title="📥 Подтверждение зачисления",
+            description=f"Подтвердите зачисление <@{message.author.id}> в отряд.",
+            color=discord.Color.blurple()
+        )
+        view = ConfirmationView(message.author.id, keyword, message)
+        await message.channel.send(content=f"{ping_role.mention}", embed=embed, view=view)
 
     await bot.process_commands(message)
 
