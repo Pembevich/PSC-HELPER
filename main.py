@@ -246,6 +246,7 @@ async def on_message(message):
         await target_channel.send(content=role_ping.mention, embed=embed, view=view)
 
     await bot.process_commands(message)
+form_channel_id = 1349725568371003392
 @bot.event
 async def on_message(message):
     if message.author.bot:
