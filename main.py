@@ -273,6 +273,23 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
+    # --- PSC EMBED СООБЩЕНИЯ ---
+    PSC_CHANNEL_ID = 1340998084238381137
+    PSC_LOGO_PATH = https://message.style/cdn/images/b93fb259d01659bf11e7106ed14bc50d93e402eee01db0695894c4db083df204.jfif  # Убедись, что файл уже сохранён рядом с main.py
+
+    if message.channel.id == PSC_CHANNEL_ID:
+        await message.delete()
+
+        embed = Embed(
+            description=message.content,
+            color=Color.from_rgb(255, 255, 255)
+        )
+        embed.set_image(url="attachment://psc_logo.jpeg")
+        embed.set_footer(text=f"©Provision Security Complex | {datetime.now().strftime('%d.%m.%Y')}")
+
+        file = discord.File("psc_logo.jpeg", filename="psc_logo.jpeg")
+        await message.channel.send(embed=embed, file=file)
+        return
     # --- Обработка формы вступления ---
     if message.channel.id == FORM_CHANNEL_ID:
         template = "1. Ваш никнейм\n2. Ваш Дискорд Ник\n3. got или cesu"
