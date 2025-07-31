@@ -275,7 +275,7 @@ async def on_message(message):
 
     # --- PSC EMBED СООБЩЕНИЯ ---
     PSC_CHANNEL_ID = 1340998084238381137
-    PSC_LOGO_PATH = https://message.style/cdn/images/b93fb259d01659bf11e7106ed14bc50d93e402eee01db0695894c4db083df204.jfif  # Убедись, что файл уже сохранён рядом с main.py
+    PSC_LOGO_PATH = "photo-output.jpeg"  # Убедись, что файл уже сохранён рядом с main.py
 
     if message.channel.id == PSC_CHANNEL_ID:
         await message.delete()
