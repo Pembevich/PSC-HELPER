@@ -273,100 +273,101 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-    if message.channel.id != form_channel_id:
-        return
+    # --- Обработка формы вступления ---
+    if message.channel.id == FORM_CHANNEL_ID:
+        template = "1. Ваш никнейм\n2. Ваш Дискорд Ник\n3. got или cesu"
+        lines = [line.strip() for line in message.content.strip().split("\n") if line.strip()]
+        if len(lines) != 3:
+            await message.reply(embed=Embed(title="❌ Неверный шаблон", description="Форма должна содержать 3 строки.", color=Color.red()).add_field(name="Пример", value=f"```{template}```"))
+            return
 
-    template = (
-        "Никнейм: Robloxer228\n"
-        "Дискорд айди: 1234567890\n"
-        "Наказание: 1 выговор / 2 выговора / 1 страйк / 2 страйка\n"
-        "Причина: причина наказания\n"
-        "Док-ва: (по желанию)"
-    )
+        user_line, id_line, choice_line = lines
+        keyword = extract_clean_keyword(choice_line)
 
-    lines = [line.strip() for line in message.content.strip().split("\n") if line.strip()]
-    if len(lines) < 4 or len(lines) > 5:
-        await message.reply(embed=Embed(
-            title="❌ Ошибка",
-            description="Форма должна содержать 4 или 5 строк.",
-            color=Color.red()
-        ).add_field(name="Пример", value=f"```{template}```"))
-        return
-
-    try:
-        nickname = lines[0].split(":", 1)[1].strip()
-        user_id = int(lines[1].split(":", 1)[1].strip())
-        punishment = lines[2].split(":", 1)[1].strip().lower()
-        reason = lines[3].split(":", 1)[1].strip()
-    except:
-        await message.reply(embed=Embed(
-            title="❌ Ошибка в шаблоне",
-            description="Проверь правильность полей (особенно Discord ID)",
-            color=Color.red()
-        ).add_field(name="Пример", value=f"```{template}```"))
-        return
-
-    member = message.guild.get_member(user_id)
-    if not member:
-        await message.reply("❌ Пользователь с таким ID не найден на сервере.")
-        return
-
-    roles = member.roles
-    log = message.guild.get_channel(log_channel_id)
-
-    async def log_action(text):
-        if log:
-            await log.send(embed=Embed(title="📋 Лог наказаний", description=text, color=Color.orange()))
-
-    async def apply_roles(to_add, to_remove):
-        for r in to_remove:
-            if r in roles:
-                await member.remove_roles(r)
-        for r in to_add:
-            if r not in roles:
-                await member.add_roles(r)
-
-    punish_1 = message.guild.get_role(punishment_roles["1 выговор"])
-    punish_2 = message.guild.get_role(punishment_roles["2 выговора"])
-    strike_1 = message.guild.get_role(punishment_roles["1 страйк"])
-    strike_2 = message.guild.get_role(punishment_roles["2 страйка"])
-
-    # Проверка на увольнение (2 страйка + 2 выговора)
-    if all(r in roles for r in [punish_1, punish_2, strike_1, strike_2]):
-        if squad_roles["got_base"] in [r.id for r in roles]:
-            notify = message.guild.get_role(squad_roles["got_notify"])
-        elif squad_roles["cesu_base"] in [r.id for r in roles]:
-            notify = message.guild.get_role(squad_roles["cesu_notify"])
+        if keyword == "got":
+            role_id, channel_id, rewards, squad = GOT_ROLE_ID, GOT_CHANNEL_ID, GOT_ROLE_REWARDS, "G.o.T"
+        elif keyword == "cesu":
+            role_id, channel_id, rewards, squad = CESU_ROLE_ID, CESU_CHANNEL_ID, CESU_ROLE_REWARDS, "C.E.S.U"
         else:
-            notify = None
-        if notify:
-            await log_action(f"{notify.mention}\nСотрудник {member.mention} получил **максимальное количество наказаний** и подлежит **увольнению**.")
+            await message.reply(embed=Embed(title="❌ Неизвестный отряд", description="Третий пункт должен содержать **только** got или cesu.", color=Color.red()).add_field(name="Пример", value=f"```{template}```"))
+            return
+
+        target_channel = message.guild.get_channel(channel_id)
+        role_ping = message.guild.get_role(role_id)
+
+        if not target_channel or not role_ping:
+            await message.reply("❌ Ошибка конфигурации.")
+            return
+
+        embed = Embed(
+            title=f"📋 Подтверждение вступления в {squad}",
+            description=f"{message.author.mention} хочет вступить в отряд **{squad}**\nНикнейм: `{user_line}`\nID: `{id_line}`",
+            color=Color.blue()
+        )
+        embed.set_footer(text=f"ID пользователя: {message.author.id} | {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
+        view = ConfirmView(user_id=role_id, target_message=message, squad_name=squad, role_ids=rewards, target_user_id=message.author.id)
+
+        await target_channel.send(content=role_ping.mention, embed=embed, view=view)
         return
 
-    if punishment == "1 выговор":
-        if punish_1 in roles and punish_2 in roles:
-            await apply_roles([strike_1], [punish_1, punish_2])
-            await log_action(f"{member.mention} получил 1 страйк (2 выговора заменены).")
-        elif punish_1 in roles:
-            await apply_roles([punish_2], [])
-            await log_action(f"{member.mention} получил второй выговор.")
-        else:
-            await apply_roles([punish_1], [])
-            await log_action(f"{member.mention} получил первый выговор.")
+    # --- Обработка наказаний ---
+    if message.channel.id == form_channel_id:
+        template = (
+            "Никнейм: Robloxer228\n"
+            "Дискорд айди: 1234567890\n"
+            "Наказание: 1 выговор / 2 выговора / 1 страйк / 2 страйка\n"
+            "Причина: причина наказания\n"
+            "Док-ва: (по желанию)"
+        )
 
-    elif punishment == "2 выговора":
-        if punish_1 in roles and punish_2 in roles:
-            await apply_roles([strike_1], [punish_1, punish_2])
-            await log_action(f"{member.mention} получил 1 страйк (2 выговора заменены).")
-        elif punish_1 in roles:
-            await apply_roles([strike_1], [punish_1])
-            await log_action(f"{member.mention} получил 1 страйк (1 выговор заменён).")
-        else:
-            await apply_roles([punish_1, punish_2], [])
-            await log_action(f"{member.mention} получил 2 выговора.")
+        lines = [line.strip() for line in message.content.strip().split("\n") if line.strip()]
+        if len(lines) < 4 or len(lines) > 5:
+            await message.reply(embed=Embed(
+                title="❌ Ошибка",
+                description="Форма должна содержать 4 или 5 строк.",
+                color=Color.red()
+            ).add_field(name="Пример", value=f"```{template}```"))
+            return
 
-    elif punishment == "1 страйк":
-        if strike_1 in roles and strike_2 in roles:
+        try:
+            nickname = lines[0].split(":", 1)[1].strip()
+            user_id = int(lines[1].split(":", 1)[1].strip())
+            punishment = lines[2].split(":", 1)[1].strip().lower()
+            reason = lines[3].split(":", 1)[1].strip()
+        except:
+            await message.reply(embed=Embed(
+                title="❌ Ошибка в шаблоне",
+                description="Проверь правильность полей (особенно Discord ID)",
+                color=Color.red()
+            ).add_field(name="Пример", value=f"```{template}```"))
+            return
+
+        member = message.guild.get_member(user_id)
+        if not member:
+            await message.reply("❌ Пользователь с таким ID не найден на сервере.")
+            return
+
+        roles = member.roles
+        log = message.guild.get_channel(log_channel_id)
+
+        async def log_action(text):
+            if log:
+                await log.send(embed=Embed(title="📋 Лог наказаний", description=text, color=Color.orange()))
+
+        async def apply_roles(to_add, to_remove):
+            for r in to_remove:
+                if r in roles:
+                    await member.remove_roles(r)
+            for r in to_add:
+                if r not in roles:
+                    await member.add_roles(r)
+
+        punish_1 = message.guild.get_role(punishment_roles["1 выговор"])
+        punish_2 = message.guild.get_role(punishment_roles["2 выговора"])
+        strike_1 = message.guild.get_role(punishment_roles["1 страйк"])
+        strike_2 = message.guild.get_role(punishment_roles["2 страйка"])
+
+        if all(r in roles for r in [punish_1, punish_2, strike_1, strike_2]):
             if squad_roles["got_base"] in [r.id for r in roles]:
                 notify = message.guild.get_role(squad_roles["got_notify"])
             elif squad_roles["cesu_base"] in [r.id for r in roles]:
@@ -374,33 +375,66 @@ async def on_message(message):
             else:
                 notify = None
             if notify:
-                await log_action(f"{notify.mention}\nСотрудник {member.mention} получил 3-й страйк. Подлежит увольнению.")
-        elif strike_1 in roles:
-            await apply_roles([strike_2], [])
-            await log_action(f"{member.mention} получил второй страйк.")
-        else:
-            await apply_roles([strike_1], [])
-            await log_action(f"{member.mention} получил первый страйк.")
+                await log_action(f"{notify.mention}\nСотрудник {member.mention} получил **максимальное количество наказаний** и подлежит **увольнению**.")
+            return
 
-    elif punishment == "2 страйка":
-        if strike_1 in roles or strike_2 in roles:
-            if squad_roles["got_base"] in [r.id for r in roles]:
-                notify = message.guild.get_role(squad_roles["got_notify"])
-            elif squad_roles["cesu_base"] in [r.id for r in roles]:
-                notify = message.guild.get_role(squad_roles["cesu_notify"])
+        if punishment == "1 выговор":
+            if punish_1 in roles and punish_2 in roles:
+                await apply_roles([strike_1], [punish_1, punish_2])
+                await log_action(f"{member.mention} получил 1 страйк (2 выговора заменены).")
+            elif punish_1 in roles:
+                await apply_roles([punish_2], [])
+                await log_action(f"{member.mention} получил второй выговор.")
             else:
-                notify = None
-            if notify:
-                await log_action(f"{notify.mention}\nСотрудник {member.mention} уже имеет страйки и получил ещё. Подлежит увольнению.")
-        else:
-            await apply_roles([strike_1, strike_2], [])
-            await log_action(f"{member.mention} получил 2 страйка.")
+                await apply_roles([punish_1], [])
+                await log_action(f"{member.mention} получил первый выговор.")
 
-    else:
-        await message.reply(embed=Embed(
-            title="❌ Неизвестное наказание",
-            description="Допустимые значения: `1 выговор`, `2 выговора`, `1 страйк`, `2 страйка`.",
-            color=Color.red()
-        ).add_field(name="Пример", value=f"```{template}```"))
+        elif punishment == "2 выговора":
+            if punish_1 in roles and punish_2 in roles:
+                await apply_roles([strike_1], [punish_1, punish_2])
+                await log_action(f"{member.mention} получил 1 страйк (2 выговора заменены).")
+            elif punish_1 in roles:
+                await apply_roles([strike_1], [punish_1])
+                await log_action(f"{member.mention} получил 1 страйк (1 выговор заменён).")
+            else:
+                await apply_roles([punish_1, punish_2], [])
+                await log_action(f"{member.mention} получил 2 выговора.")
+
+        elif punishment == "1 страйк":
+            if strike_1 in roles and strike_2 in roles:
+                if squad_roles["got_base"] in [r.id for r in roles]:
+                    notify = message.guild.get_role(squad_roles["got_notify"])
+                elif squad_roles["cesu_base"] in [r.id for r in roles]:
+                    notify = message.guild.get_role(squad_roles["cesu_notify"])
+                else:
+                    notify = None
+                if notify:
+                    await log_action(f"{notify.mention}\nСотрудник {member.mention} получил 3-й страйк. Подлежит увольнению.")
+            elif strike_1 in roles:
+                await apply_roles([strike_2], [])
+                await log_action(f"{member.mention} получил второй страйк.")
+            else:
+                await apply_roles([strike_1], [])
+                await log_action(f"{member.mention} получил первый страйк.")
+
+        elif punishment == "2 страйка":
+            if strike_1 in roles or strike_2 in roles:
+                if squad_roles["got_base"] in [r.id for r in roles]:
+                    notify = message.guild.get_role(squad_roles["got_notify"])
+                elif squad_roles["cesu_base"] in [r.id for r in roles]:
+                    notify = message.guild.get_role(squad_roles["cesu_notify"])
+                else:
+                    notify = None
+                if notify:
+                    await log_action(f"{notify.mention}\nСотрудник {member.mention} уже имеет страйки и получил ещё. Подлежит увольнению.")
+            else:
+                await apply_roles([strike_1, strike_2], [])
+                await log_action(f"{member.mention} получил 2 страйка.")
+        else:
+            await message.reply(embed=Embed(
+                title="❌ Неизвестное наказание",
+                description="Допустимые значения: `1 выговор`, `2 выговора`, `1 страйк`, `2 страйка`.",
+                color=Color.red()
+            ).add_field(name="Пример", value=f"```{template}```"))
 
 bot.run(os.getenv("DISCORD_TOKEN"))
