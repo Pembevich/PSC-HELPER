@@ -284,10 +284,10 @@ async def on_message(message):
             description=message.content,
             color=Color.from_rgb(255, 255, 255)
         )
-        embed.set_image(url="attachment://psc_logo.jpeg")
+        embed.set_image(url="attachment://photo-output.jpeg")
         embed.set_footer(text=f"©Provision Security Complex | {datetime.now().strftime('%d.%m.%Y')}")
 
-        file = discord.File("psc_logo.jpeg", filename="psc_logo.jpeg")
+        file = discord.File("photo-output.jpeg", filename="psc_logo.jpeg")
         await message.channel.send(embed=embed, file=file)
         return
     # --- Обработка формы вступления ---
