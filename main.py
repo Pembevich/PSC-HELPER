@@ -17,6 +17,8 @@ import os
 import aiohttp
 import requests
 
+discord.VoiceClient = None
+
 # --- Константы ---
 allowed_role_ids = [1340596390614532127, 1341204231419461695]
 allowed_guild_ids = [1340594372596469872]
