@@ -276,7 +276,7 @@ async def on_message(message):
     await bot.process_commands(message)
 
     # --- PSC EMBED СООБЩЕНИЯ ---
-    PSC_CHANNEL_ID = 1340998084238381137
+    PSC_CHANNEL_ID = 1340596250809991228
     PSC_LOGO_PATH = "photo-output.jpeg"  # Убедись, что файл уже сохранён рядом с main.py
     PING_ROLE_ID = 1341168051269275718  # ID роли для пинга
 
