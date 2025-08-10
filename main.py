@@ -276,11 +276,16 @@ async def on_message(message):
     await bot.process_commands(message)
 
     # --- PSC EMBED СООБЩЕНИЯ ---
-    PSC_CHANNEL_ID = 1340596250809991228
+    PSC_CHANNEL_ID = 1340998084238381137
     PSC_LOGO_PATH = "photo-output.jpeg"  # Убедись, что файл уже сохранён рядом с main.py
+    PING_ROLE_ID = 1341168051269275718  # ID роли для пинга
 
     if message.channel.id == PSC_CHANNEL_ID:
         await message.delete()
+
+        role_ping = message.guild.get_role(PING_ROLE_ID)
+        if role_ping:
+            await message.channel.send(role_ping.mention)
 
         embed = Embed(
             description=message.content,
