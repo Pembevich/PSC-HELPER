@@ -281,6 +281,9 @@ async def on_message(message):
     PING_ROLE_ID = 1341168051269275718  # ID роли для пинга
 
     if message.channel.id == PSC_CHANNEL_ID:
+        if message.content.strip().upper().startswith("БЕЗ ВЕБХУКА"):
+            return
+        
         await message.delete()
 
         role_ping = message.guild.get_role(PING_ROLE_ID)
