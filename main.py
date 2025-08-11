@@ -281,7 +281,7 @@ async def on_message(message):
     PING_ROLE_ID = 1341168051269275718  # ID роли для пинга
 
     if message.channel.id == PSC_CHANNEL_ID:
-        if message.content.strip().upper().startswith("БЕЗ ВЕБХУКА"):
+        if not message.content.strip().upper().startswith("С ВЕБХУКОМ"):
             return
         
         await message.delete()
@@ -289,6 +289,8 @@ async def on_message(message):
         role_ping = message.guild.get_role(PING_ROLE_ID)
         if role_ping:
             await message.channel.send(role_ping.mention)
+
+        content_without_flag = message.content.strip()[len("С ВЕБХУКОМ"):].strip()
 
         embed = Embed(
             description=message.content,
