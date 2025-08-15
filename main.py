@@ -17,6 +17,7 @@ import aiohttp
 import requests
 from collections import defaultdict, deque
 import time
+from openai import OpenAI
 
 # Инструкция: положи токен в переменную окружения DISCORD_TOKEN
 
@@ -745,6 +746,22 @@ async def on_ready():
         except Exception as e:
             print(f"❌ Ошибка при синхронизации: {e}")
 
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+@bot.command(name="ai")
+async def ai_chat(ctx, *, prompt: str):
+    """Общение с ИИ через OpenAI"""
+    await ctx.trigger_typing()
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500
+        )
+        answer = response.choices[0].message.content
+        await ctx.send(answer)
+    except Exception as e:
+        await ctx.send(f"❌ Ошибка: {e}")
 # -----------------------
 # Запуск
 # -----------------------
