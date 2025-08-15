@@ -19,8 +19,6 @@ from collections import defaultdict, deque
 import time
 from openai import OpenAI
 
-# Инструкция: положи токен в переменную окружения DISCORD_TOKEN
-
 # --- Константы / настройки ---
 allowed_role_ids = [1340596390614532127, 1341204231419461695]
 allowed_guild_ids = [1340594372596469872]
