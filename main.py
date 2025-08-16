@@ -17,7 +17,7 @@ import time
 from openai import OpenAI
 
 # --- Константы / настройки ---
-allowed_role_ids = [1340596390614532127, 1341204231419461695]
+allowed_role_ids = [1340596390614532127, 1341203508606533763]
 allowed_guild_ids = [1340594372596469872]
 sbor_channels = {}
 
