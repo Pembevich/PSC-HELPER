@@ -31,6 +31,9 @@ CESU_CHANNEL_ID = 1394635216986964038
 CESU_ROLE_ID = 1341040607728107591
 CESU_ROLE_REWARDS = [1341100562783014965, 1341039967555551333]
 
+# Дополнительная роль — добавляется ТОЛЬКО к CESU (по твоему последнему требованию)
+CESU_EXTRA_ROLE_ID = 1341040703551307846
+
 # PSC (embed с логотипом) канал и роль для пинга
 PSC_CHANNEL_ID = 1340596250809991228
 PING_ROLE_ID = 1341168051269275718
@@ -216,19 +219,27 @@ async def sbor_end(interaction: discord.Interaction):
     await interaction.followup.send("✅ Сбор завершён.")
 
 # -----------------------
-# ConfirmView для выдачи ролей (оставляем как было)
+# ConfirmView для выдачи ролей (переделан чтобы поддерживать список разрешённых проверяющих ролей)
 # -----------------------
 class ConfirmView(View):
-    def __init__(self, user_id, target_message, squad_name, role_ids, target_user_id):
+    def __init__(self, allowed_checker_role_ids, target_message, squad_name, role_ids, target_user_id):
+        """
+        allowed_checker_role_ids: список id ролей, которые имеют право нажимать кнопки подтверждения (например [CESU_ROLE_ID, CESU_EXTRA_ROLE_ID])
+        target_message: исходное сообщение (объект discord.Message) от пользователя, которое было отправлено в форму
+        squad_name: строка с названием отряда ("G.o.T" или "C.E.S.U")
+        role_ids: список id ролей, которые будут выданы после одобрения (rewards)
+        target_user_id: id пользователя, которого нужно зачислить
+        """
         super().__init__(timeout=None)
-        self.user_id = user_id
+        self.allowed_checker_role_ids = allowed_checker_role_ids
         self.message = target_message
         self.squad_name = squad_name
         self.role_ids = role_ids
         self.target_user_id = target_user_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if any(role.id == self.user_id for role in interaction.user.roles):
+        # Проверяем есть ли у нажавшего одна из разрешённых ролей
+        if any(r.id in self.allowed_checker_role_ids for r in interaction.user.roles):
             return True
         await interaction.response.send_message("❌ У тебя нет прав нажимать эту кнопку.", ephemeral=True)
         return False
@@ -557,10 +568,38 @@ async def on_message(message: discord.Message):
         user_line, id_line, choice_line = lines
         keyword = extract_clean_keyword(choice_line)
 
+        # По твоему требованию: дополнительная роль (CESU_EXTRA_ROLE_ID) добавляется ТОЛЬКО к CESU
         if keyword == "got":
             role_id, channel_id, rewards, squad = GOT_ROLE_ID, GOT_CHANNEL_ID, GOT_ROLE_REWARDS, "G.o.T"
+            # разрешённые проверяющие для G.o.T — только роль G.o.T (чтобы нажимать кнопки)
+            allowed_checker_role_ids = [GOT_ROLE_ID]
+            # упоминаем только основную роль
+            mentions = []
+            role_ping = None
+            try:
+                role_ping = message.guild.get_role(role_id)
+                if role_ping:
+                    mentions.append(role_ping.mention)
+            except Exception:
+                pass
         elif keyword == "cesu":
             role_id, channel_id, rewards, squad = CESU_ROLE_ID, CESU_CHANNEL_ID, CESU_ROLE_REWARDS, "C.E.S.U"
+            # для CESU разрешаем нажимать и основную роль, и доп. роль CESU_EXTRA_ROLE_ID
+            allowed_checker_role_ids = [CESU_ROLE_ID, CESU_EXTRA_ROLE_ID]
+            # упоминаем основную роль + доп роль
+            mentions = []
+            try:
+                r1 = message.guild.get_role(CESU_ROLE_ID)
+                if r1:
+                    mentions.append(r1.mention)
+            except Exception:
+                pass
+            try:
+                r2 = message.guild.get_role(CESU_EXTRA_ROLE_ID)
+                if r2:
+                    mentions.append(r2.mention)
+            except Exception:
+                pass
         else:
             try:
                 await message.reply(embed=Embed(title="❌ Неизвестный отряд", description="Третий пункт должен содержать **только** got или cesu.", color=Color.red()).add_field(name="Пример", value=f"```{template}```"))
@@ -570,10 +609,9 @@ async def on_message(message: discord.Message):
             return
 
         target_channel = message.guild.get_channel(channel_id)
-        role_ping = message.guild.get_role(role_id)
-        if not target_channel or not role_ping:
+        if not target_channel:
             try:
-                await message.reply("❌ Ошибка конфигурации.")
+                await message.reply("❌ Ошибка конфигурации: целевой канал не найден.")
             except Exception:
                 pass
             await bot.process_commands(message)
@@ -581,10 +619,18 @@ async def on_message(message: discord.Message):
 
         embed = Embed(title=f"📋 Подтверждение вступления в {squad}", description=f"{message.author.mention} хочет вступить в отряд **{squad}**\nНикнейм: `{user_line}`\nID: `{id_line}`", color=Color.blue())
         embed.set_footer(text=f"ID пользователя: {message.author.id} | {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
-        view = ConfirmView(user_id=role_id, target_message=message, squad_name=squad, role_ids=rewards, target_user_id=message.author.id)
+
+        # создаём view с allowed_checker_role_ids (для GOT это [GOT_ROLE_ID], для CESU — [CESU_ROLE_ID, CESU_EXTRA_ROLE_ID])
+        view = ConfirmView(allowed_checker_role_ids, target_message=message, squad_name=squad, role_ids=rewards, target_user_id=message.author.id)
+
+        # формируем строку упоминаний
+        mentions_text = " ".join(mentions) if mentions else None
 
         try:
-            await target_channel.send(content=role_ping.mention, embed=embed, view=view)
+            if mentions_text:
+                await target_channel.send(content=mentions_text, embed=embed, view=view)
+            else:
+                await target_channel.send(embed=embed, view=view)
         except Exception:
             pass
 
