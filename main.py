@@ -826,6 +826,44 @@ async def on_member_remove(member: discord.Member):
     except Exception as e:
         print(f"Ошибка on_member_remove: {e}")
 
+# --- Событие при входе нового участника ---
+@bot.event
+async def on_member_join(member: discord.Member):
+    # --- Автовыдача ролей ---
+    role_ids = [
+        1341100157902651514,
+        1349669624395858012,
+        1341202442942939207,
+        1341168051269275718,
+        1341164841649574090,
+        1341100388715335730,
+        1392396942079954985,
+    ]
+    roles = [member.guild.get_role(rid) for rid in role_ids if member.guild.get_role(rid)]
+    try:
+        await member.add_roles(*roles, reason="Автовыдача при входе")
+        print(f"Выданы роли игроку {member.name}")
+    except Exception as e:
+        print(f"Ошибка при выдаче ролей {member.name}: {e}")
+
+    # --- Логирование в канал ---
+    log_channel = member.guild.get_channel(1392125177399218186)
+    if log_channel:
+        embed = discord.Embed(
+            title="Новый участник",
+            description=f"{member.mention} присоединился к серверу!",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Выдано ролей", value=str(len(roles)))
+        embed.set_footer(text=f"ID: {member.id}")
+        await log_channel.send(embed=embed)
+
+    # --- Если у тебя уже было приветствие, оно остаётся здесь ---
+    # Например:
+    # welcome_channel = member.guild.get_channel(WELCOME_CHANNEL_ID)
+    # if welcome_channel:
+    #     await welcome_channel.send(f"Добро пожаловать, {member.mention}!")
+
 # -----------------------
 # on_ready: синхронизация команд
 # -----------------------
