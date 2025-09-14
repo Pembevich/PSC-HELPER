@@ -17,6 +17,10 @@ import requests
 from collections import defaultdict, deque
 import time
 
+# --- Приветствие и прощание ---
+WELCOME_CHANNEL_ID = 1351880905936867328
+GOODBYE_CHANNEL_ID = 135188097880896307
+
 # --- Константы / настройки ---
 allowed_role_ids = [1340596390614532127, 1341204231419461695]
 allowed_guild_ids = [1340594372596469872]
@@ -777,6 +781,50 @@ async def on_message(message: discord.Message):
 
     # Если ни одно условие не сработало — пропускаем к прочим командам
     await bot.process_commands(message)
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    try:
+        channel = member.guild.get_channel(WELCOME_CHANNEL_ID)
+        if channel:
+            embed = Embed(
+                title="## Запись в дата-базу P - O.S…",
+                description=(
+                    f"————————————\n"
+                    f"```\n"
+                    f"Приветствую, {member.name}!\n"
+                    f"Добро пожаловать на связанной центр фракции P.S.C!\n"
+                    f"Вы записаны в базу хранения.\n"
+                    f"```\n\n"
+                    f"> **Ознакомьтесь с "
+                    f"<#1340596281986383912>, "
+                    f"там вы найдёте нужную вам информацию!**"
+                ),
+                color=Color.green()
+            )
+            await channel.send(embed=embed)
+    except Exception as e:
+        print(f"Ошибка on_member_join: {e}")
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    try:
+        channel = member.guild.get_channel(GOODBYE_CHANNEL_ID)
+        if channel:
+            embed = Embed(
+                title="## Выписываю из базы данных…",
+                description=(
+                    f"```\n"
+                    f"Желаем удачи, {member.name}!\n"
+                    f"Вы выписаны из базы данных.\n"
+                    f"Ждём вас снова у нас!\n"
+                    f"```"
+                ),
+                color=Color.red()
+            )
+            await channel.send(embed=embed)
+    except Exception as e:
+        print(f"Ошибка on_member_remove: {e}")
 
 # -----------------------
 # on_ready: синхронизация команд
