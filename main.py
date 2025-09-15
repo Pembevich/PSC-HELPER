@@ -559,7 +559,7 @@ async def on_message(message: discord.Message):
 
     # --- Обработка формы вступления (got/cesu) ---
     if message.channel.id == FORM_CHANNEL_ID:
-        template = "1. Ваш никнейм\n2. Ваш Дискорд Ник\n3. got или cesu"
+        template = "1. Ваш роблокс никнейм (НЕ ДИСПЛЕЙ)\n2. Ваш Дискорд Ник\n3. got или cesu"
         lines = [line.strip() for line in (message.content or "").strip().split("\n") if line.strip()]
         if len(lines) != 3:
             try:
