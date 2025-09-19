@@ -611,6 +611,7 @@ async def on_message(message: discord.Message):
         await handle_spam_if_needed(message)
     except Exception:
         pass
+        
     # --- Авто-отписки: эмбед + ветка (thread) ---
     try:
         TARGET_CHANNELS = {
@@ -618,6 +619,8 @@ async def on_message(message: discord.Message):
             1416419420082933770: "C.E.S.U",
             1416417030520967199: "P.S.C"
         }
+
+        TARGET_OUTPUT_CHANNEL = 1341377453049774160  # сюда всегда будет отправляться эмбед
 
         # ищем точное слово ОТПИСКИ (только заглавными, отдельно как слово)
         if message.channel.id in TARGET_CHANNELS and re.search(r'\bОТПИСКИ\b', message.content or ""):
@@ -631,19 +634,21 @@ async def on_message(message: discord.Message):
 
             embed = Embed(title=title, color=Color.from_rgb(255,255,255))
 
-            # Отправляем эмбед и создаём под ним ветку с названием "Отписки"
-            try:
-                sent = await message.channel.send(embed=embed)
+            # Отправляем эмбед в целевой канал и создаём под ним ветку с названием "Отписки"
+            target_channel = bot.get_channel(TARGET_OUTPUT_CHANNEL)
+            if target_channel:
                 try:
-                    await sent.create_thread(name="Отписки")
-                except Exception:
-                    # если нет прав создавать треды — молча пропускаем
-                    pass
-            except Exception as e:
-                print(f"Ошибка при отправке эмбеда/создании ветки: {e}")
+                    sent = await target_channel.send(embed=embed)
+                    try:
+                        await sent.create_thread(name="Отписки")
+                    except Exception:
+                        # если нет прав создавать треды — молча пропускаем
+                        pass
+                except Exception as e:
+                    print(f"Ошибка при отправке эмбеда/создании ветки: {e}")
     except Exception as e:
         print(f"Ошибка авто-отписок: {e}")
-
+        
     # --- PSC EMBED СООБЩЕНИЯ ---
     if message.channel.id == PSC_CHANNEL_ID:
         # Условие: сообщение должно начинаться с "С ВЕБХУКОМ"
