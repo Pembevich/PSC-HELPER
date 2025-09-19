@@ -611,6 +611,38 @@ async def on_message(message: discord.Message):
         await handle_spam_if_needed(message)
     except Exception:
         pass
+    # --- Авто-отписки: эмбед + ветка (thread) ---
+    try:
+        TARGET_CHANNELS = {
+            1401268335798386810: "G.o.T",
+            1416419420082933770: "C.E.S.U",
+            1416417030520967199: "P.S.C"
+        }
+
+        # ищем точное слово ОТПИСКИ (только заглавными, отдельно как слово)
+        if message.channel.id in TARGET_CHANNELS and re.search(r'\bОТПИСКИ\b', message.content or ""):
+            today = datetime.now().strftime("%d.%m.%Y")
+            group = TARGET_CHANNELS[message.channel.id]
+
+            if group == "P.S.C":
+                title = f"Общее мероприятие [P.S.C] ({today}) - Отписки."
+            else:
+                title = f"Мероприятие [{group}] ({today}) - Отписки."
+
+            embed = Embed(title=title, color=Color.from_rgb(255,255,255))
+
+            # Отправляем эмбед и создаём под ним ветку с названием "Отписки"
+            try:
+                sent = await message.channel.send(embed=embed)
+                try:
+                    await sent.create_thread(name="Отписки")
+                except Exception:
+                    # если нет прав создавать треды — молча пропускаем
+                    pass
+            except Exception as e:
+                print(f"Ошибка при отправке эмбеда/создании ветки: {e}")
+    except Exception as e:
+        print(f"Ошибка авто-отписок: {e}")
 
     # --- PSC EMBED СООБЩЕНИЯ ---
     if message.channel.id == PSC_CHANNEL_ID:
