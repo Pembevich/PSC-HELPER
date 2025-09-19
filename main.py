@@ -599,23 +599,11 @@ async def on_message(message: discord.Message):
         return
 
     # Проверка ссылок
-    if await check_and_handle_urls(message):
-        return  # если нашли плохую ссылку — дальше не идём
-
-    # Остальная обработка сообщений
-    await bot.process_commands(message)
-    
-    if message.author.bot:
-        return
-    
     try:
         if await check_and_handle_urls(message):
-        return  # прекращаем обработку, если ссылка уже была удалена
-except Exception as e:
-    print(f"Ошибка проверки ссылок: {e}")
-    
-    # не реагируем на ботов
-    if message.author.bot:
+            return
+    except Exception as e:
+        print(f"Ошибка проверки ссылок: {e}")
         return
 
     # сначала — STOPREID (анти-спам), независимо от канала
