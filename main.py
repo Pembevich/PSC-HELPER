@@ -16,6 +16,22 @@ import aiohttp
 import requests
 from collections import defaultdict, deque
 import time
+from urllib.parse import urlparse
+
+VIRUSTOTAL_KEY = os.getenv("VIRUSTOTAL_KEY")
+
+# список подозрительных ключевых слов в доменах/ссылках
+SUSPICIOUS_KEYWORDS = [
+    "porn", "porno", "xxx", "sex",
+    "casino", "bet", "slot", "1xbet",
+    "free-robux", "nitro-free", "hack"
+]
+
+# при желании можно добавить whitelist
+WHITELIST_DOMAINS = {"discord.com", "youtube.com", "roblox.com"}
+
+# регулярка для поиска ссылок
+URL_REGEX = re.compile(r"(https?://[^\s]+)")
 
 # --- Приветствие и прощание ---
 WELCOME_CHANNEL_ID = 1351880905936867328
@@ -222,6 +238,50 @@ async def sbor_end(interaction: discord.Interaction):
     sbor_channels.pop(interaction.guild.id, None)
     await interaction.followup.send("✅ Сбор завершён.")
 
+async def check_virustotal(session: aiohttp.ClientSession, url: str) -> bool:
+    """
+    Проверка URL через VirusTotal API.
+    True = URL подозрительный/вредоносный
+    """
+    if not VIRUSTOTAL_KEY:
+        return False
+
+    headers = {"x-apikey": VIRUSTOTAL_KEY}
+
+    try:
+        # 1) Отправляем URL на анализ
+        async with session.post(
+            "https://www.virustotal.com/api/v3/urls",
+            data={"url": url},
+            headers=headers,
+            timeout=15
+        ) as resp:
+            if resp.status not in (200, 201):
+                return False
+            js = await resp.json()
+            url_id = js.get("data", {}).get("id")
+            if not url_id:
+                return False
+
+        # 2) Получаем результат анализа
+        async with session.get(
+            f"https://www.virustotal.com/api/v3/analyses/{url_id}",
+            headers=headers,
+            timeout=15
+        ) as resp2:
+            if resp2.status != 200:
+                return False
+            res = await resp2.json()
+            stats = res.get("data", {}).get("attributes", {}).get("stats", {})
+            malicious = stats.get("malicious", 0)
+            suspicious = stats.get("suspicious", 0)
+
+            return (malicious + suspicious) > 0
+
+    except Exception as e:
+        print(f"Ошибка VirusTotal: {e}")
+        return False
+
 # -----------------------
 # ConfirmView для выдачи ролей (переделан чтобы поддерживать список разрешённых проверяющих ролей)
 # -----------------------
@@ -275,6 +335,128 @@ class ConfirmView(View):
         await interaction.response.send_message("Отказ зарегистрирован.", ephemeral=True)
         self.stop()
 
+
+async def check_virustotal(session: aiohttp.ClientSession, url: str) -> bool:
+    """Проверка URL через VirusTotal API. True = вредоносный."""
+    if not VIRUSTOTAL_KEY:
+        return False
+
+    headers = {"x-apikey": VIRUSTOTAL_KEY}
+
+    try:
+        # 1) Отправляем URL на анализ
+        async with session.post(
+            "https://www.virustotal.com/api/v3/urls",
+            data={"url": url},
+            headers=headers,
+            timeout=15
+        ) as resp:
+            if resp.status not in (200, 201):
+                return False
+            js = await resp.json()
+            url_id = js.get("data", {}).get("id")
+            if not url_id:
+                return False
+
+        # 2) Получаем результат анализа
+        async with session.get(
+            f"https://www.virustotal.com/api/v3/analyses/{url_id}",
+            headers=headers,
+            timeout=15
+        ) as resp2:
+            if resp2.status != 200:
+                return False
+            res = await resp2.json()
+            stats = res.get("data", {}).get("attributes", {}).get("stats", {})
+            malicious = stats.get("malicious", 0)
+            suspicious = stats.get("suspicious", 0)
+
+            return (malicious + suspicious) > 0
+
+    except Exception as e:
+        print(f"Ошибка VirusTotal: {e}")
+        return False
+
+
+async def check_and_handle_urls(message: discord.Message) -> bool:
+    """Проверяет ссылки в сообщении. True = сообщение обработано (удалено/замут)."""
+    text = message.content or ""
+    urls = URL_REGEX.findall(text)
+    if not urls:
+        return False
+
+    suspicious = []
+    async with aiohttp.ClientSession() as session:
+        for url in urls:
+            try:
+                parsed = urlparse(url)
+                domain = parsed.netloc.lower()
+            except Exception:
+                continue
+
+            # whitelist
+            if any(wd in domain for wd in WHITELIST_DOMAINS):
+                continue
+
+            # локальные ключевые слова
+            if any(kw in domain for kw in SUSPICIOUS_KEYWORDS):
+                suspicious.append((url, "keyword"))
+                continue
+
+            # проверка через VirusTotal
+            is_bad = await check_virustotal(session, url)
+            if is_bad:
+                suspicious.append((url, "VirusTotal"))
+
+    if not suspicious:
+        return False
+
+    # если нашли подозрительные ссылки — действуем
+    reason_text = "\n".join(f"{u} -> {why}" for u, why in suspicious)
+
+    # удаляем сообщение
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # мутим пользователя
+    try:
+        mute_role = message.guild.get_role(MUTE_ROLE_ID)
+        if mute_role:
+            await message.author.add_roles(mute_role, reason="Вредоносная ссылка")
+    except Exception as e:
+        print(f"Ошибка при выдаче мута: {e}")
+
+    # лог в анти-рейд канал
+    try:
+        log_chan = message.guild.get_channel(SPAM_LOG_CHANNEL)
+        if log_chan:
+            em = Embed(
+                title="🚨 Вредоносная ссылка заблокирована",
+                description=f"Сообщение от {message.author.mention} удалено.",
+                color=Color.red()
+            )
+            em.add_field(name="Канал", value=message.channel.mention, inline=False)
+            em.add_field(name="Ссылки", value=f"```{reason_text}```", inline=False)
+            await log_chan.send(embed=em)
+    except Exception as e:
+        print(f"Ошибка при логировании: {e}")
+
+    # уведомление пользователю в ЛС
+    try:
+        dm = Embed(
+            title="⚠️ Ссылка заблокирована",
+            description="Ваше сообщение удалено, так как в нём обнаружена подозрительная ссылка. Вы временно замучены.",
+            color=Color.red()
+        )
+        dm.add_field(name="Детали", value=f"```{reason_text}```", inline=False)
+        await message.author.send(embed=dm)
+    except Exception:
+        pass
+
+    return True
+    
 # -----------------------
 # STOPREID (анти-спам)
 # -----------------------
@@ -413,6 +595,25 @@ class ComplaintView(View):
 # -----------------------
 @bot.event
 async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    # Проверка ссылок
+    if await check_and_handle_urls(message):
+        return  # если нашли плохую ссылку — дальше не идём
+
+    # Остальная обработка сообщений
+    await bot.process_commands(message)
+    
+    if message.author.bot:
+        return
+    
+    try:
+        if await check_and_handle_urls(message):
+        return  # прекращаем обработку, если ссылка уже была удалена
+except Exception as e:
+    print(f"Ошибка проверки ссылок: {e}")
+    
     # не реагируем на ботов
     if message.author.bot:
         return
