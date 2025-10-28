@@ -1,4 +1,4 @@
-# main.py — исправленный полный файл
+# main.py — полный файл (обновлённый: расширенная фильтрация ссылок + CESU DM при принятии)
 import discord
 from discord.ext import commands
 import sqlite3
@@ -16,22 +16,358 @@ import aiohttp
 import requests
 from collections import defaultdict, deque
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
+import idna
 
+# --- Ключи (не меняем имя VIRUSTOTAL_KEY) ---
 VIRUSTOTAL_KEY = os.getenv("VIRUSTOTAL_KEY")
+GOOGLE_SAFEBROWSING_KEY = os.getenv("GOOGLE_SAFEBROWSING_KEY")
 
-# список подозрительных ключевых слов в доменах/ссылках
+# -----------------------
+# Расширенные списки фильтрации (заменяют предыдущие SUSPICIOUS_KEYWORDS / WHITELIST_DOMAINS)
+# -----------------------
+# ключевые слова, которые мы считаем подозрительными при их наличии в домене
 SUSPICIOUS_KEYWORDS = [
-    "porn", "porno", "xxx", "sex",
-    "casino", "bet", "slot", "1xbet",
-    "free-robux", "nitro-free", "hack"
+    # NSFW / adult
+    "porn", "porno", "xxx", "sex", "adult", "erotic", "erotica", "fetish",
+    "fetlife", "cam", "cams", "tube", "sexchat", "onlyfans", "adultfriendfinder",
+    "escort", "escortservice", "webcam", "nsfw", "honeypot",
+    # gambling
+    "casino", "casinos", "bet", "bets", "betting", "poker", "slot", "slots",
+    "roulette", "blackjack", "baccarat", "spin", "jackpot", "1xbet", "bet365",
+    "stake", "pinnacle", "bookmaker", "betway", "pokerstars",
+    # scams / freebies / nitro / robux
+    "free-robux", "robuxfree", "freegift", "free-nitro", "nitro-free", "getnitro",
+    "nitrogiveaway", "nitroclaim", "discord-nitro", "discordgift", "discord-gift",
+    "hack", "cheat", "generator", "gens", "prize", "claim", "giveaway", "earn",
+    # phishing / account theft
+    "login", "signin", "securelogin", "account-recovery", "accountverify",
+    "verify-account", "verify", "verification", "auth", "password-reset", "login-roblox",
+    "paypal-secure", "wallet-connect", "metamasklogin"
 ]
 
-# при желании можно добавить whitelist
-WHITELIST_DOMAINS = {"discord.com", "youtube.com", "roblox.com"}
+# конкретные домены / сильные индикаторы (поддомены тоже блокируются)
+SUSPICIOUS_DOMAINS = {
+    "pornhub.com", "xvideos.com", "xnxx.com", "xhamster.com", "redtube.com",
+    "youporn.com", "tube8.com", "tnaflix.com", "spankwire.com", "brazzers.com",
+    "onlyfans.com", "cams.com", "adultfriendfinder.com", "cam4.com",
+    "1xbet.com", "bet365.com", "betfair.com", "stake.com", "pokerstars.com",
+    "betway.com", "bovada.lv", "draftkings.com", "fanduel.com", "casino.com",
+    "free-robux.com", "robux-free.com", "nitro.gifts", "verify-nitro.com",
+    "discord-nitro.com", "discordgift.com", "discord-gift.com", "nitroclaim.xyz",
+    # добавляй сюда свои известные мошеннические домены
+}
 
-# регулярка для поиска ссылок
+# подозрительные фрагменты в пути/параметрах запроса
+SUSPICIOUS_PATH_KEYWORDS = [
+    "claim", "free", "giveaway", "get-nitro", "nitro", "free-robux",
+    "verify", "verification", "password", "reset", "voucher", "coupon", "earn"
+]
+
+# whitelist — если домен содержит любой из этих фрагментов — не фильтруем
+WHITELIST_DOMAINS = {"discord.com", "youtube.com", "roblox.com", "google.com", "github.com"}
+
+# регулярка для поиска ссылок (оставляем как у тебя)
 URL_REGEX = re.compile(r"(https?://[^\s]+)")
+
+# кеш VirusTotal: url -> (bool_is_bad, timestamp)
+_vt_cache = {}
+_VT_CACHE_TTL = 60 * 60  # 1 час
+
+def _normalize_domain(raw_domain: str) -> str:
+    """
+    Приводим домен к безопасной форме: убираем порт, lowercase, punycode если нужно.
+    """
+    try:
+        d = raw_domain.split(":")[0].lower()
+        try:
+            d = idna.encode(d).decode("ascii")
+        except Exception:
+            pass
+        return d
+    except Exception:
+        return raw_domain.lower()
+
+def _domain_matches_blacklist(domain: str) -> bool:
+    dom = _normalize_domain(domain)
+    # прямой домен / поддомен
+    for bad in SUSPICIOUS_DOMAINS:
+        if dom == bad or dom.endswith("." + bad):
+            return True
+    # ключевые слова в домене
+    for kw in SUSPICIOUS_KEYWORDS:
+        if kw in dom:
+            return True
+    return False
+
+# -----------------------
+# Google Safe Browsing проверка
+# -----------------------
+async def check_google_safe_browsing(session: aiohttp.ClientSession, url: str) -> bool:
+    """
+    Возвращает True если Google Safe Browsing пометил URL как опасный.
+    Требует GOOGLE_SAFEBROWSING_KEY в окружении.
+    """
+    key = GOOGLE_SAFEBROWSING_KEY
+    if not key:
+        return False
+    endpoint = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={key}"
+    payload = {
+        "client": {"clientId": "discord-bot", "clientVersion": "1.0"},
+        "threatInfo": {
+            "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
+            "platformTypes": ["ANY_PLATFORM"],
+            "threatEntryTypes": ["URL"],
+            "threatEntries": [{"url": url}]
+        }
+    }
+    try:
+        async with session.post(endpoint, json=payload, timeout=10) as resp:
+            if resp.status != 200:
+                return False
+            js = await resp.json()
+            return "matches" in js and bool(js["matches"])
+    except Exception as e:
+        print(f"GSB error for {url}: {e}")
+        return False
+
+# -----------------------
+# VirusTotal проверка (с использованием VIRUSTOTAL_KEY)
+# -----------------------
+async def check_virustotal(session: aiohttp.ClientSession, url: str) -> bool:
+    """
+    Проверка URL через VirusTotal API. True = вредоносный/suspicious.
+    Использует переменную окружения VIRUSTOTAL_KEY (не меняю название).
+    """
+    if not VIRUSTOTAL_KEY:
+        return False
+
+    headers = {"x-apikey": VIRUSTOTAL_KEY}
+    try:
+        # 1) Отправляем URL на анализ
+        async with session.post(
+            "https://www.virustotal.com/api/v3/urls",
+            data={"url": url},
+            headers=headers,
+            timeout=15
+        ) as resp:
+            if resp.status not in (200, 201):
+                return False
+            js = await resp.json()
+            url_id = js.get("data", {}).get("id")
+            if not url_id:
+                return False
+
+        # 2) Получаем результат анализа
+        async with session.get(
+            f"https://www.virustotal.com/api/v3/analyses/{url_id}",
+            headers=headers,
+            timeout=15
+        ) as resp2:
+            if resp2.status != 200:
+                return False
+            res = await resp2.json()
+            stats = res.get("data", {}).get("attributes", {}).get("stats", {})
+            malicious = stats.get("malicious", 0)
+            suspicious = stats.get("suspicious", 0)
+
+            return (malicious + suspicious) > 0
+
+    except Exception as e:
+        print(f"Ошибка VirusTotal: {e}")
+        return False
+
+# -----------------------
+# Основная проверка ссылок — интегрируем локальный фильтр + GSB + VT + кеш
+# -----------------------
+async def check_and_handle_urls(message: discord.Message) -> bool:
+    """Проверяет ссылки в сообщении. True = сообщение обработано (удалено/замут)."""
+    text = message.content or ""
+    urls = URL_REGEX.findall(text)
+    if not urls:
+        return False
+
+    suspicious = []
+    async with aiohttp.ClientSession() as session:
+        for url in urls:
+            try:
+                parsed = urlparse(url if url.startswith("http") else "http://" + url)
+                domain = parsed.netloc or ""
+                domain = domain.lower()
+                path = (parsed.path or "") + ("?" + (parsed.query or "") if parsed.query else "")
+                try:
+                    path_dec = unquote(path).lower()
+                except Exception:
+                    path_dec = path.lower()
+            except Exception:
+                continue
+
+            # whitelist
+            if any(wd in domain for wd in WHITELIST_DOMAINS):
+                continue
+
+            # 1) локальные домены/ключевики
+            if _domain_matches_blacklist(domain):
+                suspicious.append((url, "local-domain/keyword"))
+                continue
+
+            # 2) путь/параметры (claim-free-nitro и т.д.)
+            for pk in SUSPICIOUS_PATH_KEYWORDS:
+                if pk in path_dec:
+                    suspicious.append((url, f"path={pk}"))
+                    break
+            if any(u == url for u, _ in suspicious):
+                continue
+
+            # 3) кеш VT
+            try:
+                cached = _vt_cache.get(url)
+                if cached and (time.time() - cached[1]) < _VT_CACHE_TTL:
+                    if cached[0]:
+                        suspicious.append((url, "vt-cache"))
+                        continue
+                    else:
+                        continue
+            except Exception:
+                pass
+
+            # 4) Google Safe Browsing
+            try:
+                gsb_bad = await check_google_safe_browsing(session, url)
+                if gsb_bad:
+                    suspicious.append((url, "GoogleSafeBrowsing"))
+                    _vt_cache[url] = (True, time.time())
+                    continue
+            except Exception as e:
+                print(f"GSB check error: {e}")
+
+            # 5) VirusTotal
+            try:
+                vt_bad = await check_virustotal(session, url)
+                _vt_cache[url] = (bool(vt_bad), time.time())
+                if vt_bad:
+                    suspicious.append((url, "VirusTotal"))
+                    continue
+            except Exception as e:
+                print(f"VirusTotal check error: {e}")
+
+    if not suspicious:
+        return False
+
+    # если нашли подозрительные ссылки — действуем (поведение как в твоём коде)
+    reason_text = "\n".join(f"{u} -> {why}" for u, why in suspicious)
+
+    # удаляем сообщение
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # мутим пользователя
+    try:
+        mute_role = message.guild.get_role(MUTE_ROLE_ID)
+        if mute_role:
+            await message.author.add_roles(mute_role, reason="Вредоносная/неприемлемая ссылка")
+    except Exception as e:
+        print(f"Ошибка при выдаче мута: {e}")
+
+    # лог в анти-рейд канал
+    try:
+        log_chan = message.guild.get_channel(SPAM_LOG_CHANNEL)
+        if log_chan:
+            em = Embed(
+                title="🚨 Вредоносная ссылка заблокирована",
+                description=f"Сообщение от {message.author.mention} удалено.",
+                color=Color.red()
+            )
+            em.add_field(name="Канал", value=message.channel.mention, inline=False)
+            em.add_field(name="Ссылки", value=f"```{reason_text}```", inline=False)
+            await log_chan.send(embed=em)
+    except Exception as e:
+        print(f"Ошибка при логировании: {e}")
+
+    # уведомление пользователю в ЛС
+    try:
+        dm = Embed(
+            title="⚠️ Ссылка заблокирована",
+            description="Ваше сообщение удалено, так как в нём обнаружена подозрительная или неприемлемая ссылка. Вы временно замучены.",
+            color=Color.red()
+        )
+        dm.add_field(name="Детали", value=f"```{reason_text}```", inline=False)
+        await message.author.send(embed=dm)
+    except Exception:
+        pass
+
+    return True
+
+# -----------------------
+# ConfirmView для выдачи ролей (с изменённой логикой для CESU DM)
+# -----------------------
+class ConfirmView(View):
+    def __init__(self, allowed_checker_role_ids, target_message, squad_name, role_ids, target_user_id):
+        """
+        allowed_checker_role_ids: список id ролей, которые имеют право нажимать кнопки подтверждения
+        target_message: исходное сообщение (объект discord.Message) от пользователя, которое было отправлено в форму
+        squad_name: строка с названием отряда ("G.o.T" или "C.E.S.U")
+        role_ids: список id ролей, которые будут выданы после одобрения (rewards)
+        target_user_id: id пользователя, которого нужно зачислить
+        """
+        super().__init__(timeout=None)
+        self.allowed_checker_role_ids = allowed_checker_role_ids
+        self.message = target_message
+        self.squad_name = squad_name
+        self.role_ids = role_ids
+        self.target_user_id = target_user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Проверяем есть ли у нажавшего одна из разрешённых ролей
+        if any(r.id in self.allowed_checker_role_ids for r in interaction.user.roles):
+            return True
+        await interaction.response.send_message("❌ У тебя нет прав нажимать эту кнопку.", ephemeral=True)
+        return False
+
+    @button(label="Принять", style=discord.ButtonStyle.green)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        member = interaction.guild.get_member(self.target_user_id)
+        if member:
+            for role_id in self.role_ids:
+                role = interaction.guild.get_role(role_id)
+                if role:
+                    try:
+                        await member.add_roles(role)
+                    except Exception:
+                        pass
+            # Если это C.E.S.U — отправляем ЛС-эмбед с сообщением о принятии и эмодзи времени
+            try:
+                if self.squad_name == "C.E.S.U":
+                    dm_embed = Embed(
+                        title="⏳ Ваша заявка принята!",
+                        description="Скоро вам напишут для проведения опроса. Ожидайте.",
+                        color=Color.green()
+                    )
+                    await member.send(embed=dm_embed)
+            except Exception:
+                pass
+            # Ответ в канале (как было)
+            try:
+                await self.message.reply(embed=Embed(title="✅ Принято", description=f"Вы зачислены в отряд **{self.squad_name}**!", color=Color.green()))
+            except Exception:
+                pass
+        await interaction.response.send_message("Принято.", ephemeral=True)
+        self.stop()
+
+    @button(label="Отказать", style=discord.ButtonStyle.red)
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await self.message.add_reaction("❌")
+        except Exception:
+            pass
+        await interaction.response.send_message("Отказ зарегистрирован.", ephemeral=True)
+        self.stop()
+
+# -----------------------
+# (Дальше остальной твой код — без изменений)
+# -----------------------
 
 # --- Приветствие и прощание ---
 WELCOME_CHANNEL_ID = 1351880905936867328
@@ -51,7 +387,7 @@ CESU_CHANNEL_ID = 1394635216986964038
 CESU_ROLE_ID = 1341040607728107591
 CESU_ROLE_REWARDS = [1341100562783014965, 1341039967555551333]
 
-# Дополнительная роль — добавляется ТОЛЬКО к CESU (по твоему последнему требованию)
+# Дополнительная роль — добавляется ТОЛЬКО к CESU
 CESU_EXTRA_ROLE_ID = 1341040703551307846
 
 # PSC (embed с логотипом) канал и роль для пинга
@@ -238,225 +574,6 @@ async def sbor_end(interaction: discord.Interaction):
     sbor_channels.pop(interaction.guild.id, None)
     await interaction.followup.send("✅ Сбор завершён.")
 
-async def check_virustotal(session: aiohttp.ClientSession, url: str) -> bool:
-    """
-    Проверка URL через VirusTotal API.
-    True = URL подозрительный/вредоносный
-    """
-    if not VIRUSTOTAL_KEY:
-        return False
-
-    headers = {"x-apikey": VIRUSTOTAL_KEY}
-
-    try:
-        # 1) Отправляем URL на анализ
-        async with session.post(
-            "https://www.virustotal.com/api/v3/urls",
-            data={"url": url},
-            headers=headers,
-            timeout=15
-        ) as resp:
-            if resp.status not in (200, 201):
-                return False
-            js = await resp.json()
-            url_id = js.get("data", {}).get("id")
-            if not url_id:
-                return False
-
-        # 2) Получаем результат анализа
-        async with session.get(
-            f"https://www.virustotal.com/api/v3/analyses/{url_id}",
-            headers=headers,
-            timeout=15
-        ) as resp2:
-            if resp2.status != 200:
-                return False
-            res = await resp2.json()
-            stats = res.get("data", {}).get("attributes", {}).get("stats", {})
-            malicious = stats.get("malicious", 0)
-            suspicious = stats.get("suspicious", 0)
-
-            return (malicious + suspicious) > 0
-
-    except Exception as e:
-        print(f"Ошибка VirusTotal: {e}")
-        return False
-
-# -----------------------
-# ConfirmView для выдачи ролей (переделан чтобы поддерживать список разрешённых проверяющих ролей)
-# -----------------------
-class ConfirmView(View):
-    def __init__(self, allowed_checker_role_ids, target_message, squad_name, role_ids, target_user_id):
-        """
-        allowed_checker_role_ids: список id ролей, которые имеют право нажимать кнопки подтверждения (например [CESU_ROLE_ID, CESU_EXTRA_ROLE_ID])
-        target_message: исходное сообщение (объект discord.Message) от пользователя, которое было отправлено в форму
-        squad_name: строка с названием отряда ("G.o.T" или "C.E.S.U")
-        role_ids: список id ролей, которые будут выданы после одобрения (rewards)
-        target_user_id: id пользователя, которого нужно зачислить
-        """
-        super().__init__(timeout=None)
-        self.allowed_checker_role_ids = allowed_checker_role_ids
-        self.message = target_message
-        self.squad_name = squad_name
-        self.role_ids = role_ids
-        self.target_user_id = target_user_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Проверяем есть ли у нажавшего одна из разрешённых ролей
-        if any(r.id in self.allowed_checker_role_ids for r in interaction.user.roles):
-            return True
-        await interaction.response.send_message("❌ У тебя нет прав нажимать эту кнопку.", ephemeral=True)
-        return False
-
-    @button(label="Принять", style=discord.ButtonStyle.green)
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        member = interaction.guild.get_member(self.target_user_id)
-        if member:
-            for role_id in self.role_ids:
-                role = interaction.guild.get_role(role_id)
-                if role:
-                    try:
-                        await member.add_roles(role)
-                    except Exception:
-                        pass
-            try:
-                await self.message.reply(embed=Embed(title="✅ Принято", description=f"Вы зачислены в отряд **{self.squad_name}**!", color=Color.green()))
-            except Exception:
-                pass
-        await interaction.response.send_message("Принято.", ephemeral=True)
-        self.stop()
-
-    @button(label="Отказать", style=discord.ButtonStyle.red)
-    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            await self.message.add_reaction("❌")
-        except Exception:
-            pass
-        await interaction.response.send_message("Отказ зарегистрирован.", ephemeral=True)
-        self.stop()
-
-
-async def check_virustotal(session: aiohttp.ClientSession, url: str) -> bool:
-    """Проверка URL через VirusTotal API. True = вредоносный."""
-    if not VIRUSTOTAL_KEY:
-        return False
-
-    headers = {"x-apikey": VIRUSTOTAL_KEY}
-
-    try:
-        # 1) Отправляем URL на анализ
-        async with session.post(
-            "https://www.virustotal.com/api/v3/urls",
-            data={"url": url},
-            headers=headers,
-            timeout=15
-        ) as resp:
-            if resp.status not in (200, 201):
-                return False
-            js = await resp.json()
-            url_id = js.get("data", {}).get("id")
-            if not url_id:
-                return False
-
-        # 2) Получаем результат анализа
-        async with session.get(
-            f"https://www.virustotal.com/api/v3/analyses/{url_id}",
-            headers=headers,
-            timeout=15
-        ) as resp2:
-            if resp2.status != 200:
-                return False
-            res = await resp2.json()
-            stats = res.get("data", {}).get("attributes", {}).get("stats", {})
-            malicious = stats.get("malicious", 0)
-            suspicious = stats.get("suspicious", 0)
-
-            return (malicious + suspicious) > 0
-
-    except Exception as e:
-        print(f"Ошибка VirusTotal: {e}")
-        return False
-
-
-async def check_and_handle_urls(message: discord.Message) -> bool:
-    """Проверяет ссылки в сообщении. True = сообщение обработано (удалено/замут)."""
-    text = message.content or ""
-    urls = URL_REGEX.findall(text)
-    if not urls:
-        return False
-
-    suspicious = []
-    async with aiohttp.ClientSession() as session:
-        for url in urls:
-            try:
-                parsed = urlparse(url)
-                domain = parsed.netloc.lower()
-            except Exception:
-                continue
-
-            # whitelist
-            if any(wd in domain for wd in WHITELIST_DOMAINS):
-                continue
-
-            # локальные ключевые слова
-            if any(kw in domain for kw in SUSPICIOUS_KEYWORDS):
-                suspicious.append((url, "keyword"))
-                continue
-
-            # проверка через VirusTotal
-            is_bad = await check_virustotal(session, url)
-            if is_bad:
-                suspicious.append((url, "VirusTotal"))
-
-    if not suspicious:
-        return False
-
-    # если нашли подозрительные ссылки — действуем
-    reason_text = "\n".join(f"{u} -> {why}" for u, why in suspicious)
-
-    # удаляем сообщение
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    # мутим пользователя
-    try:
-        mute_role = message.guild.get_role(MUTE_ROLE_ID)
-        if mute_role:
-            await message.author.add_roles(mute_role, reason="Вредоносная ссылка")
-    except Exception as e:
-        print(f"Ошибка при выдаче мута: {e}")
-
-    # лог в анти-рейд канал
-    try:
-        log_chan = message.guild.get_channel(SPAM_LOG_CHANNEL)
-        if log_chan:
-            em = Embed(
-                title="🚨 Вредоносная ссылка заблокирована",
-                description=f"Сообщение от {message.author.mention} удалено.",
-                color=Color.red()
-            )
-            em.add_field(name="Канал", value=message.channel.mention, inline=False)
-            em.add_field(name="Ссылки", value=f"```{reason_text}```", inline=False)
-            await log_chan.send(embed=em)
-    except Exception as e:
-        print(f"Ошибка при логировании: {e}")
-
-    # уведомление пользователю в ЛС
-    try:
-        dm = Embed(
-            title="⚠️ Ссылка заблокирована",
-            description="Ваше сообщение удалено, так как в нём обнаружена подозрительная ссылка. Вы временно замучены.",
-            color=Color.red()
-        )
-        dm.add_field(name="Детали", value=f"```{reason_text}```", inline=False)
-        await message.author.send(embed=dm)
-    except Exception:
-        pass
-
-    return True
-    
 # -----------------------
 # STOPREID (анти-спам)
 # -----------------------
@@ -813,7 +930,7 @@ async def on_message(message: discord.Message):
             except Exception:
                 pass
         elif keyword == "cesu":
-            role_id, channel_id, rewards, squad = CESU_ROLE_ID, CESU_CHANNEL_ID, CESU_ROLE_REWARDS, "C.E.S.U"
+            role_id, channel_id, rewards, squad = CESU_ROLE_ID, CESU_CHANNEL_ID, CESU_ROLE_REWARDS + [CESU_EXTRA_ROLE_ID], "C.E.S.U"
             # для CESU разрешаем нажимать и основную роль, и доп. роль CESU_EXTRA_ROLE_ID
             allowed_checker_role_ids = [CESU_ROLE_ID, CESU_EXTRA_ROLE_ID]
             # упоминаем основную роль + доп роль
@@ -1070,13 +1187,6 @@ async def on_member_remove(member: discord.Member):
             await channel.send(embed=embed)
     except Exception as e:
         print(f"Ошибка on_member_remove: {e}")
-
-
-    # --- Если у тебя уже было приветствие, оно остаётся здесь ---
-    # Например:
-    # welcome_channel = member.guild.get_channel(WELCOME_CHANNEL_ID)
-    # if welcome_channel:
-    #     await welcome_channel.send(f"Добро пожаловать, {member.mention}!")
 
 # -----------------------
 # on_ready: синхронизация команд
