@@ -581,36 +581,38 @@ async def sbor_end(interaction: discord.Interaction):
 # Команда !ai
 @bot.command()
 async def ai(ctx, *, question: str):
-    try:
-        headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}"}
-        json_data = {
-            "model": "deepseek-chat",
-            "messages": [
-                {"role": "system", "content": "Ты — P-OS, искусственный интеллект сервера. Отвечай дружелюбно и профессионально."},
-                {"role": "user", "content": question}
-            ],
-            "max_tokens": 300,
-            "temperature": 0.7
-        }
+    await ctx.send("Команда !ai временно отключена.")
+    # КОД ОТКЛЮЧЕН
+    # try:
+        # headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}"}
+        # json_data = {
+            # "model": "deepseek-chat",
+            # "messages": [
+                # {"role": "system", "content": "Ты — P-OS, искусственный интеллект сервера. Отвечай дружелюбно и профессионально."},
+                # {"role": "user", "content": question}
+            # ],
+            # "max_tokens": 300,
+            # "temperature": 0.7
+        # }
 
-        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=json_data).json()
+        # response = requests.post(DEEPSEEK_API_URL, headers=headers, json=json_data).json()
         
         # исправлено: берем текст ответа напрямую
-        answer = "Нет ответа от ИИ."
-        if "choices" in response and len(response["choices"]) > 0:
-            answer = response["choices"][0]["message"]["content"]
+        # answer = "Нет ответа от ИИ."
+        # if "choices" in response and len(response["choices"]) > 0:
+            # answer = response["choices"][0]["message"]["content"]
 
-        embed = discord.Embed(
-            title="P-OS 🤖",
-            description=answer,
-            color=discord.Color.blurple()
-        )
-        embed.set_footer(text=f"Вопрос от {ctx.author}", icon_url=ctx.author.avatar.url)
+        # embed = discord.Embed(
+            # title="P-OS 🤖",
+            # description=answer,
+            # color=discord.Color.blurple()
+        # )
+        # embed.set_footer(text=f"Вопрос от {ctx.author}", icon_url=ctx.author.avatar.url)
 
-        await ctx.send(embed=embed)
+        # await ctx.send(embed=embed)
 
-    except Exception as e:
-        await ctx.send(f"Произошла ошибка: {e}")
+    # except Exception as e:
+        # await ctx.send(f"Произошла ошибка: {e}")
 
 # -----------------------
 # STOPREID (анти-спам)
