@@ -18,10 +18,13 @@ from collections import defaultdict, deque
 import time
 from urllib.parse import urlparse, unquote
 import idna
+import openai
 
 # --- Ключи (не меняем имя VIRUSTOTAL_KEY) ---
 VIRUSTOTAL_KEY = os.getenv("VIRUSTOTAL_KEY")
 GOOGLE_SAFEBROWSING_KEY = os.getenv("GOOGLE_SAFEBROWSING_KEY")
+# Подключение API ключа OpenAI из переменной окружения
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # -----------------------
 # Расширенные списки фильтрации (заменяют предыдущие SUSPICIOUS_KEYWORDS / WHITELIST_DOMAINS)
@@ -573,6 +576,37 @@ async def sbor_end(interaction: discord.Interaction):
     await webhook.delete()
     sbor_channels.pop(interaction.guild.id, None)
     await interaction.followup.send("✅ Сбор завершён.")
+
+# Команда !ai
+@bot.command()
+async def ai(ctx, *, question: str):
+    """Отправляет вопрос в OpenAI и возвращает ответ от P-OS."""
+    try:
+        # Отправка запроса в OpenAI
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",  # или "gpt-4", если доступно
+            messages=[
+                {"role": "system", "content": "Ты — P-OS, искусственный интеллект сервера. Отвечай дружелюбно и профессионально."},
+                {"role": "user", "content": question}
+            ],
+            max_tokens=300,
+            temperature=0.7,
+        )
+
+        answer = response['choices'][0]['message']['content']
+
+        # Формируем embed в стиле сервера
+        embed = discord.Embed(
+            title="P-OS 🤖",
+            description=answer,
+            color=discord.Color.blurple()  # цвет сервера, можно заменить
+        )
+        embed.set_footer(text=f"Вопрос от {ctx.author}", icon_url=ctx.author.avatar.url)
+
+        await ctx.send(embed=embed)
+
+    except Exception as e:
+        await ctx.send(f"Произошла ошибка: {e}")
 
 # -----------------------
 # STOPREID (анти-спам)
