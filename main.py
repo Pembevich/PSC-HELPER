@@ -596,7 +596,9 @@ async def ai(ctx, *, question: str):
         response = requests.post(DEEPSEEK_API_URL, headers=headers, json=json_data).json()
         
         # исправлено: берем текст ответа напрямую
-        answer = response.get("text", "Нет ответа от ИИ.")
+        answer = "Нет ответа от ИИ."
+        if "choices" in response and len(response["choices"]) > 0:
+            answer = response["choices"][0]["message"]["content"]
 
         embed = discord.Embed(
             title="P-OS 🤖",
