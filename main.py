@@ -582,24 +582,23 @@ async def sbor_end(interaction: discord.Interaction):
 async def ai(ctx, *, question: str):
     """Отправляет вопрос в OpenAI и возвращает ответ от P-OS."""
     try:
-        # Отправка запроса в OpenAI
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",  # или "gpt-4", если доступно
+        # Новый синтаксис ChatCompletion
+        response = openai.chat.completions.create(
+            model="gpt-3.5-turbo",  # или "gpt-4"
             messages=[
                 {"role": "system", "content": "Ты — P-OS, искусственный интеллект сервера. Отвечай дружелюбно и профессионально."},
                 {"role": "user", "content": question}
             ],
-            max_tokens=300,
             temperature=0.7,
+            max_tokens=300
         )
 
-        answer = response['choices'][0]['message']['content']
+        answer = response.choices[0].message.content
 
-        # Формируем embed в стиле сервера
         embed = discord.Embed(
             title="P-OS 🤖",
             description=answer,
-            color=discord.Color.blurple()  # цвет сервера, можно заменить
+            color=discord.Color.blurple()
         )
         embed.set_footer(text=f"Вопрос от {ctx.author}", icon_url=ctx.author.avatar.url)
 
