@@ -24,8 +24,8 @@ import openai
 VIRUSTOTAL_KEY = os.getenv("VIRUSTOTAL_KEY")
 GOOGLE_SAFEBROWSING_KEY = os.getenv("GOOGLE_SAFEBROWSING_KEY")
 # Подключение API ключа OpenAI из переменной окружения
-openai.api_key = os.getenv("DEEPSEEK_API_KEY")
-openai.api_base = "https://api.deepseek.com/v1"
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat"
 
 # -----------------------
 # Расширенные списки фильтрации (заменяют предыдущие SUSPICIOUS_KEYWORDS / WHITELIST_DOMAINS)
@@ -581,18 +581,19 @@ async def sbor_end(interaction: discord.Interaction):
 # Команда !ai
 @bot.command()
 async def ai(ctx, *, question: str):
-    """P-OS отвечает через DeepSeek API"""
     try:
-        response = openai.ChatCompletion.create(
-            model="deepseek-chat",
-            messages=[
+        headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}"}
+        json_data = {
+            "model": "deepseek-chat",
+            "messages": [
                 {"role": "system", "content": "Ты — P-OS, искусственный интеллект сервера. Отвечай дружелюбно и профессионально."},
                 {"role": "user", "content": question}
             ],
-            max_tokens=300,
-            temperature=0.7,
-        )
+            "max_tokens": 300,
+            "temperature": 0.7
+        }
 
+        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=json_data).json()
         answer = response['choices'][0]['message']['content']
 
         embed = discord.Embed(
