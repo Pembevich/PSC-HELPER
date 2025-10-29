@@ -392,7 +392,7 @@ CESU_ROLE_ID = 1341040607728107591
 CESU_ROLE_REWARDS = [1341100562783014965, 1341039967555551333]
 
 # Дополнительная роль — добавляется ТОЛЬКО к CESU
-CESU_EXTRA_ROLE_ID = 1341198119718621285
+CESU_EXTRA_ROLE_ID = 1341040703551307846
 
 # PSC (embed с логотипом) канал и роль для пинга
 PSC_CHANNEL_ID = 1416417030520967199
@@ -970,7 +970,7 @@ async def on_message(message: discord.Message):
             except Exception:
                 pass
         elif keyword == "cesu":
-            role_id, channel_id, rewards, squad = CESU_ROLE_ID, CESU_CHANNEL_ID, CESU_ROLE_REWARDS + [CESU_EXTRA_ROLE_ID], "C.E.S.U"
+            role_id, channel_id, rewards, squad = CESU_ROLE_ID, CESU_CHANNEL_ID, CESU_ROLE_REWARDS, "C.E.S.U"
             # для CESU разрешаем нажимать и основную роль, и доп. роль CESU_EXTRA_ROLE_ID
             allowed_checker_role_ids = [CESU_ROLE_ID, CESU_EXTRA_ROLE_ID]
             # упоминаем основную роль + доп роль
