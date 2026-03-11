@@ -282,7 +282,7 @@ async def check_and_handle_urls(message: discord.Message) -> bool:
     try:
         dm = Embed(
             title="⚠️ Ссылка заблокирована",
-            description="Ваше сообщение удалено: обнаружены подозрительные ссылки. Вам выдано ограничение голоса на 24 часа.",
+            description="Ваше сообщение удалено: обнаружены подозрительные ссылки. Вам выдан timeout на максимальный срок.",
             color=Color.red()
         )
         dm.add_field(name="Детали", value=f"```{reason_text[:1900]}```", inline=False)
@@ -375,13 +375,12 @@ TAS_CHANNEL_ID = 1394635110665556009
 TAS_REVIEWER_ROLE_IDS = [1341041194733670401, 1341040607728107591, 1341040703551307846]
 TAS_ROLE_REWARDS = [1341040784723411017, 1341040871562285066, 1341100562783014965, 1341039967555551333]
 
-VOICE_TIMEOUT_HOURS = 24
+MAX_TIMEOUT_DAYS = 28
 VIOLATION_ATTACHMENT_LIMIT = 3
 NSFW_FILENAME_KEYWORDS = ["porn", "sex", "xxx", "nsfw", "erotic", "nud", "18+"]
 AD_FILENAME_KEYWORDS = ["casino", "bet", "free", "nitro", "robux", "giveaway", "promo", "advert"]
 AD_TEXT_KEYWORDS = ["подпишись", "реклама", "промокод", "ставки", "казино", "розыгрыш", "nitro", "robux", "бонус"]
-SUSPICIOUS_INVITE_PATTERNS = ["t.me/", "vk.com/"]
-ALLOWED_DISCORD_INVITE_PATTERNS = ["discord.gg/", "discord.com/invite/"]
+SUSPICIOUS_INVITE_PATTERNS = ["discord.gg/", "discord.com/invite/", "t.me/", "vk.com/"]
 
 # PSC (embed с логотипом) канал и роль для пинга
 PSC_CHANNEL_ID = 1416417030520967199
@@ -475,26 +474,11 @@ def assess_applicant_risk(roblox_nick: str, discord_nick: str, member: discord.M
 
 
 async def apply_max_timeout(member: discord.Member, reason: str):
-    until = datetime.now(timezone.utc) + timedelta(hours=VOICE_TIMEOUT_HOURS)
-
-    me = member.guild.me if member.guild else None
-    if me and not me.guild_permissions.moderate_members:
-        print("Не удалось выдать ограничение голоса: у бота нет права Moderate Members")
-        return False
-
     try:
-        await member.edit(timed_out_until=until, reason=reason)
+        await member.edit(timeout=datetime.now(timezone.utc) + timedelta(days=MAX_TIMEOUT_DAYS), reason=reason)
         return True
-    except TypeError:
-        # fallback для старых сигнатур discord.py
-        try:
-            await member.edit(timeout=until, reason=reason)
-            return True
-        except Exception as e:
-            print(f"Не удалось выдать ограничение голоса: {e}")
-            return False
     except Exception as e:
-        print(f"Не удалось выдать ограничение голоса: {e}")
+        print(f"Не удалось выдать timeout: {e}")
         return False
 
 
@@ -534,21 +518,10 @@ async def log_violation_with_evidence(message: discord.Message, title: str, reas
 def detect_advertising_or_scam_text(text: str):
     t = (text or "").lower()
     reasons = []
-
-    # Обычные Discord-инвайты сами по себе не считаем рекламой.
-    has_discord_invite = any(p in t for p in ALLOWED_DISCORD_INVITE_PATTERNS)
-
     if any(p in t for p in SUSPICIOUS_INVITE_PATTERNS):
         reasons.append("инвайт/внешняя ссылка для рекламы")
-
-    # Ключевики рекламы/скама считаем нарушением.
-    # Но если в сообщении только Discord-инвайт без рекламных маркеров — не триггерим.
     if any(k in t for k in AD_TEXT_KEYWORDS):
         reasons.append("рекламные/скам ключевые слова")
-
-    if has_discord_invite and reasons == ["инвайт/внешняя ссылка для рекламы"]:
-        return []
-
     return reasons
 
 
@@ -775,7 +748,7 @@ async def handle_spam_if_needed(message: discord.Message):
     try:
         dm = Embed(
             title="🚫 Обнаружен спам",
-            description="Вы отправляли повторяющиеся сообщения. Выдано ограничение голоса на 24 часа.",
+            description="Вы отправляли повторяющиеся сообщения. Выдан timeout на максимальный срок.",
             color=Color.orange()
         )
         dm.add_field(name="Детали", value=reasons[0], inline=False)
@@ -907,7 +880,7 @@ async def on_message(message: discord.Message):
         try:
             dm = Embed(
                 title="🚫 Сообщение удалено",
-                description="Обнаружены признаки рекламы/скама или нерелевантного медиа. Выдано ограничение голоса на 24 часа.",
+                description="Обнаружены признаки рекламы/скама или нерелевантного медиа. Выдан timeout на максимальный срок.",
                 color=Color.red()
             )
             dm.add_field(name="Причины", value="\n".join(f"• {r}" for r in moderation_reasons)[:1024], inline=False)
