@@ -69,7 +69,7 @@ SUSPICIOUS_PATH_KEYWORDS = [
 ]
 
 # whitelist — если домен содержит любой из этих фрагментов — не фильтруем
-WHITELIST_DOMAINS = {"discord.com", "youtube.com", "roblox.com", "google.com", "github.com"}
+WHITELIST_DOMAINS = {"discord.com", "discord.gg", "youtube.com", "roblox.com", "google.com", "github.com"}
 
 # регулярка для поиска ссылок (оставляем как у тебя)
 URL_REGEX = re.compile(r"(https?://[^\s]+)")
