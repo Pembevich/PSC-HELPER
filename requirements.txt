@@ -1,4 +1,4 @@
-discord.py
+discord.py==2.3.2
 python-dotenv
 aiosqlite
 pillow
@@ -7,5 +7,4 @@ moviepy==1.0.3
 imageio-ffmpeg>=0.4.5
 pytube
 yt-dlp
-discord.py==2.3.2
 openai>=1.0.0
