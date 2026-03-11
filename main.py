@@ -10,7 +10,7 @@ import uuid
 import re
 import asyncio
 from discord import Embed, Color
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from discord.ui import View, button, Modal, TextInput
 import aiohttp
 import requests
@@ -69,7 +69,7 @@ SUSPICIOUS_PATH_KEYWORDS = [
 ]
 
 # whitelist — если домен содержит любой из этих фрагментов — не фильтруем
-WHITELIST_DOMAINS = {"discord.com", "youtube.com", "roblox.com", "google.com", "github.com"}
+WHITELIST_DOMAINS = {"discord.com", "discord.gg", "youtube.com", "roblox.com", "google.com", "github.com"}
 
 # регулярка для поиска ссылок (оставляем как у тебя)
 URL_REGEX = re.compile(r"(https?://[^\s]+)")
@@ -77,6 +77,43 @@ URL_REGEX = re.compile(r"(https?://[^\s]+)")
 # кеш VirusTotal: url -> (bool_is_bad, timestamp)
 _vt_cache = {}
 _VT_CACHE_TTL = 60 * 60  # 1 час
+
+
+
+DISCORD_TOKEN_ENV_CANDIDATES = ("DISCORD_TOKEN", "BOT_TOKEN", "TOKEN")
+
+
+def sanitize_discord_token(raw: str | None) -> str:
+    """Убирает частые артефакты из токена (пробелы, кавычки, префикс Bot)."""
+    token = (raw or "").strip().strip('"').strip("'")
+    if token.lower().startswith("bot "):
+        token = token[4:].strip()
+    return token
+
+
+def resolve_discord_token():
+    """Ищет токен в стандартных env-именах и возвращает (token, source_env)."""
+    for env_name in DISCORD_TOKEN_ENV_CANDIDATES:
+        value = os.getenv(env_name)
+        if value:
+            return sanitize_discord_token(value), env_name
+    return "", None
+
+
+def looks_like_discord_token(token: str) -> bool:
+    """Быстрая валидация формата токена до попытки логина."""
+    parts = token.split(".")
+    return len(parts) == 3 and all(parts)
+def collect_runtime_health() -> dict:
+    """Собирает ключевые параметры окружения для быстрой диагностики."""
+    token, token_source = resolve_discord_token()
+    return {
+        "DISCORD_TOKEN": bool(token),
+        "DISCORD_TOKEN_SOURCE": token_source or "not-set",
+        "VIRUSTOTAL_KEY": bool(VIRUSTOTAL_KEY),
+        "GOOGLE_SAFEBROWSING_KEY": bool(GOOGLE_SAFEBROWSING_KEY),
+        "DEEPSEEK_API_KEY": bool(DEEPSEEK_API_KEY),
+    }
 
 def _normalize_domain(raw_domain: str) -> str:
     """
@@ -258,46 +295,24 @@ async def check_and_handle_urls(message: discord.Message) -> bool:
     if not suspicious:
         return False
 
-    # если нашли подозрительные ссылки — действуем (поведение как в твоём коде)
     reason_text = "\n".join(f"{u} -> {why}" for u, why in suspicious)
+    reasons = [f"Подозрительная ссылка: {u} ({why})" for u, why in suspicious]
 
-    # удаляем сообщение
     try:
         await message.delete()
     except Exception:
         pass
 
-    # мутим пользователя
-    try:
-        mute_role = message.guild.get_role(MUTE_ROLE_ID)
-        if mute_role:
-            await message.author.add_roles(mute_role, reason="Вредоносная/неприемлемая ссылка")
-    except Exception as e:
-        print(f"Ошибка при выдаче мута: {e}")
+    await apply_max_timeout(message.author, "Автомодерация: опасные ссылки")
+    await log_violation_with_evidence(message, "🚨 Опасная ссылка", reasons)
 
-    # лог в анти-рейд канал
-    try:
-        log_chan = message.guild.get_channel(SPAM_LOG_CHANNEL)
-        if log_chan:
-            em = Embed(
-                title="🚨 Вредоносная ссылка заблокирована",
-                description=f"Сообщение от {message.author.mention} удалено.",
-                color=Color.red()
-            )
-            em.add_field(name="Канал", value=message.channel.mention, inline=False)
-            em.add_field(name="Ссылки", value=f"```{reason_text}```", inline=False)
-            await log_chan.send(embed=em)
-    except Exception as e:
-        print(f"Ошибка при логировании: {e}")
-
-    # уведомление пользователю в ЛС
     try:
         dm = Embed(
             title="⚠️ Ссылка заблокирована",
-            description="Ваше сообщение удалено, так как в нём обнаружена подозрительная или неприемлемая ссылка. Вы временно замучены.",
+            description="Ваше сообщение удалено: обнаружены подозрительные ссылки. Вам выдано ограничение голоса на 24 часа.",
             color=Color.red()
         )
-        dm.add_field(name="Детали", value=f"```{reason_text}```", inline=False)
+        dm.add_field(name="Детали", value=f"```{reason_text[:1900]}```", inline=False)
         await message.author.send(embed=dm)
     except Exception:
         pass
@@ -305,14 +320,14 @@ async def check_and_handle_urls(message: discord.Message) -> bool:
     return True
 
 # -----------------------
-# ConfirmView для выдачи ролей (с изменённой логикой для CESU DM)
+# ConfirmView для выдачи ролей (единый отряд TAS)
 # -----------------------
 class ConfirmView(View):
     def __init__(self, allowed_checker_role_ids, target_message, squad_name, role_ids, target_user_id):
         """
         allowed_checker_role_ids: список id ролей, которые имеют право нажимать кнопки подтверждения
         target_message: исходное сообщение (объект discord.Message) от пользователя, которое было отправлено в форму
-        squad_name: строка с названием отряда ("G.o.T" или "C.E.S.U")
+        squad_name: строка с названием отряда
         role_ids: список id ролей, которые будут выданы после одобрения (rewards)
         target_user_id: id пользователя, которого нужно зачислить
         """
@@ -341,15 +356,13 @@ class ConfirmView(View):
                         await member.add_roles(role)
                     except Exception:
                         pass
-            # Если это C.E.S.U — отправляем ЛС-эмбед с сообщением о принятии и эмодзи времени
             try:
-                if self.squad_name == "C.E.S.U":
-                    dm_embed = Embed(
-                        title="⏳ Ваша заявка принята!",
-                        description="Скоро вам напишут для проведения опроса. Ожидайте.",
-                        color=Color.green()
-                    )
-                    await member.send(embed=dm_embed)
+                dm_embed = Embed(
+                    title="⏳ Ваша заявка принята!",
+                    description="Вы успешно прошли предварительное подтверждение. Ожидайте связи от офицера отряда.",
+                    color=Color.green()
+                )
+                await member.send(embed=dm_embed)
             except Exception:
                 pass
             # Ответ в канале (как было)
@@ -383,16 +396,19 @@ allowed_guild_ids = [1340594372596469872]
 sbor_channels = {}
 
 FORM_CHANNEL_ID = 1340996239113850971
-GOT_CHANNEL_ID = 1394635110665556009
-GOT_ROLE_ID = 1341041194733670401
-GOT_ROLE_REWARDS = [1341040784723411017, 1341040871562285066]
 
-CESU_CHANNEL_ID = 1394635216986964038
-CESU_ROLE_ID = 1341040607728107591
-CESU_ROLE_REWARDS = [1341100562783014965, 1341039967555551333]
+# Единый отряд TAS (заменяет старые GOT/CESU формы)
+TAS_CHANNEL_ID = 1394635110665556009
+TAS_REVIEWER_ROLE_IDS = [1341041194733670401, 1341040607728107591, 1341040703551307846]
+TAS_ROLE_REWARDS = [1341040784723411017, 1341040871562285066, 1341100562783014965, 1341039967555551333]
 
-# Дополнительная роль — добавляется ТОЛЬКО к CESU
-CESU_EXTRA_ROLE_ID = 1341040703551307846
+VOICE_TIMEOUT_HOURS = 24
+VIOLATION_ATTACHMENT_LIMIT = 3
+NSFW_FILENAME_KEYWORDS = ["porn", "sex", "xxx", "nsfw", "erotic", "nud", "18+"]
+AD_FILENAME_KEYWORDS = ["casino", "bet", "free", "nitro", "robux", "giveaway", "promo", "advert"]
+AD_TEXT_KEYWORDS = ["подпишись", "реклама", "промокод", "ставки", "казино", "розыгрыш", "nitro", "robux", "бонус"]
+SUSPICIOUS_INVITE_PATTERNS = ["t.me/", "vk.com/"]
+ALLOWED_DISCORD_INVITE_PATTERNS = ["discord.gg/", "discord.com/invite/"]
 
 # PSC (embed с логотипом) канал и роль для пинга
 PSC_CHANNEL_ID = 1416417030520967199
@@ -463,6 +479,119 @@ async def safe_send_dm(user: discord.User, embed: Embed, file: discord.File = No
         # Нельзя отправить ЛС — игнорируем
         pass
 
+
+def assess_applicant_risk(roblox_nick: str, discord_nick: str, member: discord.Member):
+    reasons = []
+    rb = (roblox_nick or "").strip()
+    dn = (discord_nick or "").strip()
+
+    if re.search(r"https?://|discord\.gg|t\.me", rb + " " + dn, re.IGNORECASE):
+        reasons.append("в нике есть ссылка/инвайт")
+    if any(ch in rb + dn for ch in ["$", "@everyone", "@here"]):
+        reasons.append("подозрительные символы в нике")
+    if len(re.sub(r"\D", "", rb)) >= 5 or len(re.sub(r"\D", "", dn)) >= 5:
+        reasons.append("много цифр в никнейме")
+    if member and member.created_at:
+        created = member.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - created).days
+        if age_days < 14:
+            reasons.append(f"свежий Discord-аккаунт ({age_days} дн.)")
+    return reasons
+
+
+async def apply_max_timeout(member: discord.Member, reason: str):
+    until = datetime.now(timezone.utc) + timedelta(hours=VOICE_TIMEOUT_HOURS)
+
+    me = member.guild.me if member.guild else None
+    if me and not me.guild_permissions.moderate_members:
+        print("Не удалось выдать ограничение голоса: у бота нет права Moderate Members")
+        return False
+
+    try:
+        await member.edit(timed_out_until=until, reason=reason)
+        return True
+    except TypeError:
+        # fallback для старых сигнатур discord.py
+        try:
+            await member.edit(timeout=until, reason=reason)
+            return True
+        except Exception as e:
+            print(f"Не удалось выдать ограничение голоса: {e}")
+            return False
+    except Exception as e:
+        print(f"Не удалось выдать ограничение голоса: {e}")
+        return False
+
+
+async def log_violation_with_evidence(message: discord.Message, title: str, reasons: list[str]):
+    if not message.guild:
+        return
+    log_chan = message.guild.get_channel(SPAM_LOG_CHANNEL)
+    if not log_chan:
+        return
+
+    emb = Embed(title=title, color=Color.red(), timestamp=datetime.utcnow())
+    emb.add_field(name="Пользователь", value=f"{message.author.mention} (`{message.author.id}`)", inline=False)
+    emb.add_field(name="Канал", value=message.channel.mention, inline=False)
+    emb.add_field(name="Причины", value="\n".join(f"• {r}" for r in reasons)[:1024], inline=False)
+    emb.add_field(name="Контент", value=(message.content or "(без текста)")[:1000], inline=False)
+
+    if message.attachments:
+        links = "\n".join(a.url for a in message.attachments[:5])
+        emb.add_field(name="Вложения (URL)", value=links[:1024], inline=False)
+
+    files = []
+    for a in message.attachments[:VIOLATION_ATTACHMENT_LIMIT]:
+        try:
+            files.append(await a.to_file())
+        except Exception:
+            pass
+
+    try:
+        if files:
+            await log_chan.send(embed=emb, files=files)
+        else:
+            await log_chan.send(embed=emb)
+    except Exception as e:
+        print(f"Ошибка логирования нарушения: {e}")
+
+
+def detect_advertising_or_scam_text(text: str):
+    t = (text or "").lower()
+    reasons = []
+
+    # Обычные Discord-инвайты сами по себе не считаем рекламой.
+    has_discord_invite = any(p in t for p in ALLOWED_DISCORD_INVITE_PATTERNS)
+
+    if any(p in t for p in SUSPICIOUS_INVITE_PATTERNS):
+        reasons.append("инвайт/внешняя ссылка для рекламы")
+
+    # Ключевики рекламы/скама считаем нарушением.
+    # Но если в сообщении только Discord-инвайт без рекламных маркеров — не триггерим.
+    if any(k in t for k in AD_TEXT_KEYWORDS):
+        reasons.append("рекламные/скам ключевые слова")
+
+    if has_discord_invite and reasons == ["инвайт/внешняя ссылка для рекламы"]:
+        return []
+
+    return reasons
+
+
+def detect_attachment_violations(attachments):
+    reasons = []
+    for att in attachments:
+        name = (att.filename or "").lower()
+        ctype = (att.content_type or "").lower()
+        if any(k in name for k in NSFW_FILENAME_KEYWORDS):
+            reasons.append(f"NSFW по имени файла: {att.filename}")
+        if any(k in name for k in AD_FILENAME_KEYWORDS):
+            reasons.append(f"реклама/скам по имени файла: {att.filename}")
+        if ctype.startswith("video/") and any(k in name for k in ["casino", "porn", "nitro", "robux"]):
+            reasons.append(f"подозрительное видео: {att.filename}")
+    return reasons
+
 # -----------------------
 # КОМАНДЫ: gif + sbor (как у тебя были)
 # -----------------------
@@ -514,6 +643,25 @@ async def gif(ctx):
                 os.remove(f)
         if os.path.exists(output_path):
             os.remove(output_path)
+
+
+@bot.command(name="health")
+async def health(ctx):
+    """Показывает состояние бота и наличие ключей окружения."""
+    runtime = collect_runtime_health()
+    status_lines = [
+        f"`{name}`: {'✅ OK' if enabled else '⚠️ отсутствует'}"
+        for name, enabled in runtime.items()
+    ]
+
+    embed = Embed(
+        title="Состояние бота",
+        description="\n".join(status_lines),
+        color=Color.green() if runtime["DISCORD_TOKEN"] else Color.orange(),
+        timestamp=datetime.utcnow(),
+    )
+    embed.add_field(name="Latency", value=f"`{round(bot.latency * 1000)}ms`", inline=False)
+    await ctx.send(embed=embed)
 
 @bot.tree.command(name="sbor", description="Начать сбор: создаёт голосовой канал и пингует роль")
 @discord.app_commands.describe(role="Роль, которую нужно пинговать")
@@ -630,39 +778,41 @@ async def handle_spam_if_needed(message: discord.Message):
     now = time.time()
     dq = recent_messages[user_id]
     dq.append((key, now, message.id, message.channel.id))
-    # удалить старые
+
     while dq and now - dq[0][1] > SPAM_WINDOW_SECONDS:
         dq.popleft()
-    # подсчитать количество одинаковых ключей
-    count = sum(1 for k, t, mid, cid in dq if k == key)
-    if count >= SPAM_DUPLICATES_THRESHOLD:
-        # действуем: удаляем последние совпадающие сообщения в канале и мутим
-        to_delete = [mid for k0, t0, mid, cid in dq if k0 == key and cid == message.channel.id]
-        for mid in to_delete:
-            try:
-                msg = await message.channel.fetch_message(mid)
-                if msg:
-                    await msg.delete()
-            except Exception:
-                pass
-        # выдаём роль мута
-        guild = message.guild
-        mute_role = guild.get_role(MUTE_ROLE_ID) if guild else None
-        member = guild.get_member(user_id) if guild else None
-        if member and mute_role:
-            try:
-                await member.add_roles(mute_role, reason="STOPREID spam auto-mute")
-            except Exception:
-                pass
-        # логируем
-        spam_log = guild.get_channel(SPAM_LOG_CHANNEL) if guild else None
-        if spam_log and member:
-            try:
-                await spam_log.send(embed=Embed(title="🚨 STOPREID", description=f"{member.mention} был замучен за спам.\nКанал: {message.channel.mention}\nСообщение: `{(message.content or '')[:300]}`", color=Color.orange()))
-            except Exception:
-                pass
-        # очистим deque для пользователя, чтобы не повторять
-        recent_messages[user_id].clear()
+
+    count = sum(1 for k, _, _, _ in dq if k == key)
+    if count < SPAM_DUPLICATES_THRESHOLD:
+        return False
+
+    to_delete = [mid for k0, _, mid, cid in dq if k0 == key and cid == message.channel.id]
+    for mid in to_delete:
+        try:
+            msg = await message.channel.fetch_message(mid)
+            if msg:
+                await msg.delete()
+        except Exception:
+            pass
+
+    reasons = [f"Спам одинаковыми сообщениями: {count} шт. за {SPAM_WINDOW_SECONDS} сек."]
+    await apply_max_timeout(message.author, "Автомодерация: спам")
+    await log_violation_with_evidence(message, "🚨 STOPREID: спам", reasons)
+
+    try:
+        dm = Embed(
+            title="🚫 Обнаружен спам",
+            description="Вы отправляли повторяющиеся сообщения. Выдано ограничение голоса на 24 часа.",
+            color=Color.orange()
+        )
+        dm.add_field(name="Детали", value=reasons[0], inline=False)
+        await message.author.send(embed=dm)
+    except Exception:
+        pass
+
+    recent_messages[user_id].clear()
+    return True
+
 
 # -----------------------
 # Жалобы: view + modal
@@ -765,9 +915,33 @@ async def on_message(message: discord.Message):
 
     # сначала — STOPREID (анти-спам), независимо от канала
     try:
-        await handle_spam_if_needed(message)
+        if await handle_spam_if_needed(message):
+            return
     except Exception:
         pass
+
+    # Доп. автомодерация: реклама/скам в тексте + медиа-файлы
+    text_reasons = detect_advertising_or_scam_text(message.content or "")
+    attachment_reasons = detect_attachment_violations(message.attachments)
+    moderation_reasons = text_reasons + attachment_reasons
+    if moderation_reasons:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await apply_max_timeout(message.author, "Автомодерация: реклама/NSFW/вложения")
+        await log_violation_with_evidence(message, "🚨 Автомодерация: нарушение контента", moderation_reasons)
+        try:
+            dm = Embed(
+                title="🚫 Сообщение удалено",
+                description="Обнаружены признаки рекламы/скама или нерелевантного медиа. Выдано ограничение голоса на 24 часа.",
+                color=Color.red()
+            )
+            dm.add_field(name="Причины", value="\n".join(f"• {r}" for r in moderation_reasons)[:1024], inline=False)
+            await message.author.send(embed=dm)
+        except Exception:
+            pass
+        return
         
     # --- Авто-отписки: эмбед + ветка (thread) ---
     try:
@@ -934,15 +1108,25 @@ async def on_message(message: discord.Message):
                     await complaint_chan.send(notify_role.mention)
                 view = ComplaintView(submitter=message.author, complaint_channel_id=complaint_chan.id)
                 await complaint_chan.send(embed=embed, view=view)
+
+                if message.attachments:
+                    files = []
+                    for att in message.attachments[:5]:
+                        try:
+                            files.append(await att.to_file())
+                        except Exception:
+                            pass
+                    if files:
+                        await complaint_chan.send(content="📎 Приложенные доказательства от автора жалобы:", files=files)
         except Exception:
             pass
 
         await bot.process_commands(message)
         return
 
-    # --- Обработка формы вступления (got/cesu) ---
+    # --- Обработка формы вступления (единый отряд TAS) ---
     if message.channel.id == FORM_CHANNEL_ID:
-        template = "1. Ваш роблокс никнейм (НЕ ДИСПЛЕЙ)\n2. Ваш Дискорд Ник\n3. got или cesu"
+        template = "1. Ваш roblox никнейм (НЕ ДИСПЛЕЙ)\n2. Ваш Discord ник\n3. tas"
         lines = [line.strip() for line in (message.content or "").strip().split("\n") if line.strip()]
         if len(lines) != 3:
             try:
@@ -952,70 +1136,58 @@ async def on_message(message: discord.Message):
             await bot.process_commands(message)
             return
 
-        user_line, id_line, choice_line = lines
+        user_line, discord_nick_line, choice_line = lines
         keyword = extract_clean_keyword(choice_line)
 
-        # По твоему требованию: дополнительная роль (CESU_EXTRA_ROLE_ID) добавляется ТОЛЬКО к CESU
-        if keyword == "got":
-            role_id, channel_id, rewards, squad = GOT_ROLE_ID, GOT_CHANNEL_ID, GOT_ROLE_REWARDS, "G.o.T"
-            # разрешённые проверяющие для G.o.T — только роль G.o.T (чтобы нажимать кнопки)
-            allowed_checker_role_ids = [GOT_ROLE_ID]
-            # упоминаем только основную роль
-            mentions = []
-            role_ping = None
+        if keyword != "tas":
             try:
-                role_ping = message.guild.get_role(role_id)
-                if role_ping:
-                    mentions.append(role_ping.mention)
-            except Exception:
-                pass
-        elif keyword == "cesu":
-            role_id, channel_id, rewards, squad = CESU_ROLE_ID, CESU_CHANNEL_ID, CESU_ROLE_REWARDS, "C.E.S.U"
-            # для CESU разрешаем нажимать и основную роль, и доп. роль CESU_EXTRA_ROLE_ID
-            allowed_checker_role_ids = [CESU_ROLE_ID, CESU_EXTRA_ROLE_ID]
-            # упоминаем основную роль + доп роль
-            mentions = []
-            try:
-                r1 = message.guild.get_role(CESU_ROLE_ID)
-                if r1:
-                    mentions.append(r1.mention)
-            except Exception:
-                pass
-            try:
-                r2 = message.guild.get_role(CESU_EXTRA_ROLE_ID)
-                if r2:
-                    mentions.append(r2.mention)
-            except Exception:
-                pass
-        else:
-            try:
-                await message.reply(embed=Embed(title="❌ Неизвестный отряд", description="Третий пункт должен содержать **только** got или cesu.", color=Color.red()).add_field(name="Пример", value=f"```{template}```"))
+                await message.reply(embed=Embed(title="❌ Неизвестный отряд", description="Третий пункт должен содержать только **tas**.", color=Color.red()).add_field(name="Пример", value=f"```{template}```"))
             except Exception:
                 pass
             await bot.process_commands(message)
             return
 
-        target_channel = message.guild.get_channel(channel_id)
+        target_channel = message.guild.get_channel(TAS_CHANNEL_ID)
         if not target_channel:
             try:
-                await message.reply("❌ Ошибка конфигурации: целевой канал не найден.")
+                await message.reply("❌ Ошибка конфигурации: канал TAS не найден.")
             except Exception:
                 pass
             await bot.process_commands(message)
             return
 
-        embed = Embed(title=f"📋 Подтверждение вступления в {squad}", description=f"{message.author.mention} хочет вступить в отряд **{squad}**\nНикнейм: `{user_line}`\nID: `{id_line}`", color=Color.blue())
+        risk_flags = assess_applicant_risk(user_line, discord_nick_line, message.author)
+        risk_text = "\n".join(f"⚠️ {flag}" for flag in risk_flags) if risk_flags else "✅ Явных рисков не обнаружено"
+
+        embed = Embed(
+            title="📋 Подтверждение вступления в TAS",
+            description=(
+                f"{message.author.mention} хочет вступить в отряд **TAS**\n"
+                f"Roblox ник: `{user_line}`\n"
+                f"Discord ник: `{discord_nick_line}`"
+            ),
+            color=Color.blue()
+        )
+        embed.add_field(name="Автопроверка кандидата", value=risk_text[:1024], inline=False)
         embed.set_footer(text=f"ID пользователя: {message.author.id} | {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
 
-        # создаём view с allowed_checker_role_ids (для GOT это [GOT_ROLE_ID], для CESU — [CESU_ROLE_ID, CESU_EXTRA_ROLE_ID])
-        view = ConfirmView(allowed_checker_role_ids, target_message=message, squad_name=squad, role_ids=rewards, target_user_id=message.author.id)
+        view = ConfirmView(
+            TAS_REVIEWER_ROLE_IDS,
+            target_message=message,
+            squad_name="TAS",
+            role_ids=TAS_ROLE_REWARDS,
+            target_user_id=message.author.id
+        )
 
-        # формируем строку упоминаний
-        mentions_text = " ".join(mentions) if mentions else None
+        mentions = []
+        for rid in TAS_REVIEWER_ROLE_IDS:
+            role = message.guild.get_role(rid)
+            if role:
+                mentions.append(role.mention)
 
         try:
-            if mentions_text:
-                await target_channel.send(content=mentions_text, embed=embed, view=view)
+            if mentions:
+                await target_channel.send(content=" ".join(mentions), embed=embed, view=view)
             else:
                 await target_channel.send(embed=embed, view=view)
         except Exception:
@@ -1234,6 +1406,11 @@ async def on_member_remove(member: discord.Member):
 @bot.event
 async def on_ready():
     print(f"✅ Бот запущен как {bot.user} (id: {bot.user.id})")
+    runtime = collect_runtime_health()
+    missing_optional = [k for k, available in runtime.items() if not available and k != "DISCORD_TOKEN"]
+    if missing_optional:
+        print(f"⚠️ Не настроены опциональные ключи: {', '.join(missing_optional)}")
+
     for guild_id in allowed_guild_ids:
         try:
             guild = discord.Object(id=guild_id)
@@ -1246,8 +1423,16 @@ async def on_ready():
 # Запуск
 # -----------------------
 if __name__ == "__main__":
-    token = os.getenv("DISCORD_TOKEN")
+    token, token_source = resolve_discord_token()
     if not token:
-        print("ERROR: DISCORD_TOKEN not set in environment.")
+        print("ERROR: Discord token not set. Configure one of env vars: DISCORD_TOKEN / BOT_TOKEN / TOKEN")
+    elif not looks_like_discord_token(token):
+        print(f"ERROR: Discord token from {token_source} has invalid format. Check Railway variable value (no quotes/prefix).")
     else:
-        bot.run(token)
+        try:
+            print(f"ℹ️ Использую токен из переменной: {token_source}")
+            bot.run(token)
+        except discord.errors.LoginFailure:
+            print(
+                f"ERROR: Discord login failed (401 Unauthorized). Проверь токен в Railway ({token_source}) и регенерируй его в Discord Developer Portal."
+            )
