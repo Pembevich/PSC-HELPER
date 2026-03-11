@@ -1369,8 +1369,10 @@ async def on_ready():
 # Запуск
 # -----------------------
 if __name__ == "__main__":
-    token = os.getenv("DISCORD_TOKEN")
+    token, token_source = resolve_discord_token()
     if not token:
-        print("ERROR: DISCORD_TOKEN not set in environment.")
+        print("ERROR: Discord token not set. Configure one of env vars: DISCORD_TOKEN / BOT_TOKEN / TOKEN")
+    elif not looks_like_discord_token(token):
+        print(f"ERROR: Discord token from {token_source} has invalid format. Check Railway variable value (no quotes/prefix).")
     else:
         bot.run(token)
