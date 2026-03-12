@@ -79,40 +79,10 @@ _vt_cache = {}
 _VT_CACHE_TTL = 60 * 60  # 1 час
 
 
-
-DISCORD_TOKEN_ENV_CANDIDATES = ("DISCORD_TOKEN", "BOT_TOKEN", "TOKEN")
-
-
-def sanitize_discord_token(raw: str | None) -> str:
-    """Убирает частые артефакты из токена (пробелы, кавычки, префикс Bot)."""
-    token = (raw or "").strip().strip('"').strip("'")
-    if token.lower().startswith("bot "):
-        token = token[4:].strip()
-    return token
-
-
-def resolve_discord_token():
-    """Ищет токен в стандартных env-именах и возвращает (token, source_env)."""
-    for env_name in DISCORD_TOKEN_ENV_CANDIDATES:
-        value = os.getenv(env_name)
-        if value:
-            return sanitize_discord_token(value), env_name
-    return "", None
-
 def collect_runtime_health() -> dict:
     """Собирает ключевые параметры окружения для быстрой диагностики."""
-    token = ""
-    token_source = None
-    for env_name in DISCORD_TOKEN_ENV_CANDIDATES:
-        raw = os.getenv(env_name)
-        if raw:
-            token = sanitize_discord_token(raw)
-            token_source = env_name
-            break
-
     return {
-        "DISCORD_TOKEN": bool(token),
-        "DISCORD_TOKEN_SOURCE": token_source or "not-set",
+        "DISCORD_TOKEN": bool(os.getenv("DISCORD_TOKEN")),
         "VIRUSTOTAL_KEY": bool(VIRUSTOTAL_KEY),
         "GOOGLE_SAFEBROWSING_KEY": bool(GOOGLE_SAFEBROWSING_KEY),
         "DEEPSEEK_API_KEY": bool(DEEPSEEK_API_KEY),
@@ -1432,10 +1402,4 @@ if __name__ == "__main__":
     if not token:
         print("ERROR: DISCORD_TOKEN not set in Railway values.")
     else:
-        try:
-            print("ℹ️ Использую токен из переменной: DISCORD_TOKEN")
-            bot.run(token)
-        except discord.errors.LoginFailure:
-            print(
-                "ERROR: Discord login failed (401 Unauthorized). Проверь DISCORD_TOKEN в Railway (без кавычек/лишних пробелов) или сгенерируй новый токен в Discord Developer Portal."
-            )
+        bot.run(token)
