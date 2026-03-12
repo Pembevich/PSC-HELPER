@@ -282,7 +282,7 @@ async def check_and_handle_urls(message: discord.Message) -> bool:
     try:
         dm = Embed(
             title="⚠️ Ссылка заблокирована",
-            description="Ваше сообщение удалено: обнаружены подозрительные ссылки. Вам выдан timeout на максимальный срок.",
+            description="Ваше сообщение удалено: обнаружены подозрительные ссылки. Вам выдано ограничение голоса на 24 часа.",
             color=Color.red()
         )
         dm.add_field(name="Детали", value=f"```{reason_text[:1900]}```", inline=False)
@@ -293,7 +293,7 @@ async def check_and_handle_urls(message: discord.Message) -> bool:
     return True
 
 # -----------------------
-# ConfirmView для выдачи ролей (единый отряд TAS)
+# ConfirmView для выдачи ролей (единый отряд TAC)
 # -----------------------
 class ConfirmView(View):
     def __init__(self, allowed_checker_role_ids, target_message, squad_name, role_ids, target_user_id):
@@ -370,17 +370,18 @@ sbor_channels = {}
 
 FORM_CHANNEL_ID = 1340996239113850971
 
-# Единый отряд TAS (заменяет старые GOT/CESU формы)
-TAS_CHANNEL_ID = 1394635110665556009
-TAS_REVIEWER_ROLE_IDS = [1341041194733670401, 1341040607728107591, 1341040703551307846]
-TAS_ROLE_REWARDS = [1341040784723411017, 1341040871562285066, 1341100562783014965, 1341039967555551333]
+# Единый отряд TAC (заменяет старые GOT/CESU формы)
+TAC_CHANNEL_ID = 1394635110665556009
+TAC_REVIEWER_ROLE_IDS = [1341041194733670401, 1341040607728107591, 1341040703551307846]
+TAC_ROLE_REWARDS = [1341040784723411017, 1341040871562285066, 1341100562783014965, 1341039967555551333]
 
-MAX_TIMEOUT_DAYS = 28
+VOICE_TIMEOUT_HOURS = 24
 VIOLATION_ATTACHMENT_LIMIT = 3
 NSFW_FILENAME_KEYWORDS = ["porn", "sex", "xxx", "nsfw", "erotic", "nud", "18+"]
 AD_FILENAME_KEYWORDS = ["casino", "bet", "free", "nitro", "robux", "giveaway", "promo", "advert"]
 AD_TEXT_KEYWORDS = ["подпишись", "реклама", "промокод", "ставки", "казино", "розыгрыш", "nitro", "robux", "бонус"]
-SUSPICIOUS_INVITE_PATTERNS = ["discord.gg/", "discord.com/invite/", "t.me/", "vk.com/"]
+SUSPICIOUS_INVITE_PATTERNS = ["t.me/", "vk.com/"]
+ALLOWED_DISCORD_INVITE_PATTERNS = ["discord.gg/", "discord.com/invite/"]
 
 # PSC (embed с логотипом) канал и роль для пинга
 PSC_CHANNEL_ID = 1416417030520967199
@@ -474,11 +475,26 @@ def assess_applicant_risk(roblox_nick: str, discord_nick: str, member: discord.M
 
 
 async def apply_max_timeout(member: discord.Member, reason: str):
+    until = datetime.now(timezone.utc) + timedelta(hours=VOICE_TIMEOUT_HOURS)
+
+    me = member.guild.me if member.guild else None
+    if me and not me.guild_permissions.moderate_members:
+        print("Не удалось выдать ограничение голоса: у бота нет права Moderate Members")
+        return False
+
     try:
-        await member.edit(timeout=datetime.now(timezone.utc) + timedelta(days=MAX_TIMEOUT_DAYS), reason=reason)
+        await member.edit(timed_out_until=until, reason=reason)
         return True
+    except TypeError:
+        # fallback для старых сигнатур discord.py
+        try:
+            await member.edit(timeout=until, reason=reason)
+            return True
+        except Exception as e:
+            print(f"Не удалось выдать ограничение голоса: {e}")
+            return False
     except Exception as e:
-        print(f"Не удалось выдать timeout: {e}")
+        print(f"Не удалось выдать ограничение голоса: {e}")
         return False
 
 
@@ -518,10 +534,21 @@ async def log_violation_with_evidence(message: discord.Message, title: str, reas
 def detect_advertising_or_scam_text(text: str):
     t = (text or "").lower()
     reasons = []
+
+    # Обычные Discord-инвайты сами по себе не считаем рекламой.
+    has_discord_invite = any(p in t for p in ALLOWED_DISCORD_INVITE_PATTERNS)
+
     if any(p in t for p in SUSPICIOUS_INVITE_PATTERNS):
         reasons.append("инвайт/внешняя ссылка для рекламы")
+
+    # Ключевики рекламы/скама считаем нарушением.
+    # Но если в сообщении только Discord-инвайт без рекламных маркеров — не триггерим.
     if any(k in t for k in AD_TEXT_KEYWORDS):
         reasons.append("рекламные/скам ключевые слова")
+
+    if has_discord_invite and reasons == ["инвайт/внешняя ссылка для рекламы"]:
+        return []
+
     return reasons
 
 
@@ -748,7 +775,7 @@ async def handle_spam_if_needed(message: discord.Message):
     try:
         dm = Embed(
             title="🚫 Обнаружен спам",
-            description="Вы отправляли повторяющиеся сообщения. Выдан timeout на максимальный срок.",
+            description="Вы отправляли повторяющиеся сообщения. Выдано ограничение голоса на 24 часа.",
             color=Color.orange()
         )
         dm.add_field(name="Детали", value=reasons[0], inline=False)
@@ -880,7 +907,7 @@ async def on_message(message: discord.Message):
         try:
             dm = Embed(
                 title="🚫 Сообщение удалено",
-                description="Обнаружены признаки рекламы/скама или нерелевантного медиа. Выдан timeout на максимальный срок.",
+                description="Обнаружены признаки рекламы/скама или нерелевантного медиа. Выдано ограничение голоса на 24 часа.",
                 color=Color.red()
             )
             dm.add_field(name="Причины", value="\n".join(f"• {r}" for r in moderation_reasons)[:1024], inline=False)
@@ -1070,9 +1097,9 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # --- Обработка формы вступления (единый отряд TAS) ---
+    # --- Обработка формы вступления (единый отряд TAC) ---
     if message.channel.id == FORM_CHANNEL_ID:
-        template = "1. Ваш roblox никнейм (НЕ ДИСПЛЕЙ)\n2. Ваш Discord ник\n3. tas"
+        template = "1. Ваш roblox никнейм (НЕ ДИСПЛЕЙ)\n2. Ваш Discord ник\n3. tac"
         lines = [line.strip() for line in (message.content or "").strip().split("\n") if line.strip()]
         if len(lines) != 3:
             try:
@@ -1085,18 +1112,18 @@ async def on_message(message: discord.Message):
         user_line, discord_nick_line, choice_line = lines
         keyword = extract_clean_keyword(choice_line)
 
-        if keyword != "tas":
+        if keyword != "tac":
             try:
-                await message.reply(embed=Embed(title="❌ Неизвестный отряд", description="Третий пункт должен содержать только **tas**.", color=Color.red()).add_field(name="Пример", value=f"```{template}```"))
+                await message.reply(embed=Embed(title="❌ Неизвестный отряд", description="Третий пункт должен содержать только **tac**.", color=Color.red()).add_field(name="Пример", value=f"```{template}```"))
             except Exception:
                 pass
             await bot.process_commands(message)
             return
 
-        target_channel = message.guild.get_channel(TAS_CHANNEL_ID)
+        target_channel = message.guild.get_channel(TAC_CHANNEL_ID)
         if not target_channel:
             try:
-                await message.reply("❌ Ошибка конфигурации: канал TAS не найден.")
+                await message.reply("❌ Ошибка конфигурации: канал TAC не найден.")
             except Exception:
                 pass
             await bot.process_commands(message)
@@ -1106,9 +1133,9 @@ async def on_message(message: discord.Message):
         risk_text = "\n".join(f"⚠️ {flag}" for flag in risk_flags) if risk_flags else "✅ Явных рисков не обнаружено"
 
         embed = Embed(
-            title="📋 Подтверждение вступления в TAS",
+            title="📋 Подтверждение вступления в TAC",
             description=(
-                f"{message.author.mention} хочет вступить в отряд **TAS**\n"
+                f"{message.author.mention} хочет вступить в отряд **TAC**\n"
                 f"Roblox ник: `{user_line}`\n"
                 f"Discord ник: `{discord_nick_line}`"
             ),
@@ -1118,15 +1145,15 @@ async def on_message(message: discord.Message):
         embed.set_footer(text=f"ID пользователя: {message.author.id} | {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
 
         view = ConfirmView(
-            TAS_REVIEWER_ROLE_IDS,
+            TAC_REVIEWER_ROLE_IDS,
             target_message=message,
-            squad_name="TAS",
-            role_ids=TAS_ROLE_REWARDS,
+            squad_name="TAC",
+            role_ids=TAC_ROLE_REWARDS,
             target_user_id=message.author.id
         )
 
         mentions = []
-        for rid in TAS_REVIEWER_ROLE_IDS:
+        for rid in TAC_REVIEWER_ROLE_IDS:
             role = message.guild.get_role(rid)
             if role:
                 mentions.append(role.mention)
@@ -1369,8 +1396,10 @@ async def on_ready():
 # Запуск
 # -----------------------
 if __name__ == "__main__":
-    token = os.getenv("DISCORD_TOKEN")
+    raw_token = os.getenv("DISCORD_TOKEN")
+    token = sanitize_discord_token(raw_token)
+
     if not token:
-        print("ERROR: DISCORD_TOKEN not set in environment.")
+        print("ERROR: DISCORD_TOKEN not set in Railway values.")
     else:
         bot.run(token)
