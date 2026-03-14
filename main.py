@@ -1409,11 +1409,22 @@ async def on_ready():
 # -----------------------
 # Запуск
 # -----------------------
-if __name__ == "__main__":
+# --- Безопасный запуск ---
+def main():
     raw_token = os.getenv("DISCORD_TOKEN")
     token = sanitize_discord_token(raw_token)
 
     if not token:
-        print("ERROR: DISCORD_TOKEN not set in Railway values.")
-    else:
+        print("🚨 ОШИБКА: DISCORD_TOKEN не найден в переменных окружения Railway!")
+        return
+
+    try:
+        print("⏳ Запуск бота...")
         bot.run(token)
+    except discord.errors.LoginFailure:
+        print("🚨 ОШИБКА: Неверный токен (Improper token). Проверь DISCORD_TOKEN в Railway.")
+    except Exception as e:
+        print(f"🚨 Произошла критическая ошибка при запуске: {e}")
+
+if __name__ == "__main__":
+    main()
