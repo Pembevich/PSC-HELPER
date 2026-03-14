@@ -442,6 +442,20 @@ conn.commit()
 def extract_clean_keyword(text: str):
     return re.sub(r"[^a-z]", "", (text or "").lower())
 
+
+def sanitize_discord_token(raw_token: str | None) -> str | None:
+    """Нормализует токен из Railway env (убирает пробелы/кавычки/переносы)."""
+    if raw_token is None:
+        return None
+
+    token = raw_token.strip()
+    if (token.startswith('"') and token.endswith('"')) or (token.startswith("'") and token.endswith("'")):
+        token = token[1:-1].strip()
+
+    # В некоторых UI токен может быть с переносами строк.
+    token = token.replace("\n", "").replace("\r", "")
+    return token or None
+
 async def safe_send_dm(user: discord.User, embed: Embed, file: discord.File = None):
     try:
         if file:
