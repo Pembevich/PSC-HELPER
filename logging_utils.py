@@ -102,12 +102,27 @@ def _find_category(guild: discord.Guild | None) -> discord.CategoryChannel | Non
     return None
 
 
-def _find_channel_by_names(guild: discord.Guild, names: list[str]) -> discord.TextChannel | None:
+def _find_channel_by_names(
+    guild: discord.Guild,
+    names: list[str],
+    category: discord.CategoryChannel | None = None
+) -> discord.TextChannel | None:
     names_l = {n.lower() for n in names}
+
+    if category:
+        cat_channels = [ch for ch in category.channels if isinstance(ch, discord.TextChannel)]
+        for ch in cat_channels:
+            if ch.name.lower() in names_l:
+                return ch
+        for ch in cat_channels:
+            cname = ch.name.lower()
+            for name in names_l:
+                if name and name in cname:
+                    return ch
+
     for ch in guild.text_channels:
         if ch.name.lower() in names_l:
             return ch
-    # fallback: частичное совпадение
     for ch in guild.text_channels:
         cname = ch.name.lower()
         for name in names_l:
@@ -117,11 +132,10 @@ def _find_channel_by_names(guild: discord.Guild, names: list[str]) -> discord.Te
 
 
 async def ensure_log_category_and_channels(guild: discord.Guild) -> dict[str, discord.TextChannel]:
-    if guild.me and not guild.me.guild_permissions.manage_channels:
-        return {}
+    can_manage = bool(guild.me and guild.me.guild_permissions.manage_channels)
 
     category = _find_category(guild)
-    if not category:
+    if not category and can_manage:
         try:
             category = await await_create_category(guild, LOG_CATEGORY_NAME or "логи")
         except Exception:
@@ -129,13 +143,8 @@ async def ensure_log_category_and_channels(guild: discord.Guild) -> dict[str, di
 
     resolved: dict[str, discord.TextChannel] = {}
     for cfg in LOG_CHANNEL_CONFIGS:
-        ch = _find_channel_by_names(guild, cfg["names"])
-        if ch and category and ch.category_id != category.id:
-            try:
-                await await_move_channel(ch, category)
-            except Exception:
-                pass
-        if not ch:
+        ch = _find_channel_by_names(guild, cfg["names"], category)
+        if not ch and can_manage:
             try:
                 if category:
                     ch = await await_create_text_channel(guild, cfg["names"][0], category, cfg.get("topic"))
@@ -146,7 +155,8 @@ async def ensure_log_category_and_channels(guild: discord.Guild) -> dict[str, di
         if ch:
             resolved[cfg["key"]] = ch
 
-    _LOG_CHANNEL_CACHE[guild.id] = {k: v.id for k, v in resolved.items()}
+    if resolved:
+        _LOG_CHANNEL_CACHE[guild.id] = {k: v.id for k, v in resolved.items()}
     _LOG_INIT_DONE.add(guild.id)
     return resolved
 
@@ -193,9 +203,10 @@ def get_log_channel(guild: discord.Guild | None, log_type: str = "server") -> di
             pass
 
     # fallback: поиск по имени
+    category = _find_category(guild)
     for cfg in LOG_CHANNEL_CONFIGS:
         if cfg["key"] == log_type:
-            ch = _find_channel_by_names(guild, cfg["names"])
+            ch = _find_channel_by_names(guild, cfg["names"], category)
             if ch:
                 _LOG_CHANNEL_CACHE.setdefault(guild.id, {})[log_type] = ch.id
                 return ch
