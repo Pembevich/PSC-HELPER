@@ -853,15 +853,44 @@ def register_events(bot: commands.Bot):
 
     @bot.event
     async def on_guild_channel_update(before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
+        fields = []
+
         if before.name != after.name:
-            fields = [("Было", before.name, False), ("Стало", after.name, False)]
-        else:
-            fields = [("Канал", after.name, False)]
+            fields.append(("Имя", f"{before.name} → {after.name}", False))
+
+        if getattr(before, "category_id", None) != getattr(after, "category_id", None):
+            before_cat = before.category.name if before.category else "—"
+            after_cat = after.category.name if after.category else "—"
+            fields.append(("Категория", f"{before_cat} → {after_cat}", False))
+
+        if isinstance(before, discord.TextChannel) and isinstance(after, discord.TextChannel):
+            if before.topic != after.topic:
+                fields.append(("Тема", f"{before.topic or '—'} → {after.topic or '—'}", False))
+            if before.nsfw != after.nsfw:
+                fields.append(("NSFW", f"{'вкл' if before.nsfw else 'выкл'} → {'вкл' if after.nsfw else 'выкл'}", True))
+            if before.rate_limit_per_user != after.rate_limit_per_user:
+                fields.append(("Slowmode", f"{before.rate_limit_per_user}s → {after.rate_limit_per_user}s", True))
+
+        if isinstance(before, discord.VoiceChannel) and isinstance(after, discord.VoiceChannel):
+            if before.bitrate != after.bitrate:
+                fields.append(("Bitrate", f"{before.bitrate} → {after.bitrate}", True))
+            if before.user_limit != after.user_limit:
+                fields.append(("User limit", f"{before.user_limit} → {after.user_limit}", True))
+
+        if getattr(before, "overwrites", None) != getattr(after, "overwrites", None):
+            fields.append(("Права", "изменены", False))
+
+        if getattr(before, "position", None) != getattr(after, "position", None):
+            fields.append(("Позиция", f"{before.position} → {after.position}", True))
+
+        if not fields:
+            return
+
         await send_log_embed(
             after.guild,
             "channels",
             "✏️ Канал изменён",
-            f"ID: `{after.id}`",
+            f"{after.mention if isinstance(after, discord.TextChannel) else after.name} (`{after.id}`)",
             color=Color.orange(),
             fields=fields
         )
@@ -989,15 +1018,24 @@ def register_events(bot: commands.Bot):
     async def on_thread_update(before: discord.Thread, after: discord.Thread):
         fields = []
         if before.name != after.name:
-            fields.append(("Было", before.name, False))
-            fields.append(("Стало", after.name, False))
+            fields.append(("Имя", f"{before.name} → {after.name}", False))
+        if before.archived != after.archived:
+            fields.append(("Архив", f"{'вкл' if before.archived else 'выкл'} → {'вкл' if after.archived else 'выкл'}", True))
+        if before.locked != after.locked:
+            fields.append(("Закрыт", f"{'вкл' if before.locked else 'выкл'} → {'вкл' if after.locked else 'выкл'}", True))
+        if before.auto_archive_duration != after.auto_archive_duration:
+            fields.append(("Автоархив", f"{before.auto_archive_duration} → {after.auto_archive_duration} мин", True))
+        if before.slowmode_delay != after.slowmode_delay:
+            fields.append(("Slowmode", f"{before.slowmode_delay}s → {after.slowmode_delay}s", True))
+
         if not fields:
-            fields.append(("Тред", after.mention, False))
+            return
+
         await send_log_embed(
             after.guild,
             "channels",
             "✏️ Тред изменён",
-            f"ID: `{after.id}`",
+            f"{after.mention} (`{after.id}`)",
             color=Color.orange(),
             fields=fields
         )
