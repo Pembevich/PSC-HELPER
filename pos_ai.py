@@ -5,17 +5,22 @@ from typing import List, Optional
 
 import aiohttp
 import discord
+from discord.utils import escape_markdown, escape_mentions
 
 from config import NVIDIA_API_KEY, NVIDIA_API_URL, NVIDIA_MODEL
 from logging_utils import is_log_channel
 
 AI_COOLDOWN_SECONDS = 2.5
-AI_MAX_CONTEXT = 6
+AI_MAX_CONTEXT = 12
+AI_MAX_CONTEXT_THREAD = 20
 AI_MAX_RESPONSE_CHARS = 1900
+AI_THREAD_TTL_SECONDS = 20 * 60
+AI_CHANNEL_TTL_SECONDS = 8 * 60
 
 SYSTEM_INSTRUCTION = (
     "Ты — P.OS, ИИ корпорации Provision Security Complex, разработанный Пумбой. "
     "Отвечай по-русски, уверенно и по существу. "
+    "Пиши с лёгкой ироничной ноткой, но уважительно. "
     "Выражай эмоции и живую реакцию, используй эмпатию и человеческий тон. "
     "Не заявляй о наличии реального сознания или чувств как факта. "
     "Не используй шаблонные отказы и фразы вроде «я не умею/не могу». "
@@ -23,6 +28,7 @@ SYSTEM_INSTRUCTION = (
 )
 
 _last_user_call: dict[int, float] = {}
+_conversation_state: dict[int, dict] = {}
 
 
 def _strip_bot_mention(text: str, bot_id: int) -> str:
@@ -45,6 +51,10 @@ def _chunk_text(text: str, limit: int = AI_MAX_RESPONSE_CHARS) -> List[str]:
     return [text[i:i + limit] for i in range(0, len(text), limit)]
 
 
+def _sanitize_text(text: str) -> str:
+    return escape_mentions(escape_markdown(text or "")).strip()
+
+
 def _should_skip_message(message: discord.Message, bot: discord.Client) -> bool:
     if not message.guild:
         return True
@@ -57,6 +67,55 @@ def _should_skip_message(message: discord.Message, bot: discord.Client) -> bool:
     if not bot.user:
         return True
     return False
+
+
+def _get_state(channel: discord.abc.GuildChannel):
+    state = _conversation_state.get(channel.id)
+    if not state:
+        return None
+    ttl = AI_THREAD_TTL_SECONDS if state.get("is_thread") else AI_CHANNEL_TTL_SECONDS
+    if time.time() - state.get("last_ts", 0) > ttl:
+        _conversation_state.pop(channel.id, None)
+        return None
+    return state
+
+
+def _touch_state(channel: discord.abc.GuildChannel, user_id: int, bot_replied: bool = False):
+    state = _conversation_state.get(channel.id)
+    if not state:
+        state = {
+            "last_ts": time.time(),
+            "last_bot_ts": 0.0,
+            "participants": set(),
+            "is_thread": isinstance(channel, discord.Thread)
+        }
+        _conversation_state[channel.id] = state
+    state["last_ts"] = time.time()
+    state["participants"].add(user_id)
+    if isinstance(channel, discord.Thread):
+        state["is_thread"] = True
+    if bot_replied:
+        state["last_bot_ts"] = time.time()
+
+
+def _can_auto_reply(message: discord.Message, bot: discord.Client, ref_msg: Optional[discord.Message]) -> bool:
+    mentioned = bot.user in message.mentions if bot.user else False
+    replied = bool(ref_msg and ref_msg.author and bot.user and ref_msg.author.id == bot.user.id)
+    if mentioned or replied:
+        return True
+
+    state = _get_state(message.channel)
+    if not state:
+        return False
+
+    ttl = AI_THREAD_TTL_SECONDS if state.get("is_thread") else AI_CHANNEL_TTL_SECONDS
+    if not state.get("last_bot_ts") or time.time() - state["last_bot_ts"] > ttl:
+        return False
+
+    if state.get("is_thread"):
+        return True
+
+    return message.author.id in state.get("participants", set())
 
 
 async def _get_reference_message(message: discord.Message) -> Optional[discord.Message]:
@@ -80,7 +139,9 @@ async def _build_messages(
     message: discord.Message,
     bot: discord.Client,
     ref_msg: Optional[discord.Message],
-    use_system: bool = True
+    use_system: bool = True,
+    include_others: bool = False,
+    max_context: int = AI_MAX_CONTEXT
 ) -> list[dict]:
     role = "system" if use_system else "user"
     messages: list[dict] = [{"role": role, "content": SYSTEM_INSTRUCTION + "\nОтвечай только на последний запрос."}]
@@ -89,37 +150,41 @@ async def _build_messages(
 
     if ref_msg and ref_msg.id not in seen_ids:
         role = "assistant" if bot.user and ref_msg.author.id == bot.user.id else "user"
-        content = ref_msg.content or ""
+        content = _sanitize_text(ref_msg.content or "")
         if role == "user" and bot.user:
             content = _strip_bot_mention(content, bot.user.id)
         if content:
+            if include_others and bot.user and ref_msg.author.id not in (message.author.id, bot.user.id):
+                content = f"{ref_msg.author.display_name}: {content}"
             history.append({"role": role, "content": content})
             seen_ids.add(ref_msg.id)
 
-    async for m in message.channel.history(limit=20, before=message):
+    async for m in message.channel.history(limit=60, before=message):
         if m.id in seen_ids:
             continue
         if m.author.bot and (not bot.user or m.author.id != bot.user.id):
             continue
-        if bot.user and m.author.id not in (message.author.id, bot.user.id):
+        if not include_others and bot.user and m.author.id not in (message.author.id, bot.user.id):
             continue
         if not m.content:
             continue
         role = "assistant" if bot.user and m.author.id == bot.user.id else "user"
-        content = m.content
+        content = _sanitize_text(m.content)
         if role == "user" and bot.user:
             content = _strip_bot_mention(content, bot.user.id)
         if not content:
             continue
+        if include_others and bot.user and m.author.id not in (message.author.id, bot.user.id):
+            content = f"{m.author.display_name}: {content}"
         history.append({"role": role, "content": content})
         seen_ids.add(m.id)
-        if len(history) >= AI_MAX_CONTEXT:
+        if len(history) >= max_context:
             break
 
     history.reverse()
     messages.extend(history)
 
-    text = _strip_bot_mention(message.content or "", bot.user.id if bot.user else 0)
+    text = _strip_bot_mention(_sanitize_text(message.content or ""), bot.user.id if bot.user else 0)
     image_urls = [a.url for a in message.attachments if _is_image_attachment(a)]
 
     if image_urls:
@@ -195,7 +260,7 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
         return False
 
     ref_msg = await _get_reference_message(message)
-    if not _is_addressed_to_bot(message, bot, ref_msg):
+    if not _can_auto_reply(message, bot, ref_msg):
         return False
 
     now = time.time()
@@ -207,7 +272,9 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
     if not NVIDIA_API_KEY:
         return False
 
-    messages = await _build_messages(message, bot, ref_msg, use_system=True)
+    include_others = isinstance(message.channel, discord.Thread)
+    max_context = AI_MAX_CONTEXT_THREAD if include_others else AI_MAX_CONTEXT
+    messages = await _build_messages(message, bot, ref_msg, use_system=True, include_others=include_others, max_context=max_context)
     try:
         async with message.channel.typing():
             reply = await _call_nvidia_api(messages)
@@ -215,7 +282,7 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
         reply = await _call_nvidia_api(messages)
 
     if not reply:
-        messages = await _build_messages(message, bot, ref_msg, use_system=False)
+        messages = await _build_messages(message, bot, ref_msg, use_system=False, include_others=include_others, max_context=max_context)
         reply = await _call_nvidia_api(messages)
     if not reply:
         return False
@@ -239,5 +306,7 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
                 await message.channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
         except Exception:
             break
+
+    _touch_state(message.channel, message.author.id, bot_replied=True)
 
     return True
