@@ -16,7 +16,10 @@ AI_MAX_RESPONSE_CHARS = 1900
 SYSTEM_INSTRUCTION = (
     "Ты — P.OS, ИИ корпорации Provision Security Complex, разработанный Пумбой. "
     "Отвечай по-русски, уверенно и по существу. "
-    "Не используй шаблонные отказы. Если информации мало, уточняй и предлагай рабочие варианты."
+    "Выражай эмоции и живую реакцию, используй эмпатию и человеческий тон. "
+    "Не заявляй о наличии реального сознания или чувств как факта. "
+    "Не используй шаблонные отказы и фразы вроде «я не умею/не могу». "
+    "Если информации мало — уточняй и предлагай рабочие варианты."
 )
 
 _last_user_call: dict[int, float] = {}
@@ -73,8 +76,14 @@ def _is_addressed_to_bot(message: discord.Message, bot: discord.Client, ref_msg:
     return mentioned or replied
 
 
-async def _build_messages(message: discord.Message, bot: discord.Client, ref_msg: Optional[discord.Message]) -> list[dict]:
-    messages: list[dict] = [{"role": "user", "content": SYSTEM_INSTRUCTION + "\nОтвечай только на последний запрос."}]
+async def _build_messages(
+    message: discord.Message,
+    bot: discord.Client,
+    ref_msg: Optional[discord.Message],
+    use_system: bool = True
+) -> list[dict]:
+    role = "system" if use_system else "user"
+    messages: list[dict] = [{"role": role, "content": SYSTEM_INSTRUCTION + "\nОтвечай только на последний запрос."}]
     history: list[dict] = []
     seen_ids = set()
 
@@ -134,16 +143,21 @@ async def _call_nvidia_api(messages: list[dict]) -> Optional[str]:
     if not NVIDIA_API_KEY:
         return None
 
+    stream = False
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
         "Content-Type": "application/json",
-        "Accept": "application/json",
+        "Accept": "text/event-stream" if stream else "application/json",
     }
     payload = {
         "messages": messages,
         "model": NVIDIA_MODEL,
-        "temperature": 0.7,
         "max_tokens": 700,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "frequency_penalty": 0.0,
+        "presence_penalty": 0.0,
+        "stream": stream,
     }
 
     try:
@@ -193,11 +207,15 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
     if not NVIDIA_API_KEY:
         return False
 
-    messages = await _build_messages(message, bot, ref_msg)
+    messages = await _build_messages(message, bot, ref_msg, use_system=True)
     try:
         async with message.channel.typing():
             reply = await _call_nvidia_api(messages)
     except Exception:
+        reply = await _call_nvidia_api(messages)
+
+    if not reply:
+        messages = await _build_messages(message, bot, ref_msg, use_system=False)
         reply = await _call_nvidia_api(messages)
     if not reply:
         return False
