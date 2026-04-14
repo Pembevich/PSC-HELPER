@@ -9,7 +9,7 @@ DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat"
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 NVIDIA_API_URL = os.getenv(
     "NVIDIA_API_URL",
-    "https://ai.api.nvidia.com/v1/gr/meta/llama-3.2-11b-vision-instruct/meta/llama-3.2-11b-vision-instruct"
+    "https://integrate.api.nvidia.com/v1/chat/completions"
 )
 NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "meta/llama-3.2-11b-vision-instruct")
 
