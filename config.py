@@ -6,6 +6,12 @@ VIRUSTOTAL_KEY = os.getenv("VIRUSTOTAL_KEY")
 GOOGLE_SAFEBROWSING_KEY = os.getenv("GOOGLE_SAFEBROWSING_KEY")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat"
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+NVIDIA_API_URL = os.getenv(
+    "NVIDIA_API_URL",
+    "https://ai.api.nvidia.com/v1/gr/meta/llama-3.2-11b-vision-instruct/meta/llama-3.2-11b-vision-instruct"
+)
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "meta/llama-3.2-11b-vision-instruct")
 
 # --- Логи ---
 LOG_CATEGORY_ID = int(os.getenv("LOG_CATEGORY_ID", "0") or 0)
@@ -76,7 +82,7 @@ VOICE_TIMEOUT_HOURS = 24
 VIOLATION_ATTACHMENT_LIMIT = 3
 NSFW_FILENAME_KEYWORDS = ["porn", "sex", "xxx", "nsfw", "erotic", "nud", "18+"]
 AD_FILENAME_KEYWORDS = ["casino", "bet", "free", "nitro", "robux", "giveaway", "promo", "advert"]
-AD_TEXT_KEYWORDS = ["подпишись", "реклама", "промокод", "ставки", "казино", "розыгрыш", "nitro", "robux", "бонус"]
+AD_TEXT_KEYWORDS = ["подпишись", "промокод", "ставки", "казино", "розыгрыш", "nitro", "robux", "бонус"]
 SUSPICIOUS_INVITE_PATTERNS = ["t.me/", "vk.com/"]
 ALLOWED_DISCORD_INVITE_PATTERNS = ["discord.gg/", "discord.com/invite/"]
 
