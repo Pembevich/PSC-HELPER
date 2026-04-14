@@ -41,6 +41,7 @@ from moderation import (
 )
 from forms import ConfirmView, ComplaintView
 from utils import extract_clean_keyword, assess_applicant_risk, safe_send_dm, collect_runtime_health
+from pos_ai import handle_pos_ai
 
 
 def _clean_text(text: str, limit: int = 1800) -> str:
@@ -716,6 +717,9 @@ def register_events(bot: commands.Bot):
                     pass
 
             await bot.process_commands(message)
+            return
+
+        if await handle_pos_ai(message, bot):
             return
 
         await bot.process_commands(message)
