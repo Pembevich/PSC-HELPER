@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import uuid
+from datetime import timedelta
 
 import discord
 from discord import Embed, Color
@@ -29,6 +30,8 @@ from config import (
     TARGET_CHANNELS,
     TARGET_OUTPUT_CHANNEL,
     NEW_MEMBER_ROLE_IDS,
+    UPDATE_LOG_CHANNEL_ID,
+    UPDATE_LOG_MARKER,
 )
 from logging_utils import ensure_log_category_and_channels, send_log_embed, is_log_channel
 from moderation import (
@@ -63,6 +66,88 @@ def _should_log_message(message: discord.Message) -> bool:
     if is_log_channel(message.channel):
         return False
     return True
+
+
+async def _send_update_log_if_needed(bot: commands.Bot):
+    if not UPDATE_LOG_CHANNEL_ID:
+        return
+
+    channel = bot.get_channel(UPDATE_LOG_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    try:
+        async for existing in channel.history(limit=20):
+            if existing.author.id == bot.user.id and UPDATE_LOG_MARKER in (existing.content or ""):
+                return
+    except Exception:
+        return
+
+    release_message = (
+        f"[{UPDATE_LOG_MARKER}]\n"
+        "Лог обновления P.S.C Helper:\n"
+        "- обновлена и успокоена фильтрация ссылок, GIF и безопасные медиа больше не должны ловить лишние блокировки;\n"
+        "- добавлена AI-проверка ссылок, изображений и видео для спорных случаев;\n"
+        "- все серверные логи сведены в один канал и стали подробнее;\n"
+        "- улучшено логирование ролей, каналов, банов, тайм-аутов и других действий через audit log;\n"
+        "- переработана команда создания GIF, теперь результат собирается заметно аккуратнее;\n"
+        "- восстановлена и поправлена система с сообщением \"ОТПИСКИ\"."
+    )
+
+    try:
+        await channel.send(release_message, allowed_mentions=discord.AllowedMentions.none())
+    except Exception:
+        pass
+
+
+def _format_identity(entity) -> str:
+    if not entity:
+        return "—"
+    entity_id = getattr(entity, "id", None)
+    mention = getattr(entity, "mention", None)
+    label = f"{entity} (`{entity_id}`)" if entity_id else str(entity)
+    if mention:
+        return f"{mention} — {label}"
+    return label
+
+
+async def _find_audit_entry(
+    guild: discord.Guild,
+    action: discord.AuditLogAction,
+    *,
+    target_id: int | None = None,
+    limit: int = 6,
+) -> discord.AuditLogEntry | None:
+    me = guild.me
+    if not me or not me.guild_permissions.view_audit_log:
+        return None
+
+    after = discord.utils.utcnow() - timedelta(seconds=20)
+    try:
+        async for entry in guild.audit_logs(limit=limit, action=action, after=after):
+            entry_target_id = getattr(entry.target, "id", None)
+            if target_id is not None and entry_target_id != target_id:
+                continue
+            return entry
+    except Exception:
+        return None
+    return None
+
+
+async def _append_audit_fields(
+    guild: discord.Guild,
+    action: discord.AuditLogAction,
+    target_id: int | None,
+    fields: list[tuple[str, str, bool]],
+) -> discord.AuditLogEntry | None:
+    entry = await _find_audit_entry(guild, action, target_id=target_id)
+    if not entry:
+        return None
+
+    fields.append(("Кто сделал", _format_identity(entry.user), False))
+    if entry.reason:
+        fields.append(("Причина", _clean_text(entry.reason, 1000), False))
+    return entry
 
 
 async def _log_message_create(message: discord.Message):
@@ -152,17 +237,19 @@ async def _log_member_roles_change(before: discord.Member, after: discord.Member
     if not added and not removed:
         return
 
-    fields = []
+    fields = [("Кому", _format_identity(after), False)]
     if added:
-        fields.append(("Добавлены", ", ".join(r.name for r in added), False))
+        fields.append(("Добавлены", ", ".join(r.mention for r in sorted(added, key=lambda role: role.position, reverse=True)), False))
     if removed:
-        fields.append(("Удалены", ", ".join(r.name for r in removed), False))
+        fields.append(("Удалены", ", ".join(r.mention for r in sorted(removed, key=lambda role: role.position, reverse=True)), False))
+
+    await _append_audit_fields(after.guild, discord.AuditLogAction.member_role_update, after.id, fields)
 
     await send_log_embed(
         after.guild,
         "members",
-        "🎭 Изменение ролей",
-        f"{after.mention} (`{after.id}`)",
+        "🎭 Роли участника изменены",
+        f"У участника обновился набор ролей.",
         color=Color.gold(),
         fields=fields
     )
@@ -171,16 +258,19 @@ async def _log_member_roles_change(before: discord.Member, after: discord.Member
 async def _log_member_nick_change(before: discord.Member, after: discord.Member):
     if before.display_name == after.display_name:
         return
+    fields = [
+        ("Кому", _format_identity(after), False),
+        ("Было", before.display_name, False),
+        ("Стало", after.display_name, False),
+    ]
+    await _append_audit_fields(after.guild, discord.AuditLogAction.member_update, after.id, fields)
     await send_log_embed(
         after.guild,
         "members",
         "📝 Изменение ника",
-        f"{after.mention} (`{after.id}`)",
+        "Участнику обновили отображаемое имя.",
         color=Color.blue(),
-        fields=[
-            ("Было", before.display_name, False),
-            ("Стало", after.display_name, False)
-        ]
+        fields=fields
     )
 
 
@@ -250,13 +340,15 @@ async def _log_member_timeout_change(before: discord.Member, after: discord.Memb
         title = "✅ Тайм-аут снят"
         detail = "Ограничение снято"
         color = Color.green()
+    fields = [("Кому", _format_identity(after), False), ("Детали", detail, False)]
+    await _append_audit_fields(after.guild, discord.AuditLogAction.member_update, after.id, fields)
     await send_log_embed(
         after.guild,
         "moderation",
         title,
-        f"{after.mention} (`{after.id}`)",
+        "Изменение тайм-аута участника.",
         color=color,
-        fields=[("Детали", detail, False)]
+        fields=fields
     )
 
 
@@ -297,6 +389,11 @@ def register_events(bot: commands.Bot):
         except Exception:
             pass
 
+        try:
+            await _send_update_log_if_needed(bot)
+        except Exception:
+            pass
+
     @bot.event
     async def on_message(message: discord.Message):
         if not message.guild:
@@ -320,7 +417,7 @@ def register_events(bot: commands.Bot):
             pass
 
         text_reasons = detect_advertising_or_scam_text(message.content or "")
-        attachment_reasons = detect_attachment_violations(message.attachments)
+        attachment_reasons = await detect_attachment_violations(message.attachments, message.content or "")
         moderation_reasons = text_reasons + attachment_reasons
         if moderation_reasons:
             try:
@@ -343,7 +440,7 @@ def register_events(bot: commands.Bot):
 
         # --- Авто-отписки: эмбед + ветка (thread) ---
         try:
-            if message.channel.id in TARGET_CHANNELS and re.search(r"\\bОТПИСКИ\\b", message.content or ""):
+            if message.channel.id in TARGET_CHANNELS and "ОТПИСКИ" in (message.content or "").upper():
                 today = discord.utils.utcnow().strftime("%d.%m.%Y")
                 group = TARGET_CHANNELS[message.channel.id]
 
@@ -357,9 +454,9 @@ def register_events(bot: commands.Bot):
                 target_channel = bot.get_channel(TARGET_OUTPUT_CHANNEL)
                 if target_channel:
                     try:
-                        sent = await target_channel.send(embed=embed)
+                        sent = await target_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
                         try:
-                            await sent.create_thread(name="Отписки")
+                            await sent.create_thread(name=f"Отписки • {group}")
                         except Exception:
                             pass
                     except Exception as e:
@@ -412,9 +509,6 @@ def register_events(bot: commands.Bot):
                 except Exception:
                     pass
 
-                await bot.process_commands(message)
-                return
-            else:
                 await bot.process_commands(message)
                 return
 
@@ -835,24 +929,28 @@ def register_events(bot: commands.Bot):
 
     @bot.event
     async def on_guild_channel_create(channel: discord.abc.GuildChannel):
+        fields = [("Тип", str(channel.type), False)]
+        await _append_audit_fields(channel.guild, discord.AuditLogAction.channel_create, channel.id, fields)
         await send_log_embed(
             channel.guild,
             "channels",
             "➕ Канал создан",
-            f"{channel.name} (`{channel.id}`)",
+            f"{getattr(channel, 'mention', channel.name)} (`{channel.id}`)",
             color=Color.green(),
-            fields=[("Тип", str(channel.type), False)]
+            fields=fields
         )
 
     @bot.event
     async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+        fields = [("Тип", str(channel.type), False)]
+        await _append_audit_fields(channel.guild, discord.AuditLogAction.channel_delete, channel.id, fields)
         await send_log_embed(
             channel.guild,
             "channels",
             "➖ Канал удалён",
             f"{channel.name} (`{channel.id}`)",
             color=Color.red(),
-            fields=[("Тип", str(channel.type), False)]
+            fields=fields
         )
 
     @bot.event
@@ -890,6 +988,8 @@ def register_events(bot: commands.Bot):
         if not fields:
             return
 
+        await _append_audit_fields(after.guild, discord.AuditLogAction.channel_update, after.id, fields)
+
         await send_log_embed(
             after.guild,
             "channels",
@@ -901,34 +1001,40 @@ def register_events(bot: commands.Bot):
 
     @bot.event
     async def on_guild_role_create(role: discord.Role):
+        fields = [("Роль", role.mention, False)]
+        await _append_audit_fields(role.guild, discord.AuditLogAction.role_create, role.id, fields)
         await send_log_embed(
             role.guild,
             "roles",
             "➕ Роль создана",
             f"{role.name} (`{role.id}`)",
-            color=Color.green()
+            color=Color.green(),
+            fields=fields
         )
 
     @bot.event
     async def on_guild_role_delete(role: discord.Role):
+        fields = [("Роль", role.name, False)]
+        await _append_audit_fields(role.guild, discord.AuditLogAction.role_delete, role.id, fields)
         await send_log_embed(
             role.guild,
             "roles",
             "➖ Роль удалена",
             f"{role.name} (`{role.id}`)",
-            color=Color.red()
+            color=Color.red(),
+            fields=fields
         )
 
     @bot.event
     async def on_guild_role_update(before: discord.Role, after: discord.Role):
-        fields = []
+        fields = [("Роль", after.mention, False)]
         if before.name != after.name:
-            fields.append(("Было", before.name, False))
-            fields.append(("Стало", after.name, False))
+            fields.append(("Имя", f"{before.name} → {after.name}", False))
         if before.permissions != after.permissions:
             fields.append(("Права", "изменены", False))
-        if not fields:
+        if len(fields) == 1:
             return
+        await _append_audit_fields(after.guild, discord.AuditLogAction.role_update, after.id, fields)
         await send_log_embed(
             after.guild,
             "roles",
@@ -1009,13 +1115,15 @@ def register_events(bot: commands.Bot):
 
     @bot.event
     async def on_thread_create(thread: discord.Thread):
+        fields = [("Родитель", thread.parent.mention if thread.parent else "—", False)]
+        await _append_audit_fields(thread.guild, discord.AuditLogAction.channel_create, thread.id, fields)
         await send_log_embed(
             thread.guild,
             "channels",
             "🧵 Тред создан",
             f"{thread.mention} (`{thread.id}`)",
             color=Color.green(),
-            fields=[("Родитель", thread.parent.mention if thread.parent else "—", False)]
+            fields=fields
         )
 
     @bot.event
@@ -1035,6 +1143,8 @@ def register_events(bot: commands.Bot):
         if not fields:
             return
 
+        await _append_audit_fields(after.guild, discord.AuditLogAction.channel_update, after.id, fields)
+
         await send_log_embed(
             after.guild,
             "channels",
@@ -1046,13 +1156,15 @@ def register_events(bot: commands.Bot):
 
     @bot.event
     async def on_thread_delete(thread: discord.Thread):
+        fields = [("Родитель", thread.parent.mention if thread.parent else "—", False)]
+        await _append_audit_fields(thread.guild, discord.AuditLogAction.channel_delete, thread.id, fields)
         await send_log_embed(
             thread.guild,
             "channels",
             "🗑️ Тред удалён",
             f"{thread.name} (`{thread.id}`)",
             color=Color.red(),
-            fields=[("Родитель", thread.parent.mention if thread.parent else "—", False)]
+            fields=fields
         )
 
     @bot.event
@@ -1154,22 +1266,28 @@ def register_events(bot: commands.Bot):
 
     @bot.event
     async def on_member_ban(guild: discord.Guild, user: discord.User):
+        fields = [("Кого", _format_identity(user), False)]
+        await _append_audit_fields(guild, discord.AuditLogAction.ban, user.id, fields)
         await send_log_embed(
             guild,
             "moderation",
             "⛔ Бан",
-            f"{user} (`{user.id}`) забанен.",
-            color=Color.red()
+            "Пользователь забанен.",
+            color=Color.red(),
+            fields=fields
         )
 
     @bot.event
     async def on_member_unban(guild: discord.Guild, user: discord.User):
+        fields = [("Кого", _format_identity(user), False)]
+        await _append_audit_fields(guild, discord.AuditLogAction.unban, user.id, fields)
         await send_log_embed(
             guild,
             "moderation",
             "✅ Разбан",
-            f"{user} (`{user.id}`) разбанен.",
-            color=Color.green()
+            "Пользователь разбанен.",
+            color=Color.green(),
+            fields=fields
         )
 
     @bot.event
@@ -1200,12 +1318,15 @@ def register_events(bot: commands.Bot):
     @bot.event
     async def on_guild_update(before: discord.Guild, after: discord.Guild):
         if before.name != after.name:
+            fields = [("Было", before.name, False), ("Стало", after.name, False)]
+            await _append_audit_fields(after, discord.AuditLogAction.guild_update, after.id, fields)
             await send_log_embed(
                 after,
                 "server",
                 "🏷️ Сервер переименован",
-                f"{before.name} → {after.name}",
-                color=Color.orange()
+                "У сервера обновилось название.",
+                color=Color.orange(),
+                fields=fields
             )
 
     @bot.event
@@ -1263,7 +1384,6 @@ def register_events(bot: commands.Bot):
     @bot.event
     async def on_interaction(interaction: discord.Interaction):
         if not interaction.guild:
-            await bot.process_application_commands(interaction)
             return
         if interaction.type == discord.InteractionType.application_command:
             data = interaction.data or {}
@@ -1276,4 +1396,3 @@ def register_events(bot: commands.Bot):
                 color=Color.blurple(),
                 fields=[("Канал", interaction.channel.mention if interaction.channel else "—", False)]
             )
-        await bot.process_application_commands(interaction)

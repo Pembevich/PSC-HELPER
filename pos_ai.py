@@ -3,11 +3,11 @@ from __future__ import annotations
 import time
 from typing import List, Optional
 
-import aiohttp
 import discord
 from discord.utils import escape_markdown, escape_mentions
 
-from config import NVIDIA_API_KEY, NVIDIA_API_URL, NVIDIA_MODEL
+from ai_client import pos_chat_completion
+from config import POS_AI_API_KEY
 from logging_utils import is_log_channel
 
 AI_COOLDOWN_SECONDS = 2.5
@@ -29,6 +29,7 @@ SYSTEM_INSTRUCTION = (
 
 _last_user_call: dict[int, float] = {}
 _conversation_state: dict[int, dict] = {}
+_missing_key_warned = False
 
 
 def _strip_bot_mention(text: str, bot_id: int) -> str:
@@ -43,6 +44,12 @@ def _is_image_attachment(att: discord.Attachment) -> bool:
         return True
     name = (att.filename or "").lower()
     return name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"))
+
+
+def _extract_image_urls(message: Optional[discord.Message]) -> list[str]:
+    if not message:
+        return []
+    return [a.url for a in message.attachments if _is_image_attachment(a)]
 
 
 def _chunk_text(text: str, limit: int = AI_MAX_RESPONSE_CHARS) -> List[str]:
@@ -185,7 +192,11 @@ async def _build_messages(
     messages.extend(history)
 
     text = _strip_bot_mention(_sanitize_text(message.content or ""), bot.user.id if bot.user else 0)
-    image_urls = [a.url for a in message.attachments if _is_image_attachment(a)]
+    image_urls = _extract_image_urls(message)
+    if ref_msg:
+        for url in _extract_image_urls(ref_msg):
+            if url not in image_urls:
+                image_urls.append(url)
 
     if image_urls:
         content_items = []
@@ -204,58 +215,9 @@ async def _build_messages(
     return messages
 
 
-async def _call_nvidia_api(messages: list[dict]) -> Optional[str]:
-    if not NVIDIA_API_KEY:
-        return None
-
-    stream = False
-    headers = {
-        "Authorization": f"Bearer {NVIDIA_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream" if stream else "application/json",
-    }
-    payload = {
-        "messages": messages,
-        "model": NVIDIA_MODEL,
-        "max_tokens": 700,
-        "temperature": 1.0,
-        "top_p": 1.0,
-        "frequency_penalty": 0.0,
-        "presence_penalty": 0.0,
-        "stream": stream,
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(NVIDIA_API_URL, headers=headers, json=payload, timeout=60) as resp:
-                data = await resp.json()
-    except Exception:
-        return None
-
-    text = None
-    if isinstance(data, dict):
-        choices = data.get("choices")
-        if choices and isinstance(choices, list):
-            choice0 = choices[0] or {}
-            msg = choice0.get("message") or {}
-            text = msg.get("content") or choice0.get("text")
-        if not text:
-            result = data.get("result") or {}
-            choices = result.get("choices")
-            if choices and isinstance(choices, list):
-                choice0 = choices[0] or {}
-                msg = choice0.get("message") or {}
-                text = msg.get("content") or choice0.get("text")
-        if not text:
-            text = data.get("output_text") or data.get("generated_text")
-
-    if not text:
-        return None
-
-    return text.strip()
-
-
 async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
+    global _missing_key_warned
+
     if _should_skip_message(message, bot):
         return False
 
@@ -269,7 +231,10 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
         return False
     _last_user_call[message.author.id] = now
 
-    if not NVIDIA_API_KEY:
+    if not POS_AI_API_KEY:
+        if not _missing_key_warned:
+            print("P.OS AI disabled: set POS_AI_API_KEY in Railway environment variables.")
+            _missing_key_warned = True
         return False
 
     include_others = isinstance(message.channel, discord.Thread)
@@ -277,13 +242,13 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
     messages = await _build_messages(message, bot, ref_msg, use_system=True, include_others=include_others, max_context=max_context)
     try:
         async with message.channel.typing():
-            reply = await _call_nvidia_api(messages)
+            reply = await pos_chat_completion(messages, max_tokens=700, temperature=1.0, top_p=1.0, timeout=60)
     except Exception:
-        reply = await _call_nvidia_api(messages)
+        reply = await pos_chat_completion(messages, max_tokens=700, temperature=1.0, top_p=1.0, timeout=60)
 
     if not reply:
         messages = await _build_messages(message, bot, ref_msg, use_system=False, include_others=include_others, max_context=max_context)
-        reply = await _call_nvidia_api(messages)
+        reply = await pos_chat_completion(messages, max_tokens=700, temperature=1.0, top_p=1.0, timeout=60)
     if not reply:
         return False
 

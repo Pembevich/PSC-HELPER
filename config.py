@@ -6,16 +6,27 @@ VIRUSTOTAL_KEY = os.getenv("VIRUSTOTAL_KEY")
 GOOGLE_SAFEBROWSING_KEY = os.getenv("GOOGLE_SAFEBROWSING_KEY")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat"
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-NVIDIA_API_URL = os.getenv(
-    "NVIDIA_API_URL",
-    "https://integrate.api.nvidia.com/v1/chat/completions"
+POS_AI_API_KEY = os.getenv("POS_AI_API_KEY") or os.getenv("NVIDIA_API_KEY")
+POS_AI_API_URL = os.getenv(
+    "POS_AI_API_URL",
+    os.getenv("NVIDIA_API_URL", "https://integrate.api.nvidia.com/v1/chat/completions")
 )
-NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "meta/llama-3.2-11b-vision-instruct")
+POS_AI_MODEL = os.getenv(
+    "POS_AI_MODEL",
+    os.getenv("NVIDIA_MODEL", "meta/llama-3.2-11b-vision-instruct")
+)
+
+# Старые имена оставляем для совместимости со старым кодом/окружением.
+NVIDIA_API_KEY = POS_AI_API_KEY
+NVIDIA_API_URL = POS_AI_API_URL
+NVIDIA_MODEL = POS_AI_MODEL
 
 # --- Логи ---
 LOG_CATEGORY_ID = int(os.getenv("LOG_CATEGORY_ID", "0") or 0)
 LOG_CATEGORY_NAME = os.getenv("LOG_CATEGORY_NAME", "логи")
+PRIMARY_LOG_CHANNEL_ID = int(os.getenv("PRIMARY_LOG_CHANNEL_ID", "1392124917230731376") or 0)
+UPDATE_LOG_CHANNEL_ID = int(os.getenv("UPDATE_LOG_CHANNEL_ID", "1414265499658748045") or 0)
+UPDATE_LOG_MARKER = os.getenv("UPDATE_LOG_MARKER", "psc-helper-release-2026-04-17")
 
 # -----------------------
 # Фильтрация ссылок
@@ -55,7 +66,27 @@ SUSPICIOUS_PATH_KEYWORDS = [
 ]
 
 WHITELIST_DOMAINS = {
-    "discord.com", "discord.gg", "youtube.com", "roblox.com", "google.com", "github.com"
+    "discord.com",
+    "discord.gg",
+    "discordapp.com",
+    "discordapp.net",
+    "cdn.discordapp.com",
+    "media.discordapp.net",
+    "youtube.com",
+    "youtu.be",
+    "google.com",
+    "github.com",
+    "tenor.com",
+    "media.tenor.com",
+    "c.tenor.com",
+    "giphy.com",
+    "media.giphy.com",
+    "i.giphy.com",
+    "roblox.com",
+    "reddit.com",
+    "redd.it",
+    "imgur.com",
+    "i.imgur.com",
 }
 
 # регулярка для поиска ссылок
@@ -81,7 +112,7 @@ TAC_ROLE_REWARDS = [1341040784723411017, 1341040871562285066, 134110056278301496
 VOICE_TIMEOUT_HOURS = 24
 VIOLATION_ATTACHMENT_LIMIT = 3
 NSFW_FILENAME_KEYWORDS = ["porn", "sex", "xxx", "nsfw", "erotic", "nud", "18+"]
-AD_FILENAME_KEYWORDS = ["casino", "bet", "free", "nitro", "robux", "giveaway", "promo", "advert"]
+AD_FILENAME_KEYWORDS = ["casino", "bet", "nitro", "robux", "giveaway", "promo", "advert", "bonus"]
 AD_TEXT_KEYWORDS = ["подпишись", "промокод", "ставки", "казино", "розыгрыш", "nitro", "robux", "бонус"]
 SUSPICIOUS_INVITE_PATTERNS = ["t.me/", "vk.com/"]
 ALLOWED_DISCORD_INVITE_PATTERNS = ["discord.gg/", "discord.com/invite/"]
