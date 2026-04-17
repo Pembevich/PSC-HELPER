@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 import uuid
 
 import discord
+from PIL import Image, ImageOps
 from discord import Embed, Color
 from discord.ext import commands
-from moviepy.editor import VideoFileClip, ImageSequenceClip
+
+try:
+    from moviepy import VideoFileClip, vfx
+except Exception:
+    VideoFileClip = None
+    vfx = None
 
 from config import (
     allowed_guild_ids,
@@ -16,6 +24,86 @@ from logging_utils import send_log_embed
 from utils import collect_runtime_health
 
 sbor_channels: dict[int, int] = {}
+GIF_MAX_DIMENSION = 640
+GIF_MAX_VIDEO_SECONDS = 6
+GIF_MIN_VIDEO_FPS = 8
+GIF_MAX_VIDEO_FPS = 12
+GIF_IMAGE_FRAME_MS = 700
+
+
+def _normalize_image_frame(path: str, canvas_size: tuple[int, int]) -> Image.Image:
+    with Image.open(path) as source:
+        frame = ImageOps.exif_transpose(source)
+        if getattr(frame, "is_animated", False):
+            frame.seek(0)
+        frame = frame.convert("RGBA")
+        contained = ImageOps.contain(frame, canvas_size, Image.Resampling.LANCZOS)
+        canvas = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+        offset = ((canvas_size[0] - contained.width) // 2, (canvas_size[1] - contained.height) // 2)
+        canvas.paste(contained, offset, contained)
+        return canvas
+
+
+def _build_gif_from_images(image_paths: list[str], output_path: str):
+    target_width = 1
+    target_height = 1
+
+    for path in image_paths:
+        with Image.open(path) as source:
+            frame = ImageOps.exif_transpose(source)
+            if getattr(frame, "is_animated", False):
+                frame.seek(0)
+            frame = frame.convert("RGBA")
+            if max(frame.size) > GIF_MAX_DIMENSION:
+                frame.thumbnail((GIF_MAX_DIMENSION, GIF_MAX_DIMENSION), Image.Resampling.LANCZOS)
+            target_width = max(target_width, frame.width)
+            target_height = max(target_height, frame.height)
+
+    frames = [_normalize_image_frame(path, (target_width, target_height)) for path in image_paths]
+    if len(frames) == 1:
+        frames.append(frames[0].copy())
+
+    frames[0].save(
+        output_path,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=GIF_IMAGE_FRAME_MS,
+        loop=0,
+        optimize=True,
+        disposal=2,
+    )
+
+
+def _build_gif_from_video(video_path: str, output_path: str):
+    if not VideoFileClip:
+        raise RuntimeError("moviepy недоступен в окружении")
+
+    with VideoFileClip(video_path) as source_clip:
+        if not source_clip.duration or source_clip.duration <= 0:
+            raise RuntimeError("видео не удалось прочитать")
+
+        render_clip = source_clip.subclipped(0, min(float(source_clip.duration), GIF_MAX_VIDEO_SECONDS))
+        clips_to_close = [render_clip] if render_clip is not source_clip else []
+        try:
+            if vfx and max(render_clip.size) > GIF_MAX_DIMENSION:
+                if render_clip.w >= render_clip.h:
+                    resized_clip = render_clip.with_effects([vfx.Resize(width=GIF_MAX_DIMENSION)])
+                else:
+                    resized_clip = render_clip.with_effects([vfx.Resize(height=GIF_MAX_DIMENSION)])
+                if resized_clip is not render_clip:
+                    clips_to_close.append(resized_clip)
+                render_clip = resized_clip
+
+            fps = int(round(render_clip.fps or GIF_MIN_VIDEO_FPS))
+            fps = max(GIF_MIN_VIDEO_FPS, min(GIF_MAX_VIDEO_FPS, fps))
+            render_clip.write_gif(output_path, fps=fps, loop=0, logger=None)
+        finally:
+            for clip_to_close in reversed(clips_to_close):
+                try:
+                    clip_to_close.close()
+                except Exception:
+                    pass
 
 
 def register_commands(bot: commands.Bot):
@@ -27,46 +115,38 @@ def register_commands(bot: commands.Bot):
 
         image_files = []
         video_files = []
-        os.makedirs("temp", exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix="psc-gif-")
 
-        for attachment in ctx.message.attachments:
-            filename = attachment.filename
-            ext = os.path.splitext(filename)[1].lower().strip(".")
-            unique_name = f"{uuid.uuid4().hex}.{ext}"
-            file_path = os.path.join("temp", unique_name)
-            await attachment.save(file_path)
-
-            if ext in ["jpg", "jpeg", "png", "webp", "bmp", "heic"]:
-                image_files.append(file_path)
-            elif ext in ["mp4", "mov", "webm", "avi", "mkv"]:
-                video_files.append(file_path)
-            else:
-                await ctx.send(f"❌ Файл `{filename}` не поддерживается.")
-                os.remove(file_path)
-                return
-
-        output_path = f"temp/{uuid.uuid4().hex}.gif"
         try:
+            for attachment in ctx.message.attachments:
+                filename = attachment.filename
+                ext = os.path.splitext(filename)[1].lower().strip(".")
+                unique_name = f"{uuid.uuid4().hex}.{ext}"
+                file_path = os.path.join(temp_dir, unique_name)
+                await attachment.save(file_path)
+
+                if ext in ["jpg", "jpeg", "png", "webp", "bmp", "heic", "gif"]:
+                    image_files.append(file_path)
+                elif ext in ["mp4", "mov", "webm", "avi", "mkv"]:
+                    video_files.append(file_path)
+                else:
+                    await ctx.send(f"❌ Файл `{filename}` не поддерживается для GIF.")
+                    return
+
+            output_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.gif")
             if image_files:
-                clip = ImageSequenceClip(image_files, fps=1)
-                clip.write_gif(output_path, fps=1)
+                _build_gif_from_images(image_files, output_path)
             elif video_files:
-                clip = VideoFileClip(video_files[0])
-                clip = clip.subclip(0, min(5, clip.duration))
-                clip.write_gif(output_path)
+                _build_gif_from_video(video_files[0], output_path)
             else:
-                await ctx.send("❌ Не удалось обработать вложения.")
+                await ctx.send("❌ Не удалось найти подходящее изображение или видео.")
                 return
 
-            await ctx.send(file=discord.File(output_path))
+            await ctx.send(file=discord.File(output_path, filename="psc.gif"))
         except Exception as e:
             await ctx.send(f"❌ Ошибка при создании GIF: {e}")
         finally:
-            for f in image_files + video_files:
-                if os.path.exists(f):
-                    os.remove(f)
-            if os.path.exists(output_path):
-                os.remove(output_path)
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     @bot.command(name="health")
     async def health(ctx: commands.Context):

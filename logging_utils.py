@@ -4,7 +4,7 @@ import discord
 from discord import Embed, Color
 from typing import Dict
 
-from config import LOG_CATEGORY_ID, LOG_CATEGORY_NAME
+from config import LOG_CATEGORY_ID, LOG_CATEGORY_NAME, PRIMARY_LOG_CHANNEL_ID
 
 LOG_CHANNEL_CONFIGS = [
     {
@@ -71,6 +71,20 @@ LOG_CHANNEL_CONFIGS = [
 
 _LOG_CHANNEL_CACHE: Dict[int, Dict[str, int]] = {}
 _LOG_INIT_DONE: set[int] = set()
+LOG_TYPE_LABELS = {
+    "moderation": "Модерация",
+    "messages": "Сообщения",
+    "message_edits": "Правки",
+    "message_deletes": "Удаления",
+    "members": "Участники",
+    "voice": "Голос",
+    "roles": "Роли",
+    "channels": "Каналы",
+    "server": "Сервер",
+    "commands": "Команды",
+    "forms": "Формы",
+    "errors": "Ошибки",
+}
 
 
 def _safe_lower(value: str | None) -> str:
@@ -132,6 +146,14 @@ def _find_channel_by_names(
 
 
 async def ensure_log_category_and_channels(guild: discord.Guild) -> dict[str, discord.TextChannel]:
+    if PRIMARY_LOG_CHANNEL_ID:
+        explicit_channel = guild.get_channel(PRIMARY_LOG_CHANNEL_ID)
+        if isinstance(explicit_channel, discord.TextChannel):
+            resolved = {cfg["key"]: explicit_channel for cfg in LOG_CHANNEL_CONFIGS}
+            _LOG_CHANNEL_CACHE[guild.id] = {key: channel.id for key, channel in resolved.items()}
+            _LOG_INIT_DONE.add(guild.id)
+            return resolved
+
     can_manage = bool(guild.me and guild.me.guild_permissions.manage_channels)
 
     category = _find_category(guild)
@@ -187,6 +209,12 @@ def get_log_channel(guild: discord.Guild | None, log_type: str = "server") -> di
     if not guild:
         return None
 
+    if PRIMARY_LOG_CHANNEL_ID:
+        explicit_channel = guild.get_channel(PRIMARY_LOG_CHANNEL_ID)
+        if isinstance(explicit_channel, discord.TextChannel):
+            _LOG_CHANNEL_CACHE.setdefault(guild.id, {})[log_type] = explicit_channel.id
+            return explicit_channel
+
     cache = _LOG_CHANNEL_CACHE.get(guild.id)
     if cache and log_type in cache:
         ch = guild.get_channel(cache[log_type])
@@ -220,6 +248,8 @@ def get_log_channel(guild: discord.Guild | None, log_type: str = "server") -> di
 def is_log_channel(channel: discord.abc.GuildChannel | None) -> bool:
     if not channel or not isinstance(channel, discord.TextChannel):
         return False
+    if PRIMARY_LOG_CHANNEL_ID and channel.id == PRIMARY_LOG_CHANNEL_ID:
+        return True
     if is_log_category(channel.category):
         return True
     cache = _LOG_CHANNEL_CACHE.get(channel.guild.id, {})
@@ -246,7 +276,11 @@ async def send_log_embed(
         for name, value, inline in fields:
             emb.add_field(name=name, value=(value or "")[:1024], inline=inline)
     if footer:
-        emb.set_footer(text=footer[:2048])
+        footer_text = footer[:2048]
+    else:
+        footer_text = LOG_TYPE_LABELS.get(log_type, "Логи")
+    emb.set_footer(text=footer_text)
+    emb.set_author(name=f"P.S.C Logs • {LOG_TYPE_LABELS.get(log_type, 'Логи')}")
 
     try:
         if files:
