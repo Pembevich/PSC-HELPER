@@ -16,11 +16,31 @@ class ConfirmView(View):
         self.squad_name = squad_name
         self.role_ids = role_ids
         self.target_user_id = target_user_id
+        self.resolved = False
+
+    def _disable_buttons(self):
+        for item in self.children:
+            item.disabled = True
+
+    async def _finalize_view(self, interaction: discord.Interaction):
+        self.resolved = True
+        self._disable_buttons()
+        try:
+            if interaction.message:
+                await interaction.message.edit(view=self)
+        except Exception:
+            pass
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if any(r.id in self.allowed_checker_role_ids for r in interaction.user.roles):
+        if self.resolved:
+            await interaction.response.send_message("Эта заявка уже обработана.", ephemeral=True)
+            return False
+        if interaction.user.bot:
+            await interaction.response.send_message("Ботам тут делать нечего.", ephemeral=True)
+            return False
+        if interaction.guild:
             return True
-        await interaction.response.send_message("❌ У тебя нет прав нажимать эту кнопку.", ephemeral=True)
+        await interaction.response.send_message("❌ Не удалось проверить участника сервера.", ephemeral=True)
         return False
 
     @button(label="Принять", style=discord.ButtonStyle.green)
@@ -67,6 +87,7 @@ class ConfirmView(View):
                 )
             except Exception:
                 pass
+        await self._finalize_view(interaction)
         await interaction.response.send_message("Принято.", ephemeral=True)
         self.stop()
 
@@ -87,6 +108,7 @@ class ConfirmView(View):
             )
         except Exception:
             pass
+        await self._finalize_view(interaction)
         await interaction.response.send_message("Отказ зарегистрирован.", ephemeral=True)
         self.stop()
 

@@ -16,7 +16,7 @@ import idna
 from PIL import Image, ImageOps
 from discord import Color, Embed
 
-from ai_client import extract_json_block, pos_chat_completion
+from ai_client import ai_is_temporarily_unavailable, extract_json_block, pos_chat_completion
 from config import (
     AD_FILENAME_KEYWORDS,
     AD_TEXT_KEYWORDS,
@@ -65,6 +65,25 @@ VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm", ".avi", ".mkv")
 _vt_cache: dict[str, tuple[bool, float]] = {}
 _ai_url_cache: dict[str, tuple[str, str, float]] = {}
 recent_messages = defaultdict(lambda: deque())
+
+
+def _text_has_media_risk_signals(text: str) -> bool:
+    lowered = (text or "").lower()
+    if not lowered:
+        return False
+    keywords = {
+        *AD_TEXT_KEYWORDS,
+        *NSFW_FILENAME_KEYWORDS,
+        "скам",
+        "фишинг",
+        "эрот",
+        "18+",
+        "adult",
+        "porn",
+        "casino",
+        "казино",
+    }
+    return any(keyword in lowered for keyword in keywords)
 
 
 def extract_urls(text: str) -> list[str]:
@@ -254,7 +273,10 @@ async def check_virustotal(session: aiohttp.ClientSession, url: str) -> bool:
     if not VIRUSTOTAL_KEY:
         return False
 
-    headers = {"x-apikey": VIRUSTOTAL_KEY}
+    headers = {
+        "x-apikey": VIRUSTOTAL_KEY,
+        "User-Agent": "PSC-HELPER/2026.04",
+    }
     try:
         async with session.post(
             "https://www.virustotal.com/api/v3/urls",
@@ -285,7 +307,7 @@ async def check_virustotal(session: aiohttp.ClientSession, url: str) -> bool:
 
 
 async def _classify_urls_with_ai(url_contexts: list[dict]) -> list[tuple[str, str]]:
-    if not POS_AI_API_KEY or not url_contexts:
+    if not POS_AI_API_KEY or not url_contexts or ai_is_temporarily_unavailable():
         return []
 
     now = time.time()
@@ -374,7 +396,7 @@ def _detect_attachment_metadata_flags(attachments: list[discord.Attachment]) -> 
 
 
 async def _classify_media_with_ai(attachments: list[discord.Attachment], text: str = "") -> dict[str, tuple[str, str]]:
-    if not POS_AI_API_KEY:
+    if not POS_AI_API_KEY or ai_is_temporarily_unavailable():
         return {}
 
     media = [attachment for attachment in attachments if _is_image_attachment(attachment) or _is_video_attachment(attachment)]
@@ -641,8 +663,11 @@ def detect_advertising_or_scam_text(text: str):
 
 
 async def detect_attachment_violations(attachments, text: str = ""):
-    metadata_flags = _detect_attachment_metadata_flags(list(attachments))
-    ai_verdicts = await _classify_media_with_ai(list(attachments), text=text)
+    attachment_list = list(attachments)
+    metadata_flags = _detect_attachment_metadata_flags(attachment_list)
+    has_video = any(_is_video_attachment(attachment) for attachment in attachment_list)
+    should_run_ai_review = bool(metadata_flags) or _text_has_media_risk_signals(text) or has_video
+    ai_verdicts = await _classify_media_with_ai(attachment_list, text=text) if should_run_ai_review else {}
 
     reasons: list[str] = []
     already_added = set()

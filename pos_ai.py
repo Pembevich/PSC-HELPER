@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import re
 import time
 from typing import List, Optional
 
 import discord
 from discord.utils import escape_markdown, escape_mentions
 
-from ai_client import pos_chat_completion
+from ai_client import (
+    ai_cooldown_remaining,
+    ai_is_temporarily_unavailable,
+    ai_unavailable_reason,
+    pos_chat_completion,
+)
 from config import (
     POS_AI_API_KEY,
     POS_AI_MAX_TOKENS,
@@ -30,7 +36,9 @@ SYSTEM_INSTRUCTION = POS_AI_SYSTEM_PROMPT
 
 _last_user_call: dict[int, float] = {}
 _conversation_state: dict[int, dict] = {}
+_last_rate_limit_notice: dict[int, float] = {}
 _missing_key_warned = False
+AI_NAME_PATTERN = re.compile(r"(?<!\w)(?:p[\s.\-_]*o[\s.\-_]*s|п[\s.\-_]*о[\s.\-_]*с)(?!\w)", re.IGNORECASE)
 
 
 def _strip_bot_mention(text: str, bot_id: int) -> str:
@@ -63,6 +71,37 @@ def _sanitize_text(text: str) -> str:
     return escape_mentions(escape_markdown(text or "")).strip()
 
 
+def _mentions_bot_by_name(message: discord.Message, bot: discord.Client) -> bool:
+    content = (message.content or "").strip()
+    if not content:
+        return False
+    if AI_NAME_PATTERN.search(content):
+        return True
+    if not bot.user:
+        return False
+    bot_name = (getattr(bot.user, "display_name", None) or bot.user.name or "").strip().lower()
+    return bool(bot_name and bot_name in content.lower())
+
+
+def _build_rate_limit_reply() -> str:
+    seconds = max(int(ai_cooldown_remaining()), 1)
+    if ai_unavailable_reason() == "rate_limited":
+        return (
+            f"Сейчас я упёрся в лимит GitHub Models. Дай мне около {seconds} сек., "
+            "и я снова включусь в разговор без истерик и белого шума."
+        )
+    return "Сейчас внешний AI-сервис подзадумался. Через минуту попробуй ещё раз — я вернусь в строй."
+
+
+def _should_send_rate_limit_notice(channel_id: int, window_seconds: int = 20) -> bool:
+    now = time.time()
+    last_notice = _last_rate_limit_notice.get(channel_id, 0.0)
+    if now - last_notice < window_seconds:
+        return False
+    _last_rate_limit_notice[channel_id] = now
+    return True
+
+
 def build_pos_user_content(text: str, image_urls: list[str] | None = None):
     cleaned_text = _sanitize_text(text or "")
     urls = [url for url in (image_urls or []) if url][:4]
@@ -83,7 +122,7 @@ async def request_pos_reply(messages: list[dict], *, allow_system_fallback: bool
         top_p=POS_AI_TOP_P,
         timeout=POS_AI_TIMEOUT_SECONDS,
     )
-    if reply or not allow_system_fallback:
+    if reply or not allow_system_fallback or ai_is_temporarily_unavailable():
         return reply
 
     fallback_messages = [message.copy() for message in messages if message.get("role") != "system"]
@@ -158,7 +197,8 @@ def _touch_state(channel: discord.abc.GuildChannel, user_id: int, bot_replied: b
 def _can_auto_reply(message: discord.Message, bot: discord.Client, ref_msg: Optional[discord.Message]) -> bool:
     mentioned = bot.user in message.mentions if bot.user else False
     replied = bool(ref_msg and ref_msg.author and bot.user and ref_msg.author.id == bot.user.id)
-    if mentioned or replied:
+    named = _mentions_bot_by_name(message, bot)
+    if mentioned or replied or named:
         return True
 
     state = _get_state(message.channel)
@@ -189,7 +229,7 @@ async def _get_reference_message(message: discord.Message) -> Optional[discord.M
 def _is_addressed_to_bot(message: discord.Message, bot: discord.Client, ref_msg: Optional[discord.Message]) -> bool:
     mentioned = bot.user in message.mentions if bot.user else False
     replied = bool(ref_msg and ref_msg.author and bot.user and ref_msg.author.id == bot.user.id)
-    return mentioned or replied
+    return mentioned or replied or _mentions_bot_by_name(message, bot)
 
 
 async def _build_messages(
@@ -262,6 +302,7 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
     ref_msg = await _get_reference_message(message)
     if not _can_auto_reply(message, bot, ref_msg):
         return False
+    explicit_addressing = _is_addressed_to_bot(message, bot, ref_msg)
 
     now = time.time()
     last = _last_user_call.get(message.author.id, 0.0)
@@ -287,6 +328,15 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
     except Exception:
         reply = await request_pos_reply(messages)
     if not reply:
+        if explicit_addressing and ai_is_temporarily_unavailable() and _should_send_rate_limit_notice(message.channel.id):
+            try:
+                await message.reply(
+                    _build_rate_limit_reply(),
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except Exception:
+                pass
         return False
 
     chunks = _chunk_text(reply)
