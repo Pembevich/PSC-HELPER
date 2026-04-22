@@ -87,7 +87,7 @@ def _build_rate_limit_reply() -> str:
     seconds = max(int(ai_cooldown_remaining()), 1)
     if ai_unavailable_reason() == "rate_limited":
         return (
-            f"Сейчас я упёрся в лимит GitHub Models. Дай мне около {seconds} сек., "
+            f"Сейчас я немного занят, выполняю другие задачи. Дай мне около {seconds} сек., "
             "и я снова включусь в разговор без истерик и белого шума."
         )
     return "Сейчас внешний AI-сервис подзадумался. Через минуту попробуй ещё раз — я вернусь в строй."
