@@ -7,7 +7,16 @@ import discord
 from discord.utils import escape_markdown, escape_mentions
 
 from ai_client import pos_chat_completion
-from config import POS_AI_API_KEY
+from config import (
+    POS_AI_API_KEY,
+    POS_AI_MAX_TOKENS,
+    POS_AI_MODEL,
+    POS_AI_PROVIDER,
+    POS_AI_SYSTEM_PROMPT,
+    POS_AI_TIMEOUT_SECONDS,
+    POS_AI_TOP_P,
+    POS_AI_TEMPERATURE,
+)
 from logging_utils import is_log_channel
 
 AI_COOLDOWN_SECONDS = 2.5
@@ -17,15 +26,7 @@ AI_MAX_RESPONSE_CHARS = 1900
 AI_THREAD_TTL_SECONDS = 20 * 60
 AI_CHANNEL_TTL_SECONDS = 8 * 60
 
-SYSTEM_INSTRUCTION = (
-    "Ты — P.OS, ИИ корпорации Provision Security Complex, разработанный Пумбой. "
-    "Отвечай по-русски, уверенно и по существу. "
-    "Пиши с лёгкой ироничной ноткой, но уважительно. "
-    "Выражай эмоции и живую реакцию, используй эмпатию и человеческий тон. "
-    "Не заявляй о наличии реального сознания или чувств как факта. "
-    "Не используй шаблонные отказы и фразы вроде «я не умею/не могу». "
-    "Если информации мало — уточняй и предлагай рабочие варианты."
-)
+SYSTEM_INSTRUCTION = POS_AI_SYSTEM_PROMPT
 
 _last_user_call: dict[int, float] = {}
 _conversation_state: dict[int, dict] = {}
@@ -60,6 +61,55 @@ def _chunk_text(text: str, limit: int = AI_MAX_RESPONSE_CHARS) -> List[str]:
 
 def _sanitize_text(text: str) -> str:
     return escape_mentions(escape_markdown(text or "")).strip()
+
+
+def build_pos_user_content(text: str, image_urls: list[str] | None = None):
+    cleaned_text = _sanitize_text(text or "")
+    urls = [url for url in (image_urls or []) if url][:4]
+    if not urls:
+        return cleaned_text or "Да, я на связи. Что нужно?"
+
+    content_items = [{"type": "text", "text": cleaned_text or "Посмотри на изображение и ответь по делу."}]
+    for url in urls:
+        content_items.append({"type": "image_url", "image_url": {"url": url}})
+    return content_items
+
+
+async def request_pos_reply(messages: list[dict], *, allow_system_fallback: bool = True) -> str | None:
+    reply = await pos_chat_completion(
+        messages,
+        max_tokens=POS_AI_MAX_TOKENS,
+        temperature=POS_AI_TEMPERATURE,
+        top_p=POS_AI_TOP_P,
+        timeout=POS_AI_TIMEOUT_SECONDS,
+    )
+    if reply or not allow_system_fallback:
+        return reply
+
+    fallback_messages = [message.copy() for message in messages if message.get("role") != "system"]
+    if not fallback_messages:
+        fallback_messages = messages
+    return await pos_chat_completion(
+        fallback_messages,
+        max_tokens=POS_AI_MAX_TOKENS,
+        temperature=POS_AI_TEMPERATURE,
+        top_p=POS_AI_TOP_P,
+        timeout=POS_AI_TIMEOUT_SECONDS,
+    )
+
+
+async def ask_pos(
+    prompt: str,
+    *,
+    image_urls: list[str] | None = None,
+    author_name: str | None = None,
+) -> str | None:
+    user_prefix = f"Пользователь: {author_name}\n" if author_name else ""
+    messages = [
+        {"role": "system", "content": SYSTEM_INSTRUCTION},
+        {"role": "user", "content": build_pos_user_content(user_prefix + (prompt or ""), image_urls)},
+    ]
+    return await request_pos_reply(messages)
 
 
 def _should_skip_message(message: discord.Message, bot: discord.Client) -> bool:
@@ -198,19 +248,7 @@ async def _build_messages(
             if url not in image_urls:
                 image_urls.append(url)
 
-    if image_urls:
-        content_items = []
-        if text:
-            content_items.append({"type": "text", "text": text})
-        else:
-            content_items.append({"type": "text", "text": "Опиши изображение и ответь по делу."})
-        for url in image_urls[:4]:
-            content_items.append({"type": "image_url", "image_url": {"url": url}})
-        messages.append({"role": "user", "content": content_items})
-    else:
-        if not text:
-            text = "Да, я на связи. Что нужно?"
-        messages.append({"role": "user", "content": text})
+    messages.append({"role": "user", "content": build_pos_user_content(text, image_urls)})
 
     return messages
 
@@ -233,7 +271,10 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
 
     if not POS_AI_API_KEY:
         if not _missing_key_warned:
-            print("P.OS AI disabled: set POS_AI_API_KEY in Railway environment variables.")
+            print(
+                "P.OS AI disabled: set GITHUB_MODELS_TOKEN or POS_AI_API_KEY in Railway environment variables. "
+                f"Current provider={POS_AI_PROVIDER}, model={POS_AI_MODEL}."
+            )
             _missing_key_warned = True
         return False
 
@@ -242,13 +283,9 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
     messages = await _build_messages(message, bot, ref_msg, use_system=True, include_others=include_others, max_context=max_context)
     try:
         async with message.channel.typing():
-            reply = await pos_chat_completion(messages, max_tokens=700, temperature=1.0, top_p=1.0, timeout=60)
+            reply = await request_pos_reply(messages)
     except Exception:
-        reply = await pos_chat_completion(messages, max_tokens=700, temperature=1.0, top_p=1.0, timeout=60)
-
-    if not reply:
-        messages = await _build_messages(message, bot, ref_msg, use_system=False, include_others=include_others, max_context=max_context)
-        reply = await pos_chat_completion(messages, max_tokens=700, temperature=1.0, top_p=1.0, timeout=60)
+        reply = await request_pos_reply(messages)
     if not reply:
         return False
 

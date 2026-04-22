@@ -17,11 +17,14 @@ except Exception:
     vfx = None
 
 from config import (
+    POS_AI_MODEL,
+    POS_AI_PROVIDER,
     allowed_guild_ids,
     allowed_role_ids,
 )
 from logging_utils import send_log_embed
 from utils import collect_runtime_health
+from pos_ai import ask_pos
 
 sbor_channels: dict[int, int] = {}
 GIF_MAX_DIMENSION = 640
@@ -29,6 +32,12 @@ GIF_MAX_VIDEO_SECONDS = 6
 GIF_MIN_VIDEO_FPS = 8
 GIF_MAX_VIDEO_FPS = 12
 GIF_IMAGE_FRAME_MS = 700
+
+
+def _is_image_attachment(attachment: discord.Attachment) -> bool:
+    content_type = (attachment.content_type or "").lower()
+    filename = (attachment.filename or "").lower()
+    return content_type.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"))
 
 
 def _normalize_image_frame(path: str, canvas_size: tuple[int, int]) -> Image.Image:
@@ -163,6 +172,8 @@ def register_commands(bot: commands.Bot):
             timestamp=discord.utils.utcnow(),
         )
         embed.add_field(name="Latency", value=f"`{round(bot.latency * 1000)}ms`", inline=False)
+        embed.add_field(name="AI Provider", value=f"`{POS_AI_PROVIDER}`", inline=True)
+        embed.add_field(name="AI Model", value=f"`{POS_AI_MODEL}`", inline=True)
         await ctx.send(embed=embed)
 
     @bot.tree.command(name="sbor", description="Начать сбор: создаёт голосовой канал и пингует роль")
@@ -256,4 +267,14 @@ def register_commands(bot: commands.Bot):
 
     @bot.command()
     async def ai(ctx: commands.Context, *, question: str):
-        await ctx.send("Команда !ai временно отключена.")
+        image_urls = [attachment.url for attachment in ctx.message.attachments if _is_image_attachment(attachment)]
+        async with ctx.typing():
+            reply = await ask_pos(question, image_urls=image_urls, author_name=ctx.author.display_name)
+
+        if not reply:
+            await ctx.send("P.OS сейчас молчит как сервер в понедельник утром. Проверь AI-ключ и модель в Railway.")
+            return
+
+        chunks = [reply[i:i + 1900] for i in range(0, len(reply), 1900)]
+        for chunk in chunks:
+            await ctx.send(chunk, allowed_mentions=discord.AllowedMentions.none())

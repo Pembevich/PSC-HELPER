@@ -5,7 +5,17 @@ from typing import Any
 
 import aiohttp
 
-from config import POS_AI_API_KEY, POS_AI_API_URL, POS_AI_MODEL
+from config import (
+    GITHUB_MODELS_API_VERSION,
+    POS_AI_API_KEY,
+    POS_AI_MAX_TOKENS,
+    POS_AI_PROVIDER,
+    POS_AI_API_URL,
+    POS_AI_MODEL,
+    POS_AI_TIMEOUT_SECONDS,
+    POS_AI_TOP_P,
+    POS_AI_TEMPERATURE,
+)
 
 
 def _extract_text_from_payload(data: dict[str, Any]) -> str | None:
@@ -43,14 +53,15 @@ def _extract_text_from_payload(data: dict[str, Any]) -> str | None:
 async def pos_chat_completion(
     messages: list[dict[str, Any]],
     *,
-    max_tokens: int = 700,
-    temperature: float = 1.0,
-    top_p: float = 1.0,
-    timeout: int = 60,
+    max_tokens: int = POS_AI_MAX_TOKENS,
+    temperature: float = POS_AI_TEMPERATURE,
+    top_p: float = POS_AI_TOP_P,
+    timeout: int = POS_AI_TIMEOUT_SECONDS,
 ) -> str | None:
     if not POS_AI_API_KEY:
         return None
 
+    accept_header = "application/vnd.github+json" if POS_AI_PROVIDER == "github_models" else "application/json"
     payload = {
         "messages": messages,
         "model": POS_AI_MODEL,
@@ -64,15 +75,23 @@ async def pos_chat_completion(
     headers = {
         "Authorization": f"Bearer {POS_AI_API_KEY}",
         "Content-Type": "application/json",
-        "Accept": "application/json",
+        "Accept": accept_header,
     }
+    if POS_AI_PROVIDER == "github_models":
+        headers["X-GitHub-Api-Version"] = GITHUB_MODELS_API_VERSION
 
     response_text = ""
     try:
-        async with aiohttp.ClientSession() as session:
+        timeout_config = aiohttp.ClientTimeout(total=timeout)
+        async with aiohttp.ClientSession(timeout=timeout_config) as session:
             async with session.post(POS_AI_API_URL, headers=headers, json=payload, timeout=timeout) as resp:
                 response_text = await resp.text()
                 if resp.status >= 400:
+                    if POS_AI_PROVIDER == "github_models" and resp.status in {401, 403}:
+                        print(
+                            "P.OS GitHub Models auth error: проверь, что GITHUB_MODELS_TOKEN существует "
+                            "и имеет доступ к Models API (PAT со scope/permission models)."
+                        )
                     print(f"P.OS API error {resp.status}: {response_text[:500]}")
                     return None
     except Exception as exc:

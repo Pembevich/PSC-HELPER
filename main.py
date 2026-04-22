@@ -1,9 +1,11 @@
 import os
 
 import discord
+from dotenv import load_dotenv
 from discord.ext import commands
 
 from commands import register_commands
+from config import POS_AI_MODEL, POS_AI_PROVIDER
 from events import register_events
 from storage import init_db
 from utils import sanitize_discord_token
@@ -11,7 +13,7 @@ from utils import sanitize_discord_token
 
 def create_bot() -> commands.Bot:
     intents = discord.Intents.all()
-    bot = commands.Bot(command_prefix="!", intents=intents)
+    bot = commands.Bot(command_prefix="!", intents=intents, case_insensitive=True)
 
     try:
         import audioop  # noqa
@@ -22,6 +24,7 @@ def create_bot() -> commands.Bot:
 
 
 def main():
+    load_dotenv()
     init_db()
 
     bot = create_bot()
@@ -36,7 +39,7 @@ def main():
         return
 
     try:
-        print("⏳ Запуск бота...")
+        print(f"⏳ Запуск бота... AI provider={POS_AI_PROVIDER}, model={POS_AI_MODEL}")
         bot.run(token)
     except discord.errors.LoginFailure:
         print("🚨 ОШИБКА: Неверный токен (Improper token). Проверь DISCORD_TOKEN в Railway.")

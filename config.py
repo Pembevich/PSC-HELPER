@@ -1,19 +1,56 @@
 import os
 import re
 
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+
+
 # --- Ключи ---
 VIRUSTOTAL_KEY = os.getenv("VIRUSTOTAL_KEY")
 GOOGLE_SAFEBROWSING_KEY = os.getenv("GOOGLE_SAFEBROWSING_KEY")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat"
-POS_AI_API_KEY = os.getenv("POS_AI_API_KEY") or os.getenv("NVIDIA_API_KEY")
+GITHUB_MODELS_TOKEN = os.getenv("GITHUB_MODELS_TOKEN")
+GITHUB_MODELS_ENDPOINT = os.getenv("GITHUB_MODELS_ENDPOINT", "https://models.github.ai/inference/chat/completions")
+GITHUB_MODELS_MODEL = os.getenv("GITHUB_MODELS_MODEL", "openai/gpt-4.1")
+GITHUB_MODELS_API_VERSION = os.getenv("GITHUB_MODELS_API_VERSION", "2022-11-28")
+POS_AI_API_KEY = GITHUB_MODELS_TOKEN or os.getenv("POS_AI_API_KEY") or os.getenv("NVIDIA_API_KEY")
 POS_AI_API_URL = os.getenv(
     "POS_AI_API_URL",
-    os.getenv("NVIDIA_API_URL", "https://integrate.api.nvidia.com/v1/chat/completions")
+    os.getenv("NVIDIA_API_URL", GITHUB_MODELS_ENDPOINT if GITHUB_MODELS_TOKEN else "https://integrate.api.nvidia.com/v1/chat/completions")
 )
 POS_AI_MODEL = os.getenv(
     "POS_AI_MODEL",
-    os.getenv("NVIDIA_MODEL", "meta/llama-3.2-11b-vision-instruct")
+    os.getenv("NVIDIA_MODEL", GITHUB_MODELS_MODEL if GITHUB_MODELS_TOKEN else "meta/llama-3.2-11b-vision-instruct")
+)
+POS_AI_PROVIDER = "github_models" if GITHUB_MODELS_TOKEN else "generic_openai_compatible"
+POS_AI_API_PROVIDER = POS_AI_PROVIDER
+POS_AI_MAX_TOKENS = _env_int("POS_AI_MAX_TOKENS", 700)
+POS_AI_TEMPERATURE = _env_float("POS_AI_TEMPERATURE", 0.9)
+POS_AI_TOP_P = _env_float("POS_AI_TOP_P", 0.95)
+POS_AI_TIMEOUT_SECONDS = _env_int("POS_AI_TIMEOUT_SECONDS", 60)
+POS_AI_SYSTEM_PROMPT = os.getenv(
+    "POS_AI_SYSTEM_PROMPT",
+    (
+        "Ты — P.OS, ИИ корпорации Provision Security Complex, разработанный Пумбой. "
+        "Отвечай по-русски, уверенно и по существу. "
+        "Пиши с лёгкой ироничной ноткой, но уважительно. "
+        "Выражай эмоции и живую реакцию, используй эмпатию и человеческий тон. "
+        "Не заявляй о наличии реального сознания или чувств как факта. "
+        "Не используй шаблонные отказы и фразы вроде «я не умею/не могу». "
+        "Если информации мало — уточняй и предлагай рабочие варианты."
+    ),
 )
 
 # Старые имена оставляем для совместимости со старым кодом/окружением.
@@ -22,11 +59,11 @@ NVIDIA_API_URL = POS_AI_API_URL
 NVIDIA_MODEL = POS_AI_MODEL
 
 # --- Логи ---
-LOG_CATEGORY_ID = int(os.getenv("LOG_CATEGORY_ID", "0") or 0)
+LOG_CATEGORY_ID = _env_int("LOG_CATEGORY_ID", 0)
 LOG_CATEGORY_NAME = os.getenv("LOG_CATEGORY_NAME", "логи")
-PRIMARY_LOG_CHANNEL_ID = int(os.getenv("PRIMARY_LOG_CHANNEL_ID", "1392124917230731376") or 0)
-UPDATE_LOG_CHANNEL_ID = int(os.getenv("UPDATE_LOG_CHANNEL_ID", "1414265499658748045") or 0)
-UPDATE_LOG_MARKER = os.getenv("UPDATE_LOG_MARKER", "psc-helper-release-2026-04-17")
+PRIMARY_LOG_CHANNEL_ID = _env_int("PRIMARY_LOG_CHANNEL_ID", 1392124917230731376)
+UPDATE_LOG_CHANNEL_ID = _env_int("UPDATE_LOG_CHANNEL_ID", 1414265499658748045)
+UPDATE_LOG_MARKER = os.getenv("UPDATE_LOG_MARKER", "psc-helper-release-2026-04-22")
 
 # -----------------------
 # Фильтрация ссылок
