@@ -22,16 +22,19 @@ from config import (
     POS_AI_TIMEOUT_SECONDS,
     POS_AI_TOP_P,
     POS_AI_TEMPERATURE,
+    POS_OWNER_FALLBACK_NAME,
+    POS_OWNER_USER_IDS,
 )
 from commands import generate_gif_from_attachments
 from logging_utils import is_log_channel
 
 AI_COOLDOWN_SECONDS = 2.5
-AI_MAX_CONTEXT = 12
-AI_MAX_CONTEXT_THREAD = 20
+AI_MAX_CONTEXT = 64
+AI_MAX_CONTEXT_THREAD = 140
 AI_MAX_RESPONSE_CHARS = 1900
 AI_THREAD_TTL_SECONDS = 20 * 60
 AI_CHANNEL_TTL_SECONDS = 8 * 60
+AI_HISTORY_SCAN_LIMIT = 450
 
 SYSTEM_INSTRUCTION = POS_AI_SYSTEM_PROMPT
 
@@ -39,8 +42,13 @@ _last_user_call: dict[int, float] = {}
 _conversation_state: dict[int, dict] = {}
 _last_rate_limit_notice: dict[int, float] = {}
 _missing_key_warned = False
+_muted_users: set[tuple[int, int]] = set()
 AI_NAME_PATTERN = re.compile(r"(?<!\w)(?:p[\s.\-_]*o[\s.\-_]*s|п[\s.\-_]*о[\s.\-_]*с)(?!\w)", re.IGNORECASE)
 GIF_INTENT_PATTERN = re.compile(r"\b(сделай|создай|собери|сгенерируй|convert|make)\b.*\b(gif|гиф)\b|\b(gif|гиф)\b", re.IGNORECASE)
+MUTE_PATTERN = re.compile(r"(не\s*отвечай|не\s*пиши|игнорируй\s*меня|молчи\s*со\s*мной)", re.IGNORECASE)
+UNMUTE_PATTERN = re.compile(r"(можешь\s*отвечать|снова\s*отвечай|вернись\s*в\s*диалог|разрешаю\s*отвечать)", re.IGNORECASE)
+UNBAN_PATTERN = re.compile(r"\b(разбань|unban|сними\s*бан)\b", re.IGNORECASE)
+USER_ID_PATTERN = re.compile(r"\b\d{17,21}\b")
 
 
 def _strip_bot_mention(text: str, bot_id: int) -> str:
@@ -111,6 +119,47 @@ def _collect_media_attachments(message: discord.Message, ref_msg: Optional[disco
             if attachment not in attachments:
                 attachments.append(attachment)
     return attachments
+
+
+async def _collect_recent_media_attachments(message: discord.Message, limit: int = 30) -> list[discord.Attachment]:
+    attachments: list[discord.Attachment] = []
+    async for hist in message.channel.history(limit=limit):
+        for attachment in hist.attachments:
+            content_type = (attachment.content_type or "").lower()
+            filename = (attachment.filename or "").lower()
+            if content_type.startswith(("image/", "video/")) or filename.endswith(
+                (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".mp4", ".mov", ".webm", ".avi", ".mkv")
+            ):
+                attachments.append(attachment)
+    return attachments
+
+
+def _mute_key(message: discord.Message) -> tuple[int, int] | None:
+    if not message.guild:
+        return None
+    return (message.guild.id, message.author.id)
+
+
+def _is_owner_user(message: discord.Message) -> bool:
+    if message.author.id in POS_OWNER_USER_IDS:
+        return True
+    name = (message.author.name or "").strip().lower()
+    display = (message.author.display_name or "").strip().lower()
+    fallback = POS_OWNER_FALLBACK_NAME
+    return bool(fallback and (name == fallback or display == fallback))
+
+
+def _is_user_muted(message: discord.Message) -> bool:
+    key = _mute_key(message)
+    return bool(key and key in _muted_users)
+
+
+def _is_mute_request(text: str) -> bool:
+    return bool(MUTE_PATTERN.search(text or ""))
+
+
+def _is_unmute_request(text: str) -> bool:
+    return bool(UNMUTE_PATTERN.search(text or ""))
 
 
 def _should_send_rate_limit_notice(channel_id: int, window_seconds: int = 20) -> bool:
@@ -218,21 +267,7 @@ def _can_auto_reply(message: discord.Message, bot: discord.Client, ref_msg: Opti
     mentioned = bot.user in message.mentions if bot.user else False
     replied = bool(ref_msg and ref_msg.author and bot.user and ref_msg.author.id == bot.user.id)
     named = _mentions_bot_by_name(message, bot)
-    if mentioned or replied or named:
-        return True
-
-    state = _get_state(message.channel)
-    if not state:
-        return False
-
-    ttl = AI_THREAD_TTL_SECONDS if state.get("is_thread") else AI_CHANNEL_TTL_SECONDS
-    if not state.get("last_bot_ts") or time.time() - state["last_bot_ts"] > ttl:
-        return False
-
-    if state.get("is_thread"):
-        return True
-
-    return message.author.id in state.get("participants", set())
+    return mentioned or replied or named
 
 
 async def _get_reference_message(message: discord.Message) -> Optional[discord.Message]:
@@ -261,7 +296,16 @@ async def _build_messages(
     max_context: int = AI_MAX_CONTEXT
 ) -> list[dict]:
     role = "system" if use_system else "user"
-    messages: list[dict] = [{"role": role, "content": SYSTEM_INSTRUCTION + "\nОтвечай только на последний запрос."}]
+    messages: list[dict] = [
+        {
+            "role": role,
+            "content": (
+                SYSTEM_INSTRUCTION
+                + "\nТы видишь многопользовательский контекст сервера. Учитывай лор, текущие обсуждения и стиль участников."
+                + "\nОтвечай строго по последнему запросу, но с учетом релевантной истории канала."
+            ),
+        }
+    ]
     history: list[dict] = []
     seen_ids = set()
 
@@ -273,10 +317,12 @@ async def _build_messages(
         if content:
             if include_others and bot.user and ref_msg.author.id not in (message.author.id, bot.user.id):
                 content = f"{ref_msg.author.display_name}: {content}"
+            if bot.user and ref_msg.author.id != bot.user.id:
+                content = f"[Сообщение, на которое пользователь отвечает]\n{content}"
             history.append({"role": role, "content": content})
             seen_ids.add(ref_msg.id)
 
-    async for m in message.channel.history(limit=60, before=message):
+    async for m in message.channel.history(limit=AI_HISTORY_SCAN_LIMIT, before=message):
         if m.id in seen_ids:
             continue
         if m.author.bot and (not bot.user or m.author.id != bot.user.id):
@@ -313,6 +359,59 @@ async def _build_messages(
     return messages
 
 
+async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[discord.Message]) -> bool:
+    if not message.guild:
+        return False
+    if not _is_owner_user(message):
+        return False
+    text = (message.content or "").strip()
+    if not UNBAN_PATTERN.search(text):
+        return False
+
+    target_id: int | None = None
+    id_match = USER_ID_PATTERN.search(text)
+    if id_match:
+        try:
+            target_id = int(id_match.group(0))
+        except ValueError:
+            target_id = None
+    elif ref_msg and ref_msg.author:
+        target_id = ref_msg.author.id
+
+    if not target_id:
+        await message.reply(
+            "Укажи ID пользователя для разбана, например: `P.OS разбань 123456789012345678`.",
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return True
+
+    try:
+        bans = [entry async for entry in message.guild.bans(limit=1000)]
+        entry = next((b for b in bans if b.user and b.user.id == target_id), None)
+        if not entry:
+            await message.reply(
+                f"Пользователь `{target_id}` сейчас не найден в бан-листе.",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return True
+        await message.guild.unban(entry.user, reason=f"P.OS owner command by {message.author}")
+        await message.reply(
+            f"Выполнено. Пользователь `{target_id}` разбанен.",
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return True
+    except Exception as exc:
+        await message.reply(
+            f"Не удалось выполнить разбан: {exc}",
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return True
+
+
 async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
     global _missing_key_warned
 
@@ -323,16 +422,49 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
     if not _can_auto_reply(message, bot, ref_msg):
         return False
     explicit_addressing = _is_addressed_to_bot(message, bot, ref_msg)
+    if not explicit_addressing:
+        return False
+
+    if await _handle_owner_actions(message, ref_msg):
+        _touch_state(message.channel, message.author.id, bot_replied=True)
+        return True
+
+    text = message.content or ""
+    mute_key = _mute_key(message)
+    if _is_mute_request(text):
+        if mute_key:
+            _muted_users.add(mute_key)
+        await message.reply(
+            "Принято. Для тебя в этом сервере замолкаю до команды на возврат.",
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return True
+
+    if _is_unmute_request(text):
+        if mute_key:
+            _muted_users.discard(mute_key)
+        await message.reply(
+            "Принято. Снова на связи и готов работать по твоим запросам.",
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return True
+
+    if _is_user_muted(message):
+        return False
 
     if explicit_addressing and _is_gif_request(message.content or ""):
         attachments = _collect_media_attachments(message, ref_msg)
         if not attachments:
-            await message.reply(
-                "Нужны вложения. Прикрепи изображение или короткое видео, и я соберу GIF.",
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return True
+            attachments = await _collect_recent_media_attachments(message)
+            if not attachments:
+                await message.reply(
+                    "Нужны вложения. Прикрепи изображение или короткое видео, и я соберу GIF.",
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return True
         try:
             async with message.channel.typing():
                 output_path, temp_dir = await generate_gif_from_attachments(attachments)

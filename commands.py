@@ -31,6 +31,20 @@ GIF_MAX_VIDEO_FPS = 12
 GIF_IMAGE_FRAME_MS = 700
 
 
+def _normalize_attachment_extension(attachment: discord.Attachment) -> str:
+    filename = (attachment.filename or "").lower()
+    ext = os.path.splitext(filename)[1].lower().strip(".")
+    if ext:
+        return ext
+    content_type = (attachment.content_type or "").lower()
+    if content_type.startswith("image/"):
+        guessed = content_type.split("/", 1)[1]
+        return "jpg" if guessed == "jpeg" else guessed
+    if content_type.startswith("video/"):
+        return content_type.split("/", 1)[1]
+    return ""
+
+
 def _is_image_attachment(attachment: discord.Attachment) -> bool:
     content_type = (attachment.content_type or "").lower()
     filename = (attachment.filename or "").lower()
@@ -119,9 +133,10 @@ async def generate_gif_from_attachments(attachments: list[discord.Attachment]) -
 
     try:
         for attachment in attachments:
-            filename = attachment.filename
-            ext = os.path.splitext(filename)[1].lower().strip(".")
-            unique_name = f"{uuid.uuid4().hex}.{ext}"
+            ext = _normalize_attachment_extension(attachment)
+            if ext not in ["jpg", "jpeg", "png", "webp", "bmp", "heic", "gif", "mp4", "mov", "webm", "avi", "mkv"]:
+                continue
+            unique_name = f"{uuid.uuid4().hex}.{ext or 'bin'}"
             file_path = os.path.join(temp_dir, unique_name)
             await attachment.save(file_path)
 
@@ -129,8 +144,6 @@ async def generate_gif_from_attachments(attachments: list[discord.Attachment]) -
                 image_files.append(file_path)
             elif ext in ["mp4", "mov", "webm", "avi", "mkv"]:
                 video_files.append(file_path)
-            else:
-                raise RuntimeError(f"Файл `{filename}` не поддерживается для GIF.")
 
         output_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.gif")
         if image_files:
@@ -138,7 +151,7 @@ async def generate_gif_from_attachments(attachments: list[discord.Attachment]) -
         elif video_files:
             _build_gif_from_video(video_files[0], output_path)
         else:
-            raise RuntimeError("Не удалось найти подходящее изображение или видео.")
+            raise RuntimeError("Не нашёл подходящих вложений для GIF (нужны изображения или короткое видео).")
 
         return output_path, temp_dir
     except Exception:
