@@ -23,6 +23,7 @@ from config import (
     POS_AI_TOP_P,
     POS_AI_TEMPERATURE,
 )
+from commands import generate_gif_from_attachments
 from logging_utils import is_log_channel
 
 AI_COOLDOWN_SECONDS = 2.5
@@ -39,6 +40,7 @@ _conversation_state: dict[int, dict] = {}
 _last_rate_limit_notice: dict[int, float] = {}
 _missing_key_warned = False
 AI_NAME_PATTERN = re.compile(r"(?<!\w)(?:p[\s.\-_]*o[\s.\-_]*s|п[\s.\-_]*о[\s.\-_]*с)(?!\w)", re.IGNORECASE)
+GIF_INTENT_PATTERN = re.compile(r"\b(сделай|создай|собери|сгенерируй|convert|make)\b.*\b(gif|гиф)\b|\b(gif|гиф)\b", re.IGNORECASE)
 
 
 def _strip_bot_mention(text: str, bot_id: int) -> str:
@@ -91,6 +93,19 @@ def _build_rate_limit_reply() -> str:
             "и я снова включусь в разговор без истерик и белого шума."
         )
     return "Сейчас внешний AI-сервис подзадумался. Через минуту попробуй ещё раз — я вернусь в строй."
+
+
+def _is_gif_request(text: str) -> bool:
+    return bool(GIF_INTENT_PATTERN.search((text or "").strip()))
+
+
+def _collect_media_attachments(message: discord.Message, ref_msg: Optional[discord.Message]) -> list[discord.Attachment]:
+    attachments = list(message.attachments or [])
+    if ref_msg and ref_msg.attachments:
+        for attachment in ref_msg.attachments:
+            if attachment not in attachments:
+                attachments.append(attachment)
+    return attachments
 
 
 def _should_send_rate_limit_notice(channel_id: int, window_seconds: int = 20) -> bool:
@@ -303,6 +318,39 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
     if not _can_auto_reply(message, bot, ref_msg):
         return False
     explicit_addressing = _is_addressed_to_bot(message, bot, ref_msg)
+
+    if explicit_addressing and _is_gif_request(message.content or ""):
+        attachments = _collect_media_attachments(message, ref_msg)
+        if not attachments:
+            await message.reply(
+                "Нужны вложения. Прикрепи изображение или короткое видео, и я соберу GIF.",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return True
+        try:
+            async with message.channel.typing():
+                output_path, temp_dir = await generate_gif_from_attachments(attachments)
+            try:
+                await message.reply(
+                    "Готово. Собрал GIF по твоему запросу.",
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    file=discord.File(output_path, filename="psc.gif"),
+                )
+            finally:
+                import shutil
+
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            _touch_state(message.channel, message.author.id, bot_replied=True)
+            return True
+        except Exception as exc:
+            await message.reply(
+                f"Не смог собрать GIF: {exc}",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return True
 
     now = time.time()
     last = _last_user_call.get(message.author.id, 0.0)

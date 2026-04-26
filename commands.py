@@ -24,7 +24,6 @@ from config import (
 )
 from logging_utils import send_log_embed
 from utils import collect_runtime_health
-from pos_ai import ask_pos
 
 sbor_channels: dict[int, int] = {}
 GIF_MAX_DIMENSION = 640
@@ -115,6 +114,40 @@ def _build_gif_from_video(video_path: str, output_path: str):
                     pass
 
 
+async def generate_gif_from_attachments(attachments: list[discord.Attachment]) -> tuple[str, str]:
+    image_files: list[str] = []
+    video_files: list[str] = []
+    temp_dir = tempfile.mkdtemp(prefix="psc-gif-")
+
+    try:
+        for attachment in attachments:
+            filename = attachment.filename
+            ext = os.path.splitext(filename)[1].lower().strip(".")
+            unique_name = f"{uuid.uuid4().hex}.{ext}"
+            file_path = os.path.join(temp_dir, unique_name)
+            await attachment.save(file_path)
+
+            if ext in ["jpg", "jpeg", "png", "webp", "bmp", "heic", "gif"]:
+                image_files.append(file_path)
+            elif ext in ["mp4", "mov", "webm", "avi", "mkv"]:
+                video_files.append(file_path)
+            else:
+                raise RuntimeError(f"Файл `{filename}` не поддерживается для GIF.")
+
+        output_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.gif")
+        if image_files:
+            _build_gif_from_images(image_files, output_path)
+        elif video_files:
+            _build_gif_from_video(video_files[0], output_path)
+        else:
+            raise RuntimeError("Не удалось найти подходящее изображение или видео.")
+
+        return output_path, temp_dir
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+
 def register_commands(bot: commands.Bot):
     @bot.command(name="gif")
     async def gif(ctx: commands.Context):
@@ -122,40 +155,15 @@ def register_commands(bot: commands.Bot):
             await ctx.send("Пожалуйста, прикрепи изображение или видео к команде.")
             return
 
-        image_files = []
-        video_files = []
-        temp_dir = tempfile.mkdtemp(prefix="psc-gif-")
-
         try:
-            for attachment in ctx.message.attachments:
-                filename = attachment.filename
-                ext = os.path.splitext(filename)[1].lower().strip(".")
-                unique_name = f"{uuid.uuid4().hex}.{ext}"
-                file_path = os.path.join(temp_dir, unique_name)
-                await attachment.save(file_path)
-
-                if ext in ["jpg", "jpeg", "png", "webp", "bmp", "heic", "gif"]:
-                    image_files.append(file_path)
-                elif ext in ["mp4", "mov", "webm", "avi", "mkv"]:
-                    video_files.append(file_path)
-                else:
-                    await ctx.send(f"❌ Файл `{filename}` не поддерживается для GIF.")
-                    return
-
-            output_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.gif")
-            if image_files:
-                _build_gif_from_images(image_files, output_path)
-            elif video_files:
-                _build_gif_from_video(video_files[0], output_path)
-            else:
-                await ctx.send("❌ Не удалось найти подходящее изображение или видео.")
-                return
-
+            output_path, temp_dir = await generate_gif_from_attachments(ctx.message.attachments)
             await ctx.send(file=discord.File(output_path, filename="psc.gif"))
         except Exception as e:
             await ctx.send(f"❌ Ошибка при создании GIF: {e}")
+            return
         finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            if "temp_dir" in locals():
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     @bot.command(name="health")
     async def health(ctx: commands.Context):
@@ -267,6 +275,8 @@ def register_commands(bot: commands.Bot):
 
     @bot.command()
     async def ai(ctx: commands.Context, *, question: str):
+        from pos_ai import ask_pos
+
         image_urls = [attachment.url for attachment in ctx.message.attachments if _is_image_attachment(attachment)]
         async with ctx.typing():
             reply = await ask_pos(question, image_urls=image_urls, author_name=ctx.author.display_name)

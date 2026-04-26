@@ -11,9 +11,13 @@ import aiohttp
 from config import (
     GITHUB_MODELS_API_VERSION,
     POS_AI_API_KEY,
+    POS_AI_API_PROVIDER,
     POS_AI_MAX_CONCURRENT_REQUESTS,
     POS_AI_MAX_TOKENS,
     POS_AI_PROVIDER,
+    POS_AI_PROVIDER_KEYS,
+    POS_AI_PROVIDER_MODELS,
+    POS_AI_PROVIDER_URLS,
     POS_AI_API_URL,
     POS_AI_RATE_LIMIT_FALLBACK_SECONDS,
     POS_AI_MODEL,
@@ -26,6 +30,41 @@ _AI_REQUEST_SEMAPHORE = asyncio.Semaphore(max(1, POS_AI_MAX_CONCURRENT_REQUESTS)
 _ai_backoff_until = 0.0
 _ai_backoff_reason = ""
 _ai_last_backoff_log_at = 0.0
+_provider_cursor = 0
+_provider_backoff_until: dict[int, float] = {}
+
+
+def _build_provider_pool() -> list[dict[str, str]]:
+    if POS_AI_PROVIDER_KEYS:
+        pool: list[dict[str, str]] = []
+        for index, key in enumerate(POS_AI_PROVIDER_KEYS):
+            url = POS_AI_PROVIDER_URLS[index] if index < len(POS_AI_PROVIDER_URLS) else POS_AI_API_URL
+            model = POS_AI_PROVIDER_MODELS[index] if index < len(POS_AI_PROVIDER_MODELS) else POS_AI_MODEL
+            provider = "github_models" if "models.github" in url else POS_AI_API_PROVIDER
+            pool.append(
+                {
+                    "name": f"provider_{index + 1}",
+                    "api_key": key,
+                    "api_url": url,
+                    "model": model,
+                    "provider": provider,
+                }
+            )
+        if pool:
+            return pool
+
+    return [
+        {
+            "name": "default",
+            "api_key": POS_AI_API_KEY or "",
+            "api_url": POS_AI_API_URL,
+            "model": POS_AI_MODEL,
+            "provider": POS_AI_PROVIDER,
+        }
+    ]
+
+
+_AI_PROVIDER_POOL = _build_provider_pool()
 
 
 def ai_cooldown_remaining() -> float:
@@ -39,6 +78,24 @@ def ai_is_temporarily_unavailable() -> bool:
 
 def ai_unavailable_reason() -> str:
     return _ai_backoff_reason or "temporarily_unavailable"
+
+
+def _provider_cooldown_remaining(index: int) -> float:
+    until = _provider_backoff_until.get(index, 0.0)
+    remaining = until - time.monotonic()
+    return remaining if remaining > 0 else 0.0
+
+
+def _pick_provider_index() -> int | None:
+    if not _AI_PROVIDER_POOL:
+        return None
+    total = len(_AI_PROVIDER_POOL)
+    start = _provider_cursor % total
+    for offset in range(total):
+        idx = (start + offset) % total
+        if _provider_cooldown_remaining(idx) <= 0:
+            return idx
+    return None
 
 
 def _set_ai_backoff(seconds: float, reason: str) -> None:
@@ -134,7 +191,7 @@ async def pos_chat_completion(
     top_p: float = POS_AI_TOP_P,
     timeout: int = POS_AI_TIMEOUT_SECONDS,
 ) -> str | None:
-    if not POS_AI_API_KEY:
+    if not _AI_PROVIDER_POOL or not any(provider.get("api_key") for provider in _AI_PROVIDER_POOL):
         return None
     if ai_is_temporarily_unavailable():
         _log_ai_backoff_once(
@@ -142,27 +199,9 @@ async def pos_chat_completion(
         )
         return None
 
-    accept_header = "application/vnd.github+json" if POS_AI_PROVIDER == "github_models" else "application/json"
-    payload = {
-        "messages": messages,
-        "model": POS_AI_MODEL,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "frequency_penalty": 0.0,
-        "presence_penalty": 0.0,
-        "stream": False,
-    }
-    headers = {
-        "Authorization": f"Bearer {POS_AI_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": accept_header,
-    }
-    if POS_AI_PROVIDER == "github_models":
-        headers["X-GitHub-Api-Version"] = GITHUB_MODELS_API_VERSION
-
     response_text = ""
     try:
+        global _provider_cursor
         async with _AI_REQUEST_SEMAPHORE:
             if ai_is_temporarily_unavailable():
                 _log_ai_backoff_once(
@@ -170,15 +209,48 @@ async def pos_chat_completion(
                 )
                 return None
 
+            provider_index = _pick_provider_index()
+            if provider_index is None:
+                shortest = min((_provider_cooldown_remaining(i) for i in range(len(_AI_PROVIDER_POOL))), default=5.0)
+                _set_ai_backoff(shortest, "all_providers_rate_limited")
+                _log_ai_backoff_once(
+                    f"P.OS AI provider pool cooldown: all providers limited, retry in {shortest:.0f}s."
+                )
+                return None
+
+            provider = _AI_PROVIDER_POOL[provider_index]
+            _provider_cursor = (provider_index + 1) % len(_AI_PROVIDER_POOL)
+
+            accept_header = "application/vnd.github+json" if provider["provider"] == "github_models" else "application/json"
+            payload = {
+                "messages": messages,
+                "model": provider["model"],
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "frequency_penalty": 0.0,
+                "presence_penalty": 0.0,
+                "stream": False,
+            }
+            headers = {
+                "Authorization": f"Bearer {provider['api_key']}",
+                "Content-Type": "application/json",
+                "Accept": accept_header,
+            }
+            if provider["provider"] == "github_models":
+                headers["X-GitHub-Api-Version"] = GITHUB_MODELS_API_VERSION
+
             timeout_config = aiohttp.ClientTimeout(total=timeout)
             async with aiohttp.ClientSession(timeout=timeout_config) as session:
-                async with session.post(POS_AI_API_URL, headers=headers, json=payload, timeout=timeout) as resp:
+                async with session.post(provider["api_url"], headers=headers, json=payload, timeout=timeout) as resp:
                     response_text = await resp.text()
                     if _looks_like_rate_limit(resp.status, response_text, resp.headers):
                         retry_after = _parse_retry_after(resp.headers) or POS_AI_RATE_LIMIT_FALLBACK_SECONDS
-                        _set_ai_backoff(retry_after, "rate_limited")
+                        _provider_backoff_until[provider_index] = max(
+                            _provider_backoff_until.get(provider_index, 0.0), time.monotonic() + retry_after
+                        )
                         _log_ai_backoff_once(
-                            f"P.OS API rate limited: pause for {retry_after:.0f}s before next request."
+                            f"P.OS API rate limited ({provider['name']}): pause for {retry_after:.0f}s."
                         )
                         return None
 
@@ -188,7 +260,7 @@ async def pos_chat_completion(
                         return None
 
                     if resp.status >= 400:
-                        if POS_AI_PROVIDER == "github_models" and resp.status in {401, 403}:
+                        if provider["provider"] == "github_models" and resp.status in {401, 403}:
                             print(
                                 "P.OS GitHub Models auth error: проверь, что GITHUB_MODELS_TOKEN существует "
                                 "и имеет доступ к Models API (PAT со scope/permission models)."
