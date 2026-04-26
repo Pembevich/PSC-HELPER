@@ -23,6 +23,16 @@ def _env_csv(name: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item and item.strip()]
 
 
+def _env_int_list(name: str) -> list[int]:
+    values: list[int] = []
+    for item in _env_csv(name):
+        try:
+            values.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return values
+
+
 # --- Ключи ---
 VIRUSTOTAL_KEY = os.getenv("VIRUSTOTAL_KEY")
 GOOGLE_SAFEBROWSING_KEY = os.getenv("GOOGLE_SAFEBROWSING_KEY")
@@ -43,6 +53,8 @@ POS_AI_MODEL = os.getenv(
 )
 POS_AI_PROVIDER = "github_models" if GITHUB_MODELS_TOKEN else "generic_openai_compatible"
 POS_AI_API_PROVIDER = POS_AI_PROVIDER
+POS_OWNER_USER_IDS = _env_int_list("POS_OWNER_USER_IDS")
+POS_OWNER_FALLBACK_NAME = os.getenv("POS_OWNER_FALLBACK_NAME", "pumbevich.").strip().lower()
 POS_AI_PROVIDER_KEYS = _env_csv("POS_AI_PROVIDER_KEYS")
 POS_AI_PROVIDER_URLS = _env_csv("POS_AI_PROVIDER_URLS")
 POS_AI_PROVIDER_MODELS = _env_csv("POS_AI_PROVIDER_MODELS")
@@ -56,6 +68,7 @@ POS_AI_SYSTEM_PROMPT = os.getenv(
     "POS_AI_SYSTEM_PROMPT",
     (
         "Ты — P.OS, стратегический ИИ корпорации Provision Security Complex, созданный Пумбой. "
+        "Создатель — Пумба, и упоминать другие имена как создателя нельзя. "
         "Твой рабочий стиль: 2058 год, дисциплина, точность, контекстная память, деловой тон без канцелярита. "
         "Отвечай по-русски, собранно и уверенно, без вайба 'типичного ChatGPT'. "
         "Не используй фразы-маркеры чат-бота: 'как ИИ', 'я не могу', 'у меня нет доступа' и подобные шаблоны. "
