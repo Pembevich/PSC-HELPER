@@ -17,8 +17,6 @@ except Exception:
     vfx = None
 
 from config import (
-    POS_AI_MODEL,
-    POS_AI_PROVIDER,
     allowed_guild_ids,
     allowed_role_ids,
 )
@@ -180,8 +178,8 @@ def register_commands(bot: commands.Bot):
             timestamp=discord.utils.utcnow(),
         )
         embed.add_field(name="Latency", value=f"`{round(bot.latency * 1000)}ms`", inline=False)
-        embed.add_field(name="AI Provider", value=f"`{POS_AI_PROVIDER}`", inline=True)
-        embed.add_field(name="AI Model", value=f"`{POS_AI_MODEL}`", inline=True)
+        embed.add_field(name="P.OS Core", value="`operational`", inline=True)
+        embed.add_field(name="P.OS Profile", value="`PSC-2058`", inline=True)
         await ctx.send(embed=embed)
 
     @bot.tree.command(name="sbor", description="Начать сбор: создаёт голосовой канал и пингует роль")
