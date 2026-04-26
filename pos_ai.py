@@ -87,12 +87,17 @@ def _mentions_bot_by_name(message: discord.Message, bot: discord.Client) -> bool
 
 def _build_rate_limit_reply() -> str:
     seconds = max(int(ai_cooldown_remaining()), 1)
+    minutes, rem_seconds = divmod(seconds, 60)
+    wait_text = f"{minutes} мин {rem_seconds} сек" if minutes else f"{rem_seconds} сек"
     if ai_unavailable_reason() == "rate_limited":
         return (
-            f"Сейчас я немного занят, выполняю другие задачи. Дай мне около {seconds} сек., "
-            "и я снова включусь в разговор без истерик и белого шума."
+            f"Сейчас я обрабатываю очередь задач. Ориентир ожидания: {wait_text}. "
+            "После этого продолжим в рабочем режиме."
         )
-    return "Сейчас внешний AI-сервис подзадумался. Через минуту попробуй ещё раз — я вернусь в строй."
+    return (
+        f"Сейчас я временно недоступен из-за нагрузки. Ориентир ожидания: {wait_text}. "
+        "Попробуй снова чуть позже."
+    )
 
 
 def _is_gif_request(text: str) -> bool:
