@@ -5,7 +5,14 @@ from datetime import datetime, timedelta, timezone
 import discord
 from discord import Embed
 
-from config import VIRUSTOTAL_KEY, GOOGLE_SAFEBROWSING_KEY, DEEPSEEK_API_KEY, POS_AI_API_KEY, GITHUB_MODELS_TOKEN
+from config import (
+    VIRUSTOTAL_KEY,
+    GOOGLE_SAFEBROWSING_KEY,
+    DEEPSEEK_API_KEY,
+    POS_AI_API_KEY,
+    GITHUB_MODELS_TOKEN,
+    POS_OWNER_USER_IDS,
+)
 
 
 def collect_runtime_health() -> dict:
@@ -16,6 +23,7 @@ def collect_runtime_health() -> dict:
         "DEEPSEEK_API_KEY": bool(DEEPSEEK_API_KEY),
         "GITHUB_MODELS_TOKEN": bool(GITHUB_MODELS_TOKEN),
         "POS_AI_API_KEY": bool(POS_AI_API_KEY),
+        "POS_OWNER_USER_IDS": bool(POS_OWNER_USER_IDS),
     }
 
 
