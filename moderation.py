@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 from datetime import timedelta
 from urllib.parse import urlparse, unquote
 
+import asyncio
 import aiohttp
 import discord
 import idna
@@ -64,6 +65,11 @@ VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm", ".avi", ".mkv")
 
 _vt_cache: dict[str, tuple[bool, float]] = {}
 _ai_url_cache: dict[str, tuple[str, str, float]] = {}
+
+# Per-user rate limit для AI-проверок медиа: не более 1 AI-вызова за 15 сек на пользователя
+_AI_MEDIA_USER_LAST_CHECK: dict[int, float] = {}
+AI_MEDIA_USER_COOLDOWN_SECONDS = 15
+
 recent_messages = defaultdict(lambda: deque())
 
 
@@ -662,11 +668,19 @@ def detect_advertising_or_scam_text(text: str):
     return reasons
 
 
-async def detect_attachment_violations(attachments, text: str = ""):
+async def detect_attachment_violations(attachments, text: str = "", user_id: int = 0):
     attachment_list = list(attachments)
     metadata_flags = _detect_attachment_metadata_flags(attachment_list)
     has_video = any(_is_video_attachment(attachment) for attachment in attachment_list)
     should_run_ai_review = bool(metadata_flags) or _text_has_media_risk_signals(text) or has_video
+    # Per-user rate limit: если пользователь недавно уже проходил AI-проверку — пропускаем
+    if should_run_ai_review and user_id:
+        _now = time.time()
+        _last = _AI_MEDIA_USER_LAST_CHECK.get(user_id, 0.0)
+        if _now - _last < AI_MEDIA_USER_COOLDOWN_SECONDS:
+            should_run_ai_review = False
+        else:
+            _AI_MEDIA_USER_LAST_CHECK[user_id] = _now
     ai_verdicts = await _classify_media_with_ai(attachment_list, text=text) if should_run_ai_review else {}
 
     reasons: list[str] = []
@@ -738,3 +752,4 @@ async def handle_spam_if_needed(message: discord.Message):
 
     recent_messages[user_id].clear()
     return True
+
