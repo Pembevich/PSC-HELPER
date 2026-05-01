@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import signal
 
@@ -70,15 +71,8 @@ async def run_bot() -> None:
             await bot.close()
 
 
-def main() -> None:
-    try:
-        asyncio.run(run_bot())
-    except KeyboardInterrupt:
-        pass
-
-
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(run_bot())
     except KeyboardInterrupt:
         pass
