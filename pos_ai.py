@@ -30,7 +30,107 @@ from config import (
 )
 from commands import generate_gif_from_attachments
 from logging_utils import is_log_channel
-from storage import add_entry, delete_entry, list_entries
+from storage import add_entry, delete_entry, list_entries, get_ai_context, update_ai_context, is_ai_muted, set_ai_muted_user
+from cogs.ai_tools import POS_AI_TOOLS
+import json
+
+
+async def execute_pos_tool(bot: discord.Client, message: discord.Message | None, tool_call: dict) -> str:
+    if not message or not message.guild:
+        return "Ошибка: инструмент можно использовать только на сервере."
+    
+    func = tool_call.get("function", {})
+    name = func.get("name")
+    args_raw = func.get("arguments", "{}")
+    try:
+        args = json.loads(args_raw)
+    except Exception:
+        args = {}
+        
+    user_id = int(args.get("user_id", 0)) if args.get("user_id") else None
+    
+    if name == "ban_user":
+        if not user_id: return "Ошибка: не указан user_id"
+        reason = args.get("reason", "Бан от P.OS")
+        try:
+            await message.guild.ban(discord.Object(id=user_id), reason=reason)
+            return f"Пользователь {user_id} успешно забанен."
+        except Exception as e:
+            return f"Ошибка при бане: {e}"
+            
+    elif name == "unban_user":
+        if not user_id: return "Ошибка: не указан user_id"
+        try:
+            await message.guild.unban(discord.Object(id=user_id))
+            return f"Пользователь {user_id} успешно разбанен."
+        except Exception as e:
+            return f"Ошибка при разбане: {e}"
+            
+    elif name == "timeout_user":
+        if not user_id: return "Ошибка: не указан user_id"
+        minutes = int(args.get("minutes", 10))
+        reason = args.get("reason", "Тайм-аут от P.OS")
+        member = message.guild.get_member(user_id)
+        if not member: return f"Ошибка: пользователь {user_id} не найден на сервере."
+        import datetime
+        try:
+            until = discord.utils.utcnow() + datetime.timedelta(minutes=minutes)
+            await member.timeout(until, reason=reason)
+            return f"Пользователю {user_id} выдан тайм-аут на {minutes} минут."
+        except Exception as e:
+            return f"Ошибка при муте: {e}"
+            
+    elif name == "add_role":
+        if not user_id: return "Ошибка: не указан user_id"
+        role_ident = args.get("role_id_or_name", "")
+        member = message.guild.get_member(user_id)
+        if not member: return "Ошибка: пользователь не найден."
+        role = None
+        if role_ident.isdigit():
+            role = message.guild.get_role(int(role_ident))
+        if not role:
+            role = discord.utils.find(lambda r: r.name.lower() == role_ident.lower(), message.guild.roles)
+        if not role: return f"Ошибка: роль '{role_ident}' не найдена."
+        try:
+            await member.add_roles(role, reason="Выдано P.OS")
+            return f"Роль {role.name} успешно выдана пользователю {user_id}."
+        except Exception as e:
+            return f"Ошибка при выдаче роли: {e}"
+            
+    elif name == "remove_role":
+        if not user_id: return "Ошибка: не указан user_id"
+        role_ident = args.get("role_id_or_name", "")
+        member = message.guild.get_member(user_id)
+        if not member: return "Ошибка: пользователь не найден."
+        role = None
+        if role_ident.isdigit():
+            role = message.guild.get_role(int(role_ident))
+        if not role:
+            role = discord.utils.find(lambda r: r.name.lower() == role_ident.lower(), message.guild.roles)
+        if not role: return f"Ошибка: роль '{role_ident}' не найдена."
+        try:
+            await member.remove_roles(role, reason="Снято P.OS")
+            return f"Роль {role.name} успешно снята с пользователя {user_id}."
+        except Exception as e:
+            return f"Ошибка при снятии роли: {e}"
+            
+    elif name == "mute_ai_for_user":
+        if not user_id: return "Ошибка: не указан user_id"
+        try:
+            await set_ai_muted_user(user_id, message.guild.id, True)
+            return f"Я добавил пользователя {user_id} в черный список (я больше не буду ему отвечать)."
+        except Exception as e:
+            return f"Ошибка базы данных: {e}"
+            
+    elif name == "unmute_ai_for_user":
+        if not user_id: return "Ошибка: не указан user_id"
+        try:
+            await set_ai_muted_user(user_id, message.guild.id, False)
+            return f"Я удалил пользователя {user_id} из черного списка (теперь буду отвечать)."
+        except Exception as e:
+            return f"Ошибка базы данных: {e}"
+            
+    return f"Неизвестный инструмент: {name}"
 
 AI_COOLDOWN_SECONDS = 2.5
 AI_MAX_CONTEXT = 64
@@ -52,21 +152,19 @@ _conversation_state: dict[int, dict] = {}
 _last_rate_limit_notice: dict[int, float] = {}
 _missing_key_warned = False
 _muted_users: set[tuple[int, int]] = set()
-_server_memory: dict[int, deque[dict]] = defaultdict(lambda: deque(maxlen=AI_MEMORY_MAX_MESSAGES))
-_user_memory: dict[tuple[int, int], deque[str]] = defaultdict(lambda: deque(maxlen=80))
 AI_NAME_PATTERN = re.compile(r"(?<!\w)(?:p[\s.\-_]*o[\s.\-_]*s|п[\s.\-_]*о[\s.\-_]*с)(?!\w)", re.IGNORECASE)
 GIF_INTENT_PATTERN = re.compile(r"\b(сделай|создай|собери|сгенерируй|convert|make)\b.*\b(gif|гиф)\b|\b(gif|гиф)\b", re.IGNORECASE)
 MUTE_PATTERN = re.compile(r"(не\s*отвечай|не\s*пиши|игнорируй\s*меня|молчи\s*со\s*мной)", re.IGNORECASE)
 UNMUTE_PATTERN = re.compile(r"(можешь\s*отвечать|снова\s*отвечай|вернись\s*в\s*диалог|разрешаю\s*отвечать)", re.IGNORECASE)
 HELP_PATTERN = re.compile(r"\b(help|хелп|помощь|команды|список\s+команд)\b", re.IGNORECASE)
-BAN_PATTERN = re.compile(r"\b(забань|ban|выдай\s*бан)\b", re.IGNORECASE)
-UNBAN_PATTERN = re.compile(r"\b(разбань|unban|сними\s*бан)\b", re.IGNORECASE)
-ADD_ROLE_PATTERN = re.compile(r"\b(добавь|выдай|назначь)\s+роль\b|\b(add)\s+role\b", re.IGNORECASE)
-REMOVE_ROLE_PATTERN = re.compile(r"\b(сними|убери|забери)\s+роль\b|\b(remove)\s+role\b", re.IGNORECASE)
-DB_ADD_PATTERN = re.compile(r"\b(запомни|добавь\s+в\s+базу|запиши\s+в\s+базу|db\s+add)\b", re.IGNORECASE)
-DB_LIST_PATTERN = re.compile(r"\b(покажи\s+базу|список\s+базы|db\s+list)\b", re.IGNORECASE)
-DB_DELETE_PATTERN = re.compile(r"\b(удали\s+из\s+базы|db\s+delete|db\s+del)\b", re.IGNORECASE)
-CONTEXT_SCAN_PATTERN = re.compile(r"\b(обнови|просканируй|собери)\s+(?:контекст|память|историю)\b", re.IGNORECASE)
+
+UN
+
+
+
+
+
+
 USER_ID_PATTERN = re.compile(r"\b\d{17,21}\b")
 GUILD_ID_PATTERN = re.compile(r"(?:сервер|guild|server)\s*(?:id)?\s*[:#-]?\s*(\d{17,21})", re.IGNORECASE)
 QUOTED_TEXT_PATTERN = re.compile(r"[\"«']([^\"»']+)[\"»']")
@@ -149,7 +247,8 @@ async def _attachment_to_visual_inputs(att: discord.Attachment) -> list[str]:
         data = await att.read(use_cached=True)
     except Exception:
         return []
-    return _image_bytes_to_data_urls(data)
+    import asyncio
+    return await asyncio.to_thread(_image_bytes_to_data_urls, data)
 
 
 async def _extract_visual_inputs(message: Optional[discord.Message]) -> list[str]:
@@ -174,11 +273,21 @@ def _sanitize_text(text: str) -> str:
     return escape_mentions(escape_markdown(text or "")).strip()
 
 
-def remember_server_message(message: discord.Message) -> None:
+async def remember_server_message(message: discord.Message) -> None:
     if not message.guild or message.author.bot or is_log_channel(message.channel):
         return
     if not message.content and not message.attachments:
         return
+
+    content = _sanitize_text(message.content or "")
+    if len(content) < 5 or content.startswith(("!", "/", "?", "P.OS", "п.ос")):
+        return
+
+    context_data = await get_ai_context(0, message.guild.id)
+    try:
+        memory_list = json.loads(context_data) if context_data else []
+    except Exception:
+        memory_list = []
 
     attachment_types = []
     for attachment in message.attachments[:4]:
@@ -187,29 +296,48 @@ def remember_server_message(message: discord.Message) -> None:
             ctype = "attachment"
         attachment_types.append(ctype)
 
-    content = _sanitize_text(message.content or "")
     if len(content) > 500:
         content = content[:500] + "..."
 
     item = {
         "ts": int(time.time()),
         "channel_id": message.channel.id,
-        "channel": getattr(message.channel, "name", str(message.channel)),
+        "channel": getattr(message.channel, "name", str(message.channel.id)),
         "author_id": message.author.id,
         "author": message.author.display_name,
         "content": content,
         "attachments": attachment_types,
     }
-    _server_memory[message.guild.id].append(item)
-    if content:
-        _user_memory[(message.guild.id, message.author.id)].append(content)
+    memory_list.append(item)
+    if len(memory_list) > 100:
+        memory_list = memory_list[-100:]
+        
+    await update_ai_context(0, message.guild.id, json.dumps(memory_list))
+    
+    # Author specific memory
+    user_context = await get_ai_context(message.author.id, message.guild.id)
+    try:
+        user_list = json.loads(user_context) if user_context else []
+    except Exception:
+        user_list = []
+    user_list.append(content[:100])
+    if len(user_list) > 20:
+        user_list = user_list[-20:]
+    await update_ai_context(message.author.id, message.guild.id, json.dumps(user_list))
 
 
-def _format_server_memory(message: discord.Message) -> str:
+async def _format_server_memory(message: discord.Message) -> str:
     if not message.guild:
         return ""
 
-    memory = list(_server_memory.get(message.guild.id, []))
+    context_data = await get_ai_context(0, message.guild.id)
+    if not context_data:
+        return ""
+    try:
+        memory = json.loads(context_data)
+    except Exception:
+        return ""
+
     if not memory:
         return ""
 
@@ -232,10 +360,16 @@ def _format_server_memory(message: discord.Message) -> str:
     return "\n".join(lines[-AI_MEMORY_CONTEXT_MESSAGES:])
 
 
-def _format_author_profile(message: discord.Message) -> str:
+async def _format_author_profile(message: discord.Message) -> str:
     if not message.guild:
         return ""
-    recent = list(_user_memory.get((message.guild.id, message.author.id), []))[-12:]
+    
+    user_context = await get_ai_context(message.author.id, message.guild.id)
+    try:
+        recent = json.loads(user_context) if user_context else []
+    except Exception:
+        recent = []
+        
     roles = []
     if isinstance(message.author, discord.Member):
         roles = [role.name for role in message.author.roles if role.name != "@everyone"][-12:]
@@ -337,19 +471,7 @@ def _is_unmute_request(text: str) -> bool:
 
 
 def _looks_like_admin_action(text: str) -> bool:
-    return any(
-        pattern.search(text or "")
-        for pattern in (
-            BAN_PATTERN,
-            UNBAN_PATTERN,
-            ADD_ROLE_PATTERN,
-            REMOVE_ROLE_PATTERN,
-            DB_ADD_PATTERN,
-            DB_LIST_PATTERN,
-            DB_DELETE_PATTERN,
-            CONTEXT_SCAN_PATTERN,
-        )
-    )
+    return False
 
 
 def _should_send_rate_limit_notice(channel_id: int, window_seconds: int = 20) -> bool:
@@ -373,27 +495,40 @@ def build_pos_user_content(text: str, image_urls: list[str] | None = None):
     return content_items
 
 
-async def request_pos_reply(messages: list[dict], *, allow_system_fallback: bool = True) -> str | None:
-    reply = await pos_chat_completion(
-        messages,
-        max_tokens=POS_AI_MAX_TOKENS,
-        temperature=POS_AI_TEMPERATURE,
-        top_p=POS_AI_TOP_P,
-        timeout=POS_AI_TIMEOUT_SECONDS,
-    )
-    if reply or not allow_system_fallback or ai_is_temporarily_unavailable():
-        return reply
 
-    fallback_messages = [message.copy() for message in messages if message.get("role") != "system"]
-    if not fallback_messages:
-        fallback_messages = messages
-    return await pos_chat_completion(
-        fallback_messages,
-        max_tokens=POS_AI_MAX_TOKENS,
-        temperature=POS_AI_TEMPERATURE,
-        top_p=POS_AI_TOP_P,
-        timeout=POS_AI_TIMEOUT_SECONDS,
-    )
+async def request_pos_reply(bot: discord.Client, message: discord.Message | None, messages: list[dict], *, allow_system_fallback: bool = True) -> str | None:
+    MAX_TURNS = 5
+    for turn in range(MAX_TURNS):
+        response_msg = await pos_chat_completion(
+            messages,
+            tools=POS_AI_TOOLS,
+            max_tokens=POS_AI_MAX_TOKENS,
+            temperature=POS_AI_TEMPERATURE,
+            top_p=POS_AI_TOP_P,
+            timeout=POS_AI_TIMEOUT_SECONDS,
+        )
+        
+        if not response_msg:
+            return None
+            
+        tool_calls = response_msg.get("tool_calls")
+        if not tool_calls:
+            return response_msg.get("content")
+            
+        messages.append(response_msg)
+        
+        for tool_call in tool_calls:
+            tool_id = tool_call.get("id")
+            result = await execute_pos_tool(bot, message, tool_call)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_id,
+                "name": tool_call["function"]["name"],
+                "content": result
+            })
+            
+    return "Я превысил максимальное число действий."
+
 
 
 async def ask_pos(
@@ -401,13 +536,14 @@ async def ask_pos(
     *,
     image_urls: list[str] | None = None,
     author_name: str | None = None,
+    bot: discord.Client | None = None,
 ) -> str | None:
     user_prefix = f"Пользователь: {author_name}\n" if author_name else ""
     messages = [
         {"role": "system", "content": SYSTEM_INSTRUCTION},
         {"role": "user", "content": build_pos_user_content(user_prefix + (prompt or ""), image_urls)},
     ]
-    return await request_pos_reply(messages)
+    return await request_pos_reply(bot, None, messages)
 
 
 def _should_skip_message(message: discord.Message, bot: discord.Client) -> bool:
@@ -645,11 +781,9 @@ async def _scan_recent_guild_context(message: discord.Message, guild: discord.Gu
             skipped_channels += 1
             continue
         try:
-            async for hist in channel.history(limit=80):
-                before_count = len(_server_memory[guild.id])
-                remember_server_message(hist)
-                if len(_server_memory[guild.id]) > before_count:
-                    remembered_messages += 1
+            async for hist in channel.history(limit=20):
+                await remember_server_message(hist)
+                remembered_messages += 1
             scanned_channels += 1
         except Exception:
             skipped_channels += 1
@@ -658,7 +792,7 @@ async def _scan_recent_guild_context(message: discord.Message, guild: discord.Gu
     await message.reply(
         (
             f"Контекст обновлён для `{guild.name}`. "
-            f"Каналов просмотрено: `{scanned_channels}`, сообщений добавлено: `{remembered_messages}`, пропущено каналов: `{skipped_channels}`."
+            f"Каналов просмотрено: `{scanned_channels}`, сообщений проанализировано: `{remembered_messages}`, пропущено каналов: `{skipped_channels}`."
         ),
         mention_author=False,
         allowed_mentions=discord.AllowedMentions.none(),
@@ -688,8 +822,8 @@ async def _build_messages(
     ]
     server_context_parts = [
         _format_guild_snapshot(message, bot),
-        _format_author_profile(message),
-        _format_server_memory(message),
+        await _format_author_profile(message),
+        await _format_server_memory(message),
     ]
     server_context = "\n\n".join(part for part in server_context_parts if part)
     if server_context:
@@ -941,7 +1075,7 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
         )
         return True
 
-    if _is_user_muted(message):
+    if await is_ai_muted(message.author.id, message.guild.id):
         return False
 
     if explicit_addressing and _is_gif_request(message.content or ""):
@@ -999,9 +1133,9 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
     messages = await _build_messages(message, bot, ref_msg, use_system=True, include_others=include_others, max_context=max_context)
     try:
         async with message.channel.typing():
-            reply = await request_pos_reply(messages)
+            reply = await request_pos_reply(bot, message, messages)
     except Exception:
-        reply = await request_pos_reply(messages)
+        reply = await request_pos_reply(bot, message, messages)
     if not reply:
         if explicit_addressing and ai_is_temporarily_unavailable() and _should_send_rate_limit_notice(message.channel.id):
             try:
