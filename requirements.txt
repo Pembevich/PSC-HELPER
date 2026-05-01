@@ -7,3 +7,4 @@ Pillow==11.3.0
 moviepy==2.2.1
 imageio==2.37.3
 imageio-ffmpeg==0.6.0
+aiosqlite==0.20.0

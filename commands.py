@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import os
-import shutil
 import tempfile
 import uuid
+import asyncio
 
 import discord
 from PIL import Image, ImageOps
@@ -147,9 +147,9 @@ async def generate_gif_from_attachments(attachments: list[discord.Attachment]) -
 
         output_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.gif")
         if image_files:
-            _build_gif_from_images(image_files, output_path)
+            await asyncio.to_thread(_build_gif_from_images, image_files, output_path)
         elif video_files:
-            _build_gif_from_video(video_files[0], output_path)
+            await asyncio.to_thread(_build_gif_from_video, video_files[0], output_path)
         else:
             raise RuntimeError("Не нашёл подходящих вложений для GIF (нужны изображения или короткое видео).")
 
@@ -159,143 +159,3 @@ async def generate_gif_from_attachments(attachments: list[discord.Attachment]) -
         raise
 
 
-def register_commands(bot: commands.Bot):
-    @bot.command(name="gif")
-    async def gif(ctx: commands.Context):
-        if not ctx.message.attachments:
-            await ctx.send("Пожалуйста, прикрепи изображение или видео к команде.")
-            return
-
-        try:
-            output_path, temp_dir = await generate_gif_from_attachments(ctx.message.attachments)
-            await ctx.send(file=discord.File(output_path, filename="psc.gif"))
-        except Exception as e:
-            await ctx.send(f"❌ Ошибка при создании GIF: {e}")
-            return
-        finally:
-            if "temp_dir" in locals():
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
-    @bot.command(name="health")
-    async def health(ctx: commands.Context):
-        runtime = collect_runtime_health()
-        status_lines = [
-            f"`{name}`: {'✅ OK' if enabled else '⚠️ отсутствует'}"
-            for name, enabled in runtime.items()
-        ]
-
-        embed = Embed(
-            title="Состояние бота",
-            description="\n".join(status_lines),
-            color=Color.green() if runtime["DISCORD_TOKEN"] else Color.orange(),
-            timestamp=discord.utils.utcnow(),
-        )
-        embed.add_field(name="Latency", value=f"`{round(bot.latency * 1000)}ms`", inline=False)
-        embed.add_field(name="P.OS Core", value="`operational`", inline=True)
-        embed.add_field(name="P.OS Profile", value="`PSC-2058`", inline=True)
-        await ctx.send(embed=embed)
-
-    @bot.tree.command(name="sbor", description="Начать сбор: создаёт голосовой канал и пингует роль")
-    @discord.app_commands.describe(role="Роль, которую нужно пинговать")
-    async def sbor(interaction: discord.Interaction, role: discord.Role):
-        if interaction.guild.id not in allowed_guild_ids:
-            await interaction.response.send_message("❌ Команда недоступна на этом сервере.", ephemeral=True)
-            return
-
-        member = interaction.guild.get_member(interaction.user.id)
-        if not member or not any(r.id in allowed_role_ids for r in member.roles):
-            await interaction.response.send_message("❌ У тебя нет прав для этой команды.", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True)
-        existing = discord.utils.get(interaction.guild.voice_channels, name="сбор")
-        if existing:
-            await interaction.followup.send("❗ Канал 'сбор' уже существует.")
-            return
-
-        overwrites = {
-            interaction.guild.default_role: discord.PermissionOverwrite(connect=False),
-            role: discord.PermissionOverwrite(connect=True, view_channel=True)
-        }
-
-        category = interaction.channel.category
-        voice_channel = await interaction.guild.create_voice_channel("Сбор", overwrites=overwrites, category=category)
-        sbor_channels[interaction.guild.id] = voice_channel.id
-
-        webhook = await interaction.channel.create_webhook(name="Сбор")
-        await webhook.send(
-            content=f"**Сбор! {role.mention}. Заходите в <#{voice_channel.id}>!**",
-            username="Сбор",
-            avatar_url=bot.user.avatar.url if bot.user.avatar else None
-        )
-        await webhook.delete()
-
-        try:
-            await send_log_embed(
-                interaction.guild,
-                "commands",
-                "📣 Сбор создан",
-                f"{interaction.user.mention} создал сбор.",
-                color=Color.blue(),
-                fields=[
-                    ("Роль", role.mention, False),
-                    ("Канал", voice_channel.mention, False)
-                ]
-            )
-        except Exception:
-            pass
-        await interaction.followup.send("✅ Сбор создан!")
-
-    @bot.tree.command(name="sbor_end", description="Завершить сбор и удалить голосовой канал")
-    async def sbor_end(interaction: discord.Interaction):
-        if interaction.guild.id not in allowed_guild_ids:
-            await interaction.response.send_message("❌ Команда недоступна на этом сервере.", ephemeral=True)
-            return
-
-        member = interaction.guild.get_member(interaction.user.id)
-        if not member or not any(r.id in allowed_role_ids for r in member.roles):
-            await interaction.response.send_message("❌ У тебя нет прав для этой команды.", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True)
-        channel_id = sbor_channels.get(interaction.guild.id)
-        if not channel_id:
-            await interaction.followup.send("❗ Канал 'сбор' не найден.")
-            return
-
-        channel = interaction.guild.get_channel(channel_id)
-        if channel:
-            await channel.delete()
-
-        webhook = await interaction.channel.create_webhook(name="Сбор")
-        await webhook.send(content="*Сбор окончен!*", username="Сбор", avatar_url=bot.user.avatar.url if bot.user.avatar else None)
-        await webhook.delete()
-        sbor_channels.pop(interaction.guild.id, None)
-
-        try:
-            await send_log_embed(
-                interaction.guild,
-                "commands",
-                "🧹 Сбор завершён",
-                f"{interaction.user.mention} завершил сбор.",
-                color=Color.orange()
-            )
-        except Exception:
-            pass
-        await interaction.followup.send("✅ Сбор завершён.")
-
-    @bot.command()
-    async def ai(ctx: commands.Context, *, question: str):
-        from pos_ai import ask_pos
-
-        image_urls = [attachment.url for attachment in ctx.message.attachments if _is_image_attachment(attachment)]
-        async with ctx.typing():
-            reply = await ask_pos(question, image_urls=image_urls, author_name=ctx.author.display_name)
-
-        if not reply:
-            await ctx.send("P.OS сейчас молчит как сервер в понедельник утром. Проверь AI-ключ и модель в Railway.")
-            return
-
-        chunks = [reply[i:i + 1900] for i in range(0, len(reply), 1900)]
-        for chunk in chunks:
-            await ctx.send(chunk, allowed_mentions=discord.AllowedMentions.none())
