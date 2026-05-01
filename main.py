@@ -6,12 +6,14 @@ import discord
 from dotenv import load_dotenv
 from discord.ext import commands
 
-from commands import register_commands
 from config import POS_AI_MODEL, POS_AI_PROVIDER
-from events import register_events
 from storage import init_db
 from utils import sanitize_discord_token
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 def create_bot() -> commands.Bot:
     intents = discord.Intents.all()
@@ -32,8 +34,6 @@ async def run_bot() -> None:
     await init_db()
 
     bot = create_bot()
-    register_commands(bot)
-    register_events(bot)
 
     raw_token = os.getenv("DISCORD_TOKEN")
     token = sanitize_discord_token(raw_token)
@@ -78,4 +78,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
