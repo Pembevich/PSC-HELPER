@@ -44,7 +44,7 @@ from moderation import (
 )
 from forms import ConfirmView, ComplaintView
 from utils import extract_clean_keyword, assess_applicant_risk, safe_send_dm, collect_runtime_health
-from pos_ai import handle_pos_ai
+from pos_ai import handle_pos_ai, remember_server_message
 
 
 def _clean_text(text: str, limit: int = 1800) -> str:
@@ -437,6 +437,8 @@ def register_events(bot: commands.Bot):
             except Exception:
                 pass
             return
+
+        remember_server_message(message)
 
         # --- Авто-отписки: эмбед + ветка (thread) ---
         try:
