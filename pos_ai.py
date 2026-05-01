@@ -153,6 +153,9 @@ _conversation_state: dict[int, dict] = {}
 _last_rate_limit_notice: dict[int, float] = {}
 _missing_key_warned = False
 _muted_users: set[tuple[int, int]] = set()
+# In-memory per-(guild, user) message cache — populated by remember_server_message.
+# Used by _format_author_profile to build behavioural context without hitting the DB.
+_user_memory: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=20))
 AI_NAME_PATTERN = re.compile(r"(?<!\w)(?:p[\s.\-_]*o[\s.\-_]*s|п[\s.\-_]*о[\s.\-_]*с)(?!\w)", re.IGNORECASE)
 GIF_INTENT_PATTERN = re.compile(r"\b(сделай|создай|собери|сгенерируй|convert|make)\b.*\b(gif|гиф)\b|\b(gif|гиф)\b", re.IGNORECASE)
 MUTE_PATTERN = re.compile(r"(не\s*отвечай|не\s*пиши|игнорируй\s*меня|молчи\s*со\s*мной)", re.IGNORECASE)
@@ -326,6 +329,9 @@ async def remember_server_message(message: discord.Message) -> None:
     if len(user_list) > 20:
         user_list = user_list[-20:]
     await update_ai_context(message.author.id, message.guild.id, json.dumps(user_list))
+
+    # Keep in-memory cache in sync so _format_author_profile works without extra DB calls.
+    _user_memory[(message.guild.id, message.author.id)].append(content[:100])
 
 
 async def _format_server_memory(message: discord.Message) -> str:
@@ -1223,16 +1229,16 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
         async with message.channel.typing():
             reply = await request_pos_reply(bot, message, messages)
     except Exception:
-        reply = await request_pos_reply(messages)
+        reply = await request_pos_reply(bot, message, messages)
 
     # Вторая попытка при пустом ответе — иногда провайдер даёт пустой body на первом запросе
     if not reply and explicit_addressing:
         await asyncio.sleep(2.0)
         try:
             async with message.channel.typing():
-                reply = await request_pos_reply(messages, allow_system_fallback=True)
+                reply = await request_pos_reply(bot, message, messages, allow_system_fallback=True)
         except Exception:
-            reply = await request_pos_reply(messages, allow_system_fallback=True)
+            reply = await request_pos_reply(bot, message, messages, allow_system_fallback=True)
     if not reply:
         if explicit_addressing:
             if ai_is_temporarily_unavailable() and _should_send_rate_limit_notice(message.channel.id):

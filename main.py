@@ -16,6 +16,18 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
+logger = logging.getLogger(__name__)
+
+# Cogs to load in order. Each must expose an async setup(bot) function.
+COGS = [
+    "cogs.logging_events",
+    "cogs.general",
+    "cogs.forms",
+    "cogs.mod",
+    "cogs.ai_chat",
+]
+
+
 def create_bot() -> commands.Bot:
     intents = discord.Intents.all()
     bot = commands.Bot(command_prefix="!", intents=intents, case_insensitive=True)
@@ -35,6 +47,14 @@ async def run_bot() -> None:
     await init_db()
 
     bot = create_bot()
+
+    # Загружаем все коги до старта бота
+    for cog in COGS:
+        try:
+            await bot.load_extension(cog)
+            logger.info(f"✅ Cog loaded: {cog}")
+        except Exception as e:
+            logger.error(f"❌ Failed to load cog {cog}: {e}", exc_info=True)
 
     raw_token = os.getenv("DISCORD_TOKEN")
     token = sanitize_discord_token(raw_token)

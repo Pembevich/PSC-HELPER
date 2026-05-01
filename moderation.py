@@ -362,7 +362,7 @@ async def _classify_urls_with_ai(url_contexts: list[dict]) -> list[tuple[str, st
         top_p=0.9,
         timeout=45,
     )
-    parsed = extract_json_block(response or "")
+    parsed = extract_json_block((response or {}).get("content", ""))
     if not parsed:
         return blocked
 
@@ -476,7 +476,7 @@ async def _classify_media_with_ai(attachments: list[discord.Attachment], text: s
         top_p=0.9,
         timeout=60,
     )
-    parsed = extract_json_block(response or "")
+    parsed = extract_json_block((response or {}).get("content", ""))
     if not parsed:
         return {}
 

@@ -355,6 +355,21 @@ async def _log_member_timeout_change(before: discord.Member, after: discord.Memb
 class LoggingCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Log every non-bot guild message and update the AI server memory."""
+        if not message.guild or message.author.bot:
+            return
+        try:
+            await _log_message_create(message)
+        except Exception:
+            pass
+        try:
+            await remember_server_message(message)
+        except Exception:
+            pass
+
     @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
         await _log_message_edit(before, after)
