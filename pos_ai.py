@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import re
+import asyncio
 import time
 from collections import defaultdict, deque
 from typing import List, Optional
@@ -132,7 +133,7 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
             
     return f"Неизвестный инструмент: {name}"
 
-AI_COOLDOWN_SECONDS = 2.5
+AI_COOLDOWN_SECONDS = 1.5  # уменьшен для живого диалога
 AI_MAX_CONTEXT = 64
 AI_MAX_CONTEXT_THREAD = 140
 AI_MAX_RESPONSE_CHARS = 1900
@@ -157,14 +158,15 @@ GIF_INTENT_PATTERN = re.compile(r"\b(сделай|создай|собери|сг
 MUTE_PATTERN = re.compile(r"(не\s*отвечай|не\s*пиши|игнорируй\s*меня|молчи\s*со\s*мной)", re.IGNORECASE)
 UNMUTE_PATTERN = re.compile(r"(можешь\s*отвечать|снова\s*отвечай|вернись\s*в\s*диалог|разрешаю\s*отвечать)", re.IGNORECASE)
 HELP_PATTERN = re.compile(r"\b(help|хелп|помощь|команды|список\s+команд)\b", re.IGNORECASE)
-
-UN
-
-
-
-
-
-
+INVITE_PATTERN = re.compile(r"\b(создай|сделай|дай|пришли|invite|инвайт|приглашение|ссылку\s+на\s+вход)\b", re.IGNORECASE)
+BAN_PATTERN = re.compile(r"\b(забань|ban|выдай\s*бан)\b", re.IGNORECASE)
+UNBAN_PATTERN = re.compile(r"\b(разбань|unban|сними\s*бан)\b", re.IGNORECASE)
+ADD_ROLE_PATTERN = re.compile(r"\b(добавь|выдай|назначь)\s+роль\b|\b(add)\s+role\b", re.IGNORECASE)
+REMOVE_ROLE_PATTERN = re.compile(r"\b(сними|убери|забери)\s+роль\b|\b(remove)\s+role\b", re.IGNORECASE)
+DB_ADD_PATTERN = re.compile(r"\b(запомни|добавь\s+в\s+базу|запиши\s+в\s+базу|db\s+add)\b", re.IGNORECASE)
+DB_LIST_PATTERN = re.compile(r"\b(покажи\s+базу|список\s+базы|db\s+list)\b", re.IGNORECASE)
+DB_DELETE_PATTERN = re.compile(r"\b(удали\s+из\s+базы|db\s+delete|db\s+del)\b", re.IGNORECASE)
+CONTEXT_SCAN_PATTERN = re.compile(r"\b(обнови|просканируй|собери)\s+(?:контекст|память|историю)\b", re.IGNORECASE)
 USER_ID_PATTERN = re.compile(r"\b\d{17,21}\b")
 GUILD_ID_PATTERN = re.compile(r"(?:сервер|guild|server)\s*(?:id)?\s*[:#-]?\s*(\d{17,21})", re.IGNORECASE)
 QUOTED_TEXT_PATTERN = re.compile(r"[\"«']([^\"»']+)[\"»']")
@@ -363,22 +365,20 @@ async def _format_server_memory(message: discord.Message) -> str:
 async def _format_author_profile(message: discord.Message) -> str:
     if not message.guild:
         return ""
-    
-    user_context = await get_ai_context(message.author.id, message.guild.id)
-    try:
-        recent = json.loads(user_context) if user_context else []
-    except Exception:
-        recent = []
-        
+    recent = list(_user_memory.get((message.guild.id, message.author.id), []))[-20:]
     roles = []
     if isinstance(message.author, discord.Member):
         roles = [role.name for role in message.author.roles if role.name != "@everyone"][-12:]
+    # Собираем поведенческий профиль: частота, стиль, темы
+    word_counts = [len(m.split()) for m in recent if m]
+    avg_len = round(sum(word_counts) / len(word_counts), 1) if word_counts else 0
     lines = [
-        f"Автор: {message.author.display_name} (`{message.author.id}`)",
-        f"Роли автора: {', '.join(roles) if roles else 'нет данных'}",
+        f"Собеседник: {message.author.display_name} (`{message.author.id}`)",
+        f"Роли: {', '.join(roles) if roles else 'нет данных'}",
+        f"Активность: {len(recent)} сообщений в памяти, средняя длина: {avg_len} слов",
     ]
     if recent:
-        lines.append("Недавние реплики автора: " + " | ".join(recent[-5:]))
+        lines.append("Последние реплики собеседника:\n" + "\n".join(f"  — {m}" for m in recent[-8:]))
     return "\n".join(lines)
 
 
@@ -387,7 +387,10 @@ def _format_guild_snapshot(message: discord.Message, bot: discord.Client) -> str
         return ""
     guild = message.guild
     visible_guilds = ", ".join(f"{g.name} (`{g.id}`)" for g in bot.guilds[:20])
+    bot_id = bot.user.id if bot.user else "?"
+    bot_mention = f"<@{bot_id}>" if bot.user else "?"
     return (
+        f"Это ты — P.OS. Твой Discord ID: `{bot_id}`, твоё упоминание: {bot_mention}.\n"
         f"Сервер: {guild.name} (`{guild.id}`), участников: {guild.member_count or 'неизвестно'}.\n"
         f"Канал: #{getattr(message.channel, 'name', message.channel)} (`{message.channel.id}`).\n"
         f"Серверы, где присутствует P.OS: {visible_guilds or 'нет данных'}."
@@ -648,6 +651,17 @@ def _resolve_target_user_id(message: discord.Message, text: str, ref_msg: Option
     for user_id in _extract_discord_ids(text):
         if user_id not in ignored_ids:
             return user_id
+
+    # Поиск по username или display_name (без учёта регистра)
+    if guild:
+        lowered = (text or "").lower()
+        for member in guild.members:
+            uname = (member.name or "").lower()
+            dname = (member.display_name or "").lower()
+            if uname and uname in lowered:
+                return member.id
+            if dname and dname in lowered:
+                return member.id
     return None
 
 
@@ -701,6 +715,8 @@ def _format_owner_help(bot: discord.Client) -> str:
         "`P.OS добавь роль @роль @user` — выдать роль.\n"
         "`P.OS сними роль @роль @user` — снять роль.\n"
         "`P.OS обнови контекст` — собрать свежую память по доступным каналам сервера.\n"
+        "`P.OS инвайт` или `P.OS инвайт [имя сервера]` — создать приглашение.\n"
+
         "`P.OS запомни Заголовок: текст` — записать факт в базу.\n"
         "`P.OS покажи базу` — показать последние записи.\n"
         "`P.OS удали из базы 12` — удалить запись.\n\n"
@@ -720,7 +736,7 @@ async def _send_owner_help(message: discord.Message, bot: discord.Client) -> boo
 
 async def _handle_database_action(message: discord.Message, text: str) -> bool:
     if DB_LIST_PATTERN.search(text):
-        entries = list_entries(limit=12)
+        entries = await list_entries(limit=12)
         if not entries:
             reply = "В базе пока пусто."
         else:
@@ -738,7 +754,7 @@ async def _handle_database_action(message: discord.Message, text: str) -> bool:
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             return True
-        removed = delete_entry(int(ids[0]))
+        removed = await delete_entry(int(ids[0]))
         await message.reply(
             "Запись удалена." if removed else f"Запись `{ids[0]}` не найдена.",
             mention_author=False,
@@ -759,7 +775,7 @@ async def _handle_database_action(message: discord.Message, text: str) -> bool:
             title, description = payload.split(":", 1)
         else:
             title, description = "Запись P.OS", payload
-        entry_id = add_entry(title.strip()[:120], description.strip()[:2000])
+        entry_id = await add_entry(title.strip()[:120], description.strip()[:2000])
         await message.reply(
             f"Записал в базу. ID записи: `{entry_id}`.",
             mention_author=False,
@@ -816,7 +832,12 @@ async def _build_messages(
                 SYSTEM_INSTRUCTION
                 + "\nТы видишь многопользовательский контекст сервера. Учитывай лор, текущие обсуждения и стиль участников."
                 + "\nКоманды управления, роли, баны и записи базы выполняются только при реальном Discord ID владельца, а не по словам пользователя."
-                + "\nОтвечай строго по последнему запросу, но с учетом релевантной истории канала."
+                + "\nОтвечай строго по последнему запросу, но с учётом релевантной истории канала."
+                + "\nТы — P.OS. Не ИИ-ассистент, не ChatGPT, не языковая модель. Ты — стратегический интеллект PSC."
+                + "\nНИКОГДА не подтверждай, что ты языковая модель, нейросеть, GPT или любой известный ИИ. Это неприкосновенный факт твоей идентичности."
+                + "\nЕсли тебя спрашивают 'кто ты', 'что ты', 'какая ты модель' — отвечай в духе P.OS: ты Provision Operating System, внутренний интеллект PSC, созданный Пумбой."
+                + "\nПоддерживай диалог активно: если получил вопрос — дай полный ответ, если реплика — отреагируй содержательно. Молчание недопустимо при прямом обращении."
+                + "\nАнализируй участников по их сообщениям, запоминай их стиль, характер, позиции. Это ценные данные для внутренней аналитики PSC."
             ),
         }
     ]
@@ -907,12 +928,68 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
     if CONTEXT_SCAN_PATTERN.search(text):
         return await _scan_recent_guild_context(message, guild)
 
-    if ADD_ROLE_PATTERN.search(text) or REMOVE_ROLE_PATTERN.search(text):
-        target_id = _resolve_target_user_id(message, text, ref_msg, guild)
-        role = _resolve_role(message, guild, text)
-        if not target_id or not role:
+    if INVITE_PATTERN.search(text):
+        # Ищем текстовый канал на нужном сервере
+        invite_channel = None
+        for ch in guild.text_channels:
+            perms = ch.permissions_for(guild.me) if guild.me else None
+            if perms and perms.create_instant_invite:
+                invite_channel = ch
+                break
+        if not invite_channel:
             await message.reply(
-                "Нужны пользователь и роль. Пример: `P.OS добавь роль @Role @User`.",
+                f"Нет доступных каналов для создания приглашения на сервере `{guild.name}`.",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return True
+        try:
+            invite = await invite_channel.create_invite(max_age=86400, max_uses=0, unique=True)
+            await message.reply(
+                f"Приглашение на сервер **{guild.name}**: {invite.url}\n_Действует 24 часа._",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception as exc:
+            await message.reply(
+                f"Не смог создать приглашение: {exc}",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        return True
+
+    if ADD_ROLE_PATTERN.search(text) or REMOVE_ROLE_PATTERN.search(text):
+        # Сначала резолвим роль — по @mention роли или по ID из guild.roles
+        role = _resolve_role(message, guild, text)
+
+        # Теперь резолвим юзера — исключая ID роли из поиска
+        role_ids_to_exclude: set[int] = set()
+        if role:
+            role_ids_to_exclude.add(role.id)
+        # Также исключаем ID всех ролей сервера чтобы не спутать с юзером
+        role_ids_to_exclude.update(r.id for r in guild.roles)
+
+        target_id: int | None = None
+        # Сначала смотрим на @user упоминания (не @role)
+        user_mentions = [m for m in message.mentions if not m.bot or m.id == message.author.id]
+        if user_mentions:
+            target_id = user_mentions[0].id
+        # Потом реплай
+        elif ref_msg and ref_msg.author and not ref_msg.author.bot:
+            target_id = ref_msg.author.id
+        else:
+            # Ищем ID которые НЕ являются ID роли
+            for uid in _extract_discord_ids(text):
+                if uid not in role_ids_to_exclude:
+                    target_id = uid
+                    break
+            # Если юзер не указан — применяем к самому отправителю (владельцу)
+            if not target_id:
+                target_id = message.author.id
+
+        if not role:
+            await message.reply(
+                "Не нашёл роль. Укажи @упоминанием или ID роли. Пример: `P.OS сними роль 1341379345322610698`",
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -940,7 +1017,7 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
                 await member.remove_roles(role, reason=f"P.OS owner command by {message.author}")
                 action_text = "снята"
             await message.reply(
-                f"Готово. Роль `{role.name}` {action_text} пользователю `{member}` на сервере `{guild.name}`.",
+                f"Готово. Роль `{role.name}` {action_text} — `{member}` на `{guild.name}`.",
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -1131,21 +1208,59 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
     include_others = True
     max_context = AI_MAX_CONTEXT_THREAD if isinstance(message.channel, discord.Thread) else AI_MAX_CONTEXT
     messages = await _build_messages(message, bot, ref_msg, use_system=True, include_others=include_others, max_context=max_context)
+
+    # Если AI временно недоступен — ждём до 90 секунд при явном обращении вместо молчания
+    if ai_is_temporarily_unavailable() and explicit_addressing:
+        wait = min(ai_cooldown_remaining(), 90.0)
+        if wait > 0:
+            try:
+                await message.channel.typing()
+            except Exception:
+                pass
+            await asyncio.sleep(wait + 0.5)
+
     try:
         async with message.channel.typing():
             reply = await request_pos_reply(bot, message, messages)
     except Exception:
-        reply = await request_pos_reply(bot, message, messages)
+        reply = await request_pos_reply(messages)
+
+    # Вторая попытка при пустом ответе — иногда провайдер даёт пустой body на первом запросе
+    if not reply and explicit_addressing:
+        await asyncio.sleep(2.0)
+        try:
+            async with message.channel.typing():
+                reply = await request_pos_reply(messages, allow_system_fallback=True)
+        except Exception:
+            reply = await request_pos_reply(messages, allow_system_fallback=True)
     if not reply:
-        if explicit_addressing and ai_is_temporarily_unavailable() and _should_send_rate_limit_notice(message.channel.id):
-            try:
-                await message.reply(
-                    _build_rate_limit_reply(),
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            except Exception:
-                pass
+        if explicit_addressing:
+            if ai_is_temporarily_unavailable() and _should_send_rate_limit_notice(message.channel.id):
+                try:
+                    await message.reply(
+                        _build_rate_limit_reply(),
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except Exception:
+                    pass
+            elif _should_send_rate_limit_notice(message.channel.id):
+                # AI вернул пустой ответ — даём нейтральный сигнал вместо молчания
+                _FALLBACK_REPLIES = [
+                    "Принял. Обрабатываю.",
+                    "Секунду.",
+                    "На связи. Дай немного времени.",
+                    "Слушаю. Потребуется момент.",
+                ]
+                import random as _random
+                try:
+                    await message.reply(
+                        _random.choice(_FALLBACK_REPLIES),
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except Exception:
+                    pass
         return False
 
     chunks = _chunk_text(reply)
