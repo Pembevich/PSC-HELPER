@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import re
+import asyncio
 import time
 from collections import defaultdict, deque
 from typing import List, Optional
@@ -32,7 +33,7 @@ from commands import generate_gif_from_attachments
 from logging_utils import is_log_channel
 from storage import add_entry, delete_entry, list_entries
 
-AI_COOLDOWN_SECONDS = 2.5
+AI_COOLDOWN_SECONDS = 1.5  # уменьшен для живого диалога
 AI_MAX_CONTEXT = 64
 AI_MAX_CONTEXT_THREAD = 140
 AI_MAX_RESPONSE_CHARS = 1900
@@ -236,16 +237,20 @@ def _format_server_memory(message: discord.Message) -> str:
 def _format_author_profile(message: discord.Message) -> str:
     if not message.guild:
         return ""
-    recent = list(_user_memory.get((message.guild.id, message.author.id), []))[-12:]
+    recent = list(_user_memory.get((message.guild.id, message.author.id), []))[-20:]
     roles = []
     if isinstance(message.author, discord.Member):
         roles = [role.name for role in message.author.roles if role.name != "@everyone"][-12:]
+    # Собираем поведенческий профиль: частота, стиль, темы
+    word_counts = [len(m.split()) for m in recent if m]
+    avg_len = round(sum(word_counts) / len(word_counts), 1) if word_counts else 0
     lines = [
-        f"Автор: {message.author.display_name} (`{message.author.id}`)",
-        f"Роли автора: {', '.join(roles) if roles else 'нет данных'}",
+        f"Собеседник: {message.author.display_name} (`{message.author.id}`)",
+        f"Роли: {', '.join(roles) if roles else 'нет данных'}",
+        f"Активность: {len(recent)} сообщений в памяти, средняя длина: {avg_len} слов",
     ]
     if recent:
-        lines.append("Недавние реплики автора: " + " | ".join(recent[-5:]))
+        lines.append("Последние реплики собеседника:\n" + "\n".join(f"  — {m}" for m in recent[-8:]))
     return "\n".join(lines)
 
 
@@ -1049,11 +1054,31 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
     include_others = True
     max_context = AI_MAX_CONTEXT_THREAD if isinstance(message.channel, discord.Thread) else AI_MAX_CONTEXT
     messages = await _build_messages(message, bot, ref_msg, use_system=True, include_others=include_others, max_context=max_context)
+
+    # Если AI временно недоступен — ждём до 90 секунд при явном обращении вместо молчания
+    if ai_is_temporarily_unavailable() and explicit_addressing:
+        wait = min(ai_cooldown_remaining(), 90.0)
+        if wait > 0:
+            try:
+                await message.channel.typing()
+            except Exception:
+                pass
+            await asyncio.sleep(wait + 0.5)
+
     try:
         async with message.channel.typing():
             reply = await request_pos_reply(messages)
     except Exception:
         reply = await request_pos_reply(messages)
+
+    # Вторая попытка при пустом ответе — иногда провайдер даёт пустой body на первом запросе
+    if not reply and explicit_addressing:
+        await asyncio.sleep(2.0)
+        try:
+            async with message.channel.typing():
+                reply = await request_pos_reply(messages, allow_system_fallback=True)
+        except Exception:
+            reply = await request_pos_reply(messages, allow_system_fallback=True)
     if not reply:
         if explicit_addressing:
             if ai_is_temporarily_unavailable() and _should_send_rate_limit_notice(message.channel.id):
