@@ -151,26 +151,29 @@ def _log_ai_backoff_once(message: str) -> None:
     print(message)
 
 
-def _extract_text_from_payload(data: dict[str, Any]) -> str | None:
-    text = None
-
+def _extract_message_from_payload(data: dict[str, Any]) -> dict[str, Any] | None:
     choices = data.get("choices")
     if choices and isinstance(choices, list):
         choice0 = choices[0] or {}
-        msg = choice0.get("message") or {}
-        text = msg.get("content") or choice0.get("text")
+        msg = choice0.get("message")
+        if msg:
+            return msg
+        text = choice0.get("text")
+        if text:
+            return {"role": "assistant", "content": text}
 
-    if not text:
-        result = data.get("result") or {}
-        choices = result.get("choices")
-        if choices and isinstance(choices, list):
-            choice0 = choices[0] or {}
-            msg = choice0.get("message") or {}
-            text = msg.get("content") or choice0.get("text")
+    result = data.get("result") or {}
+    choices = result.get("choices")
+    if choices and isinstance(choices, list):
+        choice0 = choices[0] or {}
+        msg = choice0.get("message")
+        if msg:
+            return msg
+        text = choice0.get("text")
+        if text:
+            return {"role": "assistant", "content": text}
 
-    if not text:
-        text = data.get("output_text") or data.get("generated_text")
-
+    text = data.get("output_text") or data.get("generated_text")
     if isinstance(text, list):
         parts = []
         for item in text:
@@ -179,18 +182,20 @@ def _extract_text_from_payload(data: dict[str, Any]) -> str | None:
         text = "\n".join(part for part in parts if part).strip()
 
     if isinstance(text, str):
-        return text.strip()
+        return {"role": "assistant", "content": text.strip()}
+
     return None
 
 
 async def pos_chat_completion(
     messages: list[dict[str, Any]],
     *,
+    tools: list[dict[str, Any]] | None = None,
     max_tokens: int = POS_AI_MAX_TOKENS,
     temperature: float = POS_AI_TEMPERATURE,
     top_p: float = POS_AI_TOP_P,
     timeout: int = POS_AI_TIMEOUT_SECONDS,
-) -> str | None:
+) -> dict[str, Any] | None:
     if not _AI_PROVIDER_POOL or not any(provider.get("api_key") for provider in _AI_PROVIDER_POOL):
         return None
     if ai_is_temporarily_unavailable():
@@ -232,6 +237,8 @@ async def pos_chat_completion(
                 "presence_penalty": 0.0,
                 "stream": False,
             }
+            if tools:
+                payload["tools"] = tools
             headers = {
                 "Authorization": f"Bearer {provider['api_key']}",
                 "Content-Type": "application/json",
@@ -277,11 +284,11 @@ async def pos_chat_completion(
         print(f"P.OS API returned non-JSON: {response_text[:500]}")
         return None
 
-    text = _extract_text_from_payload(data)
-    if not text:
+    msg = _extract_message_from_payload(data)
+    if not msg:
         print(f"P.OS API empty response: {response_text[:500]}")
         return None
-    return text
+    return msg
 
 
 def extract_json_block(text: str) -> dict[str, Any] | None:
