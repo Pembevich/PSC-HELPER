@@ -831,11 +831,37 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
         return True
 
     if ADD_ROLE_PATTERN.search(text) or REMOVE_ROLE_PATTERN.search(text):
-        target_id = _resolve_target_user_id(message, text, ref_msg, guild)
+        # Сначала резолвим роль — по @mention роли или по ID из guild.roles
         role = _resolve_role(message, guild, text)
-        if not target_id or not role:
+
+        # Теперь резолвим юзера — исключая ID роли из поиска
+        role_ids_to_exclude: set[int] = set()
+        if role:
+            role_ids_to_exclude.add(role.id)
+        # Также исключаем ID всех ролей сервера чтобы не спутать с юзером
+        role_ids_to_exclude.update(r.id for r in guild.roles)
+
+        target_id: int | None = None
+        # Сначала смотрим на @user упоминания (не @role)
+        user_mentions = [m for m in message.mentions if not m.bot or m.id == message.author.id]
+        if user_mentions:
+            target_id = user_mentions[0].id
+        # Потом реплай
+        elif ref_msg and ref_msg.author and not ref_msg.author.bot:
+            target_id = ref_msg.author.id
+        else:
+            # Ищем ID которые НЕ являются ID роли
+            for uid in _extract_discord_ids(text):
+                if uid not in role_ids_to_exclude:
+                    target_id = uid
+                    break
+            # Если юзер не указан — применяем к самому отправителю (владельцу)
+            if not target_id:
+                target_id = message.author.id
+
+        if not role:
             await message.reply(
-                "Нужны пользователь и роль. Пример: `P.OS добавь роль @Role @User`.",
+                "Не нашёл роль. Укажи @упоминанием или ID роли. Пример: `P.OS сними роль 1341379345322610698`",
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -863,7 +889,7 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
                 await member.remove_roles(role, reason=f"P.OS owner command by {message.author}")
                 action_text = "снята"
             await message.reply(
-                f"Готово. Роль `{role.name}` {action_text} пользователю `{member}` на сервере `{guild.name}`.",
+                f"Готово. Роль `{role.name}` {action_text} — `{member}` на `{guild.name}`.",
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
