@@ -1,4 +1,6 @@
+import asyncio
 import os
+import signal
 
 import discord
 from dotenv import load_dotenv
@@ -23,9 +25,11 @@ def create_bot() -> commands.Bot:
     return bot
 
 
-def main():
+async def run_bot() -> None:
     load_dotenv()
-    init_db()
+
+    # init_db теперь async — вызываем через await
+    await init_db()
 
     bot = create_bot()
     register_commands(bot)
@@ -38,13 +42,39 @@ def main():
         print("🚨 ОШИБКА: DISCORD_TOKEN не найден в переменных окружения Railway!")
         return
 
+    # Graceful shutdown: ловим SIGTERM (Railway) и SIGINT (Ctrl+C)
+    loop = asyncio.get_running_loop()
+
+    async def _shutdown() -> None:
+        print("⚠️ Получен сигнал завершения, закрываем бота...")
+        await bot.close()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(_shutdown()))
+        except NotImplementedError:
+            # Windows не поддерживает add_signal_handler — молча игнорируем
+            pass
+
     try:
         print(f"⏳ Запуск бота... AI provider={POS_AI_PROVIDER}, model={POS_AI_MODEL}")
-        bot.run(token)
+        await bot.start(token)
     except discord.errors.LoginFailure:
         print("🚨 ОШИБКА: Неверный токен (Improper token). Проверь DISCORD_TOKEN в Railway.")
+    except asyncio.CancelledError:
+        print("✅ Бот остановлен корректно.")
     except Exception as e:
         print(f"🚨 Произошла критическая ошибка при запуске: {e}")
+    finally:
+        if not bot.is_closed():
+            await bot.close()
+
+
+def main() -> None:
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
