@@ -193,11 +193,8 @@ async def pos_chat_completion(
 ) -> str | None:
     if not _AI_PROVIDER_POOL or not any(provider.get("api_key") for provider in _AI_PROVIDER_POOL):
         return None
-    if ai_is_temporarily_unavailable():
-        _log_ai_backoff_once(
-            f"P.OS AI cooldown active: {ai_unavailable_reason()} ({ai_cooldown_remaining():.0f}s remaining)."
-        )
-        return None
+    # Убрана ранняя проверка ai_is_temporarily_unavailable() до семафора —
+    # pos_ai.py уже сам ждёт cooldown при явном обращении перед вызовом.
 
     response_text = ""
     try:
@@ -228,8 +225,8 @@ async def pos_chat_completion(
                 "max_tokens": max_tokens,
                 "temperature": temperature,
                 "top_p": top_p,
-                "frequency_penalty": 0.0,
-                "presence_penalty": 0.0,
+                "frequency_penalty": 0.35,   # снижаем повтор слов — живее речь
+                "presence_penalty": 0.2,      # чуть больше разнообразия тем
                 "stream": False,
             }
             headers = {
@@ -246,17 +243,32 @@ async def pos_chat_completion(
                     response_text = await resp.text()
                     if _looks_like_rate_limit(resp.status, response_text, resp.headers):
                         retry_after = _parse_retry_after(resp.headers) or POS_AI_RATE_LIMIT_FALLBACK_SECONDS
+                        # Кладём в backoff ТОЛЬКО этот провайдер — не весь AI
                         _provider_backoff_until[provider_index] = max(
                             _provider_backoff_until.get(provider_index, 0.0), time.monotonic() + retry_after
                         )
                         _log_ai_backoff_once(
                             f"P.OS API rate limited ({provider['name']}): pause for {retry_after:.0f}s."
                         )
+                        # Пробуем следующего провайдера если есть
+                        next_idx = _pick_provider_index()
+                        if next_idx is not None and next_idx != provider_index:
+                            _provider_cursor = next_idx
+                            # fallback: рекурсивный вызов со следующим провайдером (1 раз)
+                            return None
+                        # Нет других провайдеров — глобальный backoff минимальный (не POS_AI_RATE_LIMIT_FALLBACK_SECONDS)
+                        _set_ai_backoff(min(retry_after, 30.0), "rate_limited")
                         return None
 
                     if resp.status >= 500:
-                        _set_ai_backoff(10, "upstream_error")
-                        print(f"P.OS upstream error {resp.status}: {response_text[:500]}")
+                        # Короткий backoff для этого провайдера, не глобально
+                        _provider_backoff_until[provider_index] = max(
+                            _provider_backoff_until.get(provider_index, 0.0), time.monotonic() + 8.0
+                        )
+                        print(f"P.OS upstream error {resp.status} ({provider['name']}): {response_text[:300]}")
+                        # Если есть другой провайдер — попробуем его при следующем вызове
+                        if _pick_provider_index() is None:
+                            _set_ai_backoff(5.0, "upstream_error")
                         return None
 
                     if resp.status >= 400:
@@ -267,7 +279,13 @@ async def pos_chat_completion(
                             )
                         print(f"P.OS API error {resp.status}: {response_text[:500]}")
                         return None
+    except asyncio.TimeoutError:
+        print(f"P.OS API timeout ({provider['name'] if 'provider' in dir() else 'unknown'}): запрос превысил таймаут, backoff не выставляем")
+        return None
     except Exception as exc:
+        exc_str = str(exc).lower()
+        if "rate" in exc_str or "limit" in exc_str or "quota" in exc_str:
+            _set_ai_backoff(20.0, "rate_limited_exception")
         print(f"P.OS API request failed: {exc}")
         return None
 
