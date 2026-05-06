@@ -50,6 +50,20 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
         
     user_id = int(args.get("user_id", 0)) if args.get("user_id") else None
     
+    if name in ("ban_user", "unban_user", "timeout_user", "add_role", "remove_role"):
+        if message.author.id not in POS_OWNER_USER_IDS:
+            owner_id = POS_OWNER_USER_IDS[0] if POS_OWNER_USER_IDS else 968698192411652176
+            owner = bot.get_user(owner_id)
+            if owner:
+                action_name = {"ban_user": "бан", "unban_user": "разбан", "timeout_user": "мут", "add_role": "выдачу роли", "remove_role": "снятие роли"}.get(name, name)
+                user_name = getattr(message.guild.get_member(user_id), "name", str(user_id)) if user_id and message.guild else str(user_id)
+                reason = args.get("reason", args.get("role_id_or_name", "Причина не указана"))
+                try:
+                    await owner.send(f"⚠️ **Запрос на {action_name} от ИИ P.OS**\nПользователь: {user_name} (`{user_id}`)\nПричина/Роль: {reason}\nКонтекст: {message.jump_url}")
+                except Exception:
+                    pass
+            return f"Отказано в доступе. Запрос на {name} отправлен владельцу на подтверждение. Я не могу наказывать сам, поэтому уведомил владельца."
+
     if name == "ban_user":
         if not user_id: return "Ошибка: не указан user_id"
         reason = args.get("reason", "Бан от P.OS")
