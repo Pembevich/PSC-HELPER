@@ -198,115 +198,115 @@ async def pos_chat_completion(
 ) -> dict[str, Any] | None:
     if not _AI_PROVIDER_POOL or not any(provider.get("api_key") for provider in _AI_PROVIDER_POOL):
         return None
-    # Убрана ранняя проверка ai_is_temporarily_unavailable() до семафора —
-    # pos_ai.py уже сам ждёт cooldown при явном обращении перед вызовом.
 
-    response_text = ""
-    try:
-        global _provider_cursor
-        async with _AI_REQUEST_SEMAPHORE:
-            if ai_is_temporarily_unavailable():
-                _log_ai_backoff_once(
-                    f"P.OS AI cooldown active: {ai_unavailable_reason()} ({ai_cooldown_remaining():.0f}s remaining)."
-                )
-                return None
+    global _provider_cursor
+    max_attempts = len(_AI_PROVIDER_POOL)
 
-            provider_index = _pick_provider_index()
-            if provider_index is None:
-                shortest = min((_provider_cooldown_remaining(i) for i in range(len(_AI_PROVIDER_POOL))), default=5.0)
-                _set_ai_backoff(shortest, "all_providers_rate_limited")
-                _log_ai_backoff_once(
-                    f"P.OS AI provider pool cooldown: all providers limited, retry in {shortest:.0f}s."
-                )
-                return None
+    for attempt in range(max_attempts):
+        response_text = ""
+        try:
+            async with _AI_REQUEST_SEMAPHORE:
+                if ai_is_temporarily_unavailable():
+                    _log_ai_backoff_once(
+                        f"P.OS AI cooldown active: {ai_unavailable_reason()} ({ai_cooldown_remaining():.0f}s remaining)."
+                    )
+                    return None
 
-            provider = _AI_PROVIDER_POOL[provider_index]
-            _provider_cursor = (provider_index + 1) % len(_AI_PROVIDER_POOL)
+                provider_index = _pick_provider_index()
+                if provider_index is None:
+                    shortest = min((_provider_cooldown_remaining(i) for i in range(len(_AI_PROVIDER_POOL))), default=5.0)
+                    _set_ai_backoff(shortest, "all_providers_rate_limited")
+                    _log_ai_backoff_once(
+                        f"P.OS AI provider pool cooldown: all providers limited, retry in {shortest:.0f}s."
+                    )
+                    return None
 
-            accept_header = "application/vnd.github+json" if provider["provider"] == "github_models" else "application/json"
-            payload = {
-                "messages": messages,
-                "model": provider["model"],
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-                "frequency_penalty": 0.35,   # снижаем повтор слов — живее речь
-                "presence_penalty": 0.2,      # чуть больше разнообразия тем
-                "stream": False,
-            }
-            if tools:
-                payload["tools"] = tools
-            headers = {
-                "Authorization": f"Bearer {provider['api_key']}",
-                "Content-Type": "application/json",
-                "Accept": accept_header,
-            }
-            if provider["provider"] == "github_models":
-                headers["X-GitHub-Api-Version"] = GITHUB_MODELS_API_VERSION
+                provider = _AI_PROVIDER_POOL[provider_index]
+                _provider_cursor = (provider_index + 1) % len(_AI_PROVIDER_POOL)
 
-            timeout_config = aiohttp.ClientTimeout(total=timeout)
-            async with aiohttp.ClientSession(timeout=timeout_config) as session:
-                async with session.post(provider["api_url"], headers=headers, json=payload, timeout=timeout) as resp:
-                    response_text = await resp.text()
-                    if _looks_like_rate_limit(resp.status, response_text, resp.headers):
-                        retry_after = _parse_retry_after(resp.headers) or POS_AI_RATE_LIMIT_FALLBACK_SECONDS
-                        # Кладём в backoff ТОЛЬКО этот провайдер — не весь AI
-                        _provider_backoff_until[provider_index] = max(
-                            _provider_backoff_until.get(provider_index, 0.0), time.monotonic() + retry_after
-                        )
-                        _log_ai_backoff_once(
-                            f"P.OS API rate limited ({provider['name']}): pause for {retry_after:.0f}s."
-                        )
-                        # Пробуем следующего провайдера если есть
-                        next_idx = _pick_provider_index()
-                        if next_idx is not None and next_idx != provider_index:
-                            _provider_cursor = next_idx
-                            # fallback: рекурсивный вызов со следующим провайдером (1 раз)
-                            return None
-                        # Нет других провайдеров — глобальный backoff минимальный (не POS_AI_RATE_LIMIT_FALLBACK_SECONDS)
-                        _set_ai_backoff(min(retry_after, 30.0), "rate_limited")
-                        return None
+                accept_header = "application/vnd.github+json" if provider["provider"] == "github_models" else "application/json"
+                payload = {
+                    "messages": messages,
+                    "model": provider["model"],
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "frequency_penalty": 0.35,
+                    "presence_penalty": 0.2,
+                    "stream": False,
+                }
+                if tools:
+                    payload["tools"] = tools
+                headers = {
+                    "Authorization": f"Bearer {provider['api_key']}",
+                    "Content-Type": "application/json",
+                    "Accept": accept_header,
+                }
+                if provider["provider"] == "github_models":
+                    headers["X-GitHub-Api-Version"] = GITHUB_MODELS_API_VERSION
 
-                    if resp.status >= 500:
-                        # Короткий backoff для этого провайдера, не глобально
-                        _provider_backoff_until[provider_index] = max(
-                            _provider_backoff_until.get(provider_index, 0.0), time.monotonic() + 8.0
-                        )
-                        print(f"P.OS upstream error {resp.status} ({provider['name']}): {response_text[:300]}")
-                        # Если есть другой провайдер — попробуем его при следующем вызове
-                        if _pick_provider_index() is None:
-                            _set_ai_backoff(5.0, "upstream_error")
-                        return None
-
-                    if resp.status >= 400:
-                        if provider["provider"] == "github_models" and resp.status in {401, 403}:
-                            print(
-                                "P.OS GitHub Models auth error: проверь, что GITHUB_MODELS_TOKEN существует "
-                                "и имеет доступ к Models API (PAT со scope/permission models)."
+                timeout_config = aiohttp.ClientTimeout(total=timeout)
+                async with aiohttp.ClientSession(timeout=timeout_config) as session:
+                    async with session.post(provider["api_url"], headers=headers, json=payload, timeout=timeout) as resp:
+                        response_text = await resp.text()
+                        if _looks_like_rate_limit(resp.status, response_text, resp.headers):
+                            retry_after = _parse_retry_after(resp.headers) or POS_AI_RATE_LIMIT_FALLBACK_SECONDS
+                            _provider_backoff_until[provider_index] = max(
+                                _provider_backoff_until.get(provider_index, 0.0), time.monotonic() + retry_after
                             )
-                        print(f"P.OS API error {resp.status}: {response_text[:500]}")
-                        return None
-    except asyncio.TimeoutError:
-        print(f"P.OS API timeout ({provider['name'] if 'provider' in dir() else 'unknown'}): запрос превысил таймаут, backoff не выставляем")
-        return None
-    except Exception as exc:
-        exc_str = str(exc).lower()
-        if "rate" in exc_str or "limit" in exc_str or "quota" in exc_str:
-            _set_ai_backoff(20.0, "rate_limited_exception")
-        print(f"P.OS API request failed: {exc}")
-        return None
+                            _log_ai_backoff_once(
+                                f"P.OS API rate limited ({provider['name']}): pause for {retry_after:.0f}s."
+                            )
+                            next_idx = _pick_provider_index()
+                            if next_idx is not None and next_idx != provider_index:
+                                _provider_cursor = next_idx
+                                continue  # retry next provider
+                            _set_ai_backoff(min(retry_after, 30.0), "rate_limited")
+                            return None
 
-    try:
-        data = json.loads(response_text)
-    except Exception:
-        print(f"P.OS API returned non-JSON: {response_text[:500]}")
-        return None
+                        if resp.status >= 500:
+                            _provider_backoff_until[provider_index] = max(
+                                _provider_backoff_until.get(provider_index, 0.0), time.monotonic() + 8.0
+                            )
+                            print(f"P.OS upstream error {resp.status} ({provider['name']}): {response_text[:300]}")
+                            if _pick_provider_index() is not None:
+                                continue  # retry next provider
+                            _set_ai_backoff(5.0, "upstream_error")
+                            return None
 
-    msg = _extract_message_from_payload(data)
-    if not msg:
-        print(f"P.OS API empty response: {response_text[:500]}")
-        return None
-    return msg
+                        if resp.status >= 400:
+                            if provider["provider"] == "github_models" and resp.status in {401, 403}:
+                                print("P.OS GitHub Models auth error.")
+                            print(f"P.OS API error {resp.status}: {response_text[:500]}")
+                            return None
+        except asyncio.TimeoutError:
+            print(f"P.OS API timeout. Attempting fallback.")
+            if attempt < max_attempts - 1:
+                continue
+            return None
+        except Exception as exc:
+            exc_str = str(exc).lower()
+            if "rate" in exc_str or "limit" in exc_str or "quota" in exc_str:
+                _provider_backoff_until[provider_index] = time.monotonic() + 20.0
+                if attempt < max_attempts - 1:
+                    continue
+            print(f"P.OS API request failed: {exc}")
+            return None
+
+        # Success
+        try:
+            data = json.loads(response_text)
+        except Exception:
+            print(f"P.OS API returned non-JSON: {response_text[:500]}")
+            return None
+
+        msg = _extract_message_from_payload(data)
+        if not msg:
+            print(f"P.OS API empty response: {response_text[:500]}")
+            return None
+        return msg
+
+    return None
 
 
 def extract_json_block(text: str) -> dict[str, Any] | None:
