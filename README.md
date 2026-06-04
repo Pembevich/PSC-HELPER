@@ -94,3 +94,15 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 python main.py
+
+Repository Structure
+ ⁠main.py⁠ — Main entry point and application initialization.
+ ⁠config.py⁠ — Environment variable handling and static ID mappings.
+ ⁠events.py⁠ — Server guild event listeners and lifecycle handling.
+ ⁠moderation.py⁠ — Automated text/attachment filters and AI safety guardrails.
+ ⁠pos_ai.py⁠ — Core P.OS AI orchestration and contextual reasoning logic.
+ ⁠ai_client.py⁠ — Asynchronous OpenAI-compatible API client routing.
+ ⁠commands.py⁠ — Classic text-based and slash command registrations.
+ ⁠logging_utils.py⁠ — Modular auditing and structured logging utilities.
+Security Note: GitHub Models Token
+When utilizing a fine-grained Personal Access Token (PAT), ensure it has explicit authorization flags enabled for the GitHub Models API. If an API key is accidentally exposed in public server channels or application logs, revoke it immediately via GitHub settings and update your environment variables on Railway
