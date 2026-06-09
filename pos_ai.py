@@ -83,7 +83,10 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
             
     elif name == "timeout_user":
         if not user_id: return "Ошибка: не указан user_id"
-        minutes = int(args.get("minutes", 10))
+        try:
+            minutes = int(args.get("minutes", 10))
+        except (ValueError, TypeError):
+            minutes = 10
         reason = args.get("reason", "Тайм-аут от P.OS")
         member = message.guild.get_member(user_id)
         if not member:

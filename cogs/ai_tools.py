@@ -54,8 +54,8 @@ POS_AI_TOOLS = [
                         "description": "Discord ID пользователя."
                     },
                     "minutes": {
-                        "type": "integer",
-                        "description": "Длительность тайм-аута в минутах."
+                        "type": "string",
+                        "description": "Длительность тайм-аута в минутах (например, '10' или '30')."
                     },
                     "reason": {
                         "type": "string",
