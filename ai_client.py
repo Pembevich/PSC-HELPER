@@ -40,7 +40,12 @@ def _build_provider_pool() -> list[dict[str, str]]:
         for index, key in enumerate(POS_AI_PROVIDER_KEYS):
             url = POS_AI_PROVIDER_URLS[index] if index < len(POS_AI_PROVIDER_URLS) else POS_AI_API_URL
             model = POS_AI_PROVIDER_MODELS[index] if index < len(POS_AI_PROVIDER_MODELS) else POS_AI_MODEL
-            provider = "github_models" if "models.github" in url else POS_AI_API_PROVIDER
+            if "models.github" in url:
+                provider = "github_models"
+            elif "googleapis.com" in url:
+                provider = "gemini"
+            else:
+                provider = POS_AI_API_PROVIDER
             pool.append(
                 {
                     "name": f"provider_{index + 1}",
@@ -231,10 +236,11 @@ async def pos_chat_completion(
                     "max_tokens": max_tokens,
                     "temperature": temperature,
                     "top_p": top_p,
-                    "frequency_penalty": 0.35,
-                    "presence_penalty": 0.2,
                     "stream": False,
                 }
+                if "googleapis.com" not in provider["api_url"] and provider["provider"] != "gemini":
+                    payload["frequency_penalty"] = 0.35
+                    payload["presence_penalty"] = 0.2
                 if tools:
                     payload["tools"] = tools
                 headers = {
