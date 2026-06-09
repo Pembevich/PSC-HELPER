@@ -277,10 +277,14 @@ async def pos_chat_completion(
                         if resp.status >= 400:
                             if provider["provider"] == "github_models" and resp.status in {401, 403}:
                                 print("P.OS GitHub Models auth error.")
-                            print(f"P.OS API error {resp.status}: {response_text[:500]}")
+                            print(f"P.OS API error {resp.status} ({provider['name']}): {response_text[:500]}")
+                            # Cool down this provider for 1 hour to prevent hitting bad credentials/models repeatedly
+                            _provider_backoff_until[provider_index] = time.monotonic() + 3600.0
+                            if attempt < max_attempts - 1:
+                                continue
                             return None
         except asyncio.TimeoutError:
-            print(f"P.OS API timeout. Attempting fallback.")
+            print(f"P.OS API timeout for {provider['name']}. Attempting fallback.")
             if attempt < max_attempts - 1:
                 continue
             return None
@@ -288,9 +292,11 @@ async def pos_chat_completion(
             exc_str = str(exc).lower()
             if "rate" in exc_str or "limit" in exc_str or "quota" in exc_str:
                 _provider_backoff_until[provider_index] = time.monotonic() + 20.0
-                if attempt < max_attempts - 1:
-                    continue
-            print(f"P.OS API request failed: {exc}")
+            else:
+                _provider_backoff_until[provider_index] = time.monotonic() + 60.0
+            print(f"P.OS API request failed ({provider['name']}): {exc}")
+            if attempt < max_attempts - 1:
+                continue
             return None
 
         # Success
