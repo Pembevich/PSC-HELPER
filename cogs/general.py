@@ -32,6 +32,7 @@ from commands import (
     generate_gif_from_attachments,
     _is_image_attachment,
     sbor_channels,
+    parse_gif_options_from_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,13 +115,31 @@ class GeneralCog(commands.Cog):
             pass
 
     @commands.command(name="gif")
-    async def gif(self, ctx: commands.Context):
-        if not ctx.message.attachments:
-            await ctx.send("Пожалуйста, прикрепи изображение или видео к команде.")
+    async def gif(self, ctx: commands.Context, *, args: str = ""):
+        attachments = list(ctx.message.attachments)
+        if not attachments and ctx.message.reference and ctx.message.reference.message_id:
+            try:
+                ref_msg = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                attachments = list(ref_msg.attachments)
+            except Exception:
+                pass
+
+        if not attachments:
+            await ctx.send("Пожалуйста, прикрепи изображение или видео к команде (или ответь на сообщение с ними).")
             return
 
+        options = parse_gif_options_from_text(args or ctx.message.content)
+        duration = options.get("duration")
+        fps = options.get("fps")
+        max_video_seconds = options.get("max_video_seconds")
+
         try:
-            output_path, temp_dir = await generate_gif_from_attachments(ctx.message.attachments)
+            output_path, temp_dir = await generate_gif_from_attachments(
+                attachments,
+                duration=duration,
+                fps=fps,
+                max_video_seconds=max_video_seconds,
+            )
             await ctx.send(file=discord.File(output_path, filename="psc.gif"))
         except Exception as e:
             logger.error(f"Error generating GIF: {e}", exc_info=True)

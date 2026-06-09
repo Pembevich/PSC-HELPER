@@ -46,6 +46,11 @@ class ConfirmView(View):
     @button(label="Принять", style=discord.ButtonStyle.green)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         member = interaction.guild.get_member(self.target_user_id)
+        if not member:
+            try:
+                member = await interaction.guild.fetch_member(self.target_user_id)
+            except Exception:
+                pass
         if member:
             for role_id in self.role_ids:
                 role = interaction.guild.get_role(role_id)

@@ -287,6 +287,11 @@ class FormsCog(commands.Cog):
             member = message.guild.get_member(user_id)
             if not member:
                 try:
+                    member = await message.guild.fetch_member(user_id)
+                except Exception:
+                    pass
+            if not member:
+                try:
                     await message.reply("❌ Пользователь с таким ID не найден на сервере.")
                 except Exception:
                     pass
