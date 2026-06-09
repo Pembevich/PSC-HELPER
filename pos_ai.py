@@ -29,7 +29,7 @@ from config import (
     POS_AI_TEMPERATURE,
     POS_OWNER_USER_IDS,
 )
-from commands import generate_gif_from_attachments
+from commands import generate_gif_from_attachments, parse_gif_options_from_text
 from logging_utils import is_log_channel
 from storage import add_entry, delete_entry, list_entries, get_ai_context, update_ai_context, is_ai_muted, set_ai_muted_user
 from cogs.ai_tools import POS_AI_TOOLS
@@ -86,6 +86,11 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
         minutes = int(args.get("minutes", 10))
         reason = args.get("reason", "Тайм-аут от P.OS")
         member = message.guild.get_member(user_id)
+        if not member:
+            try:
+                member = await message.guild.fetch_member(user_id)
+            except Exception:
+                pass
         if not member: return f"Ошибка: пользователь {user_id} не найден на сервере."
         import datetime
         try:
@@ -99,6 +104,11 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
         if not user_id: return "Ошибка: не указан user_id"
         role_ident = args.get("role_id_or_name", "")
         member = message.guild.get_member(user_id)
+        if not member:
+            try:
+                member = await message.guild.fetch_member(user_id)
+            except Exception:
+                pass
         if not member: return "Ошибка: пользователь не найден."
         role = None
         if role_ident.isdigit():
@@ -116,6 +126,11 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
         if not user_id: return "Ошибка: не указан user_id"
         role_ident = args.get("role_id_or_name", "")
         member = message.guild.get_member(user_id)
+        if not member:
+            try:
+                member = await message.guild.fetch_member(user_id)
+            except Exception:
+                pass
         if not member: return "Ошибка: пользователь не найден."
         role = None
         if role_ident.isdigit():
@@ -1186,9 +1201,18 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return True
+        options = parse_gif_options_from_text(message.content or "")
+        duration = options.get("duration")
+        fps = options.get("fps")
+        max_video_seconds = options.get("max_video_seconds")
         try:
             async with message.channel.typing():
-                output_path, temp_dir = await generate_gif_from_attachments(attachments)
+                output_path, temp_dir = await generate_gif_from_attachments(
+                    attachments,
+                    duration=duration,
+                    fps=fps,
+                    max_video_seconds=max_video_seconds,
+                )
             try:
                 await message.reply(
                     "Готово. Собрал GIF по твоему запросу.",

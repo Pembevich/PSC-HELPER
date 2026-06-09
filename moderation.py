@@ -6,6 +6,9 @@ import json
 import os
 import tempfile
 import time
+import re
+import subprocess
+import logging
 from collections import defaultdict, deque
 from datetime import timedelta
 from urllib.parse import urlparse, unquote
@@ -16,6 +19,10 @@ import discord
 import idna
 from PIL import Image, ImageOps
 from discord import Color, Embed
+import imageio_ffmpeg
+
+logger = logging.getLogger(__name__)
+
 
 from ai_client import ai_is_temporarily_unavailable, extract_json_block, pos_chat_completion
 from config import (
@@ -208,9 +215,68 @@ async def _attachment_image_to_data_url(att: discord.Attachment) -> str | None:
     return _build_data_url_from_image_bytes(data)
 
 
-async def _attachment_video_to_data_urls(att: discord.Attachment) -> list[str]:
-    if not VideoFileClip:
+async def _get_video_duration_ffmpeg(video_path: str) -> float | None:
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        def run_info():
+            return subprocess.run([ffmpeg_exe, "-i", video_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        res = await asyncio.to_thread(run_info)
+        stderr = res.stderr
+        
+        duration_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
+        if duration_match:
+            hours = int(duration_match.group(1))
+            minutes = int(duration_match.group(2))
+            seconds = float(duration_match.group(3))
+            return hours * 3600 + minutes * 60 + seconds
+    except Exception:
+        pass
+    return None
+
+
+async def _extract_video_frames_ffmpeg(video_path: str, timestamps: list[float], max_side: int = 1280) -> list[str]:
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
         return []
+
+    previews = []
+    for ts in timestamps:
+        with tempfile.NamedTemporaryFile(delete=True, suffix=".jpg") as tmp:
+            frame_path = tmp.name
+        
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-ss", f"{ts:.3f}",
+            "-i", video_path,
+            "-frames:v", "1",
+            "-vf", f"scale='if(gt(iw,ih),min(iw,{max_side}),-1)':'if(gt(ih,iw),min(ih,{max_side}))':flags=lanczos",
+            frame_path
+        ]
+        
+        try:
+            def run_cmd():
+                return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
+            
+            res = await asyncio.to_thread(run_cmd)
+            if res.returncode == 0 and os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
+                with open(frame_path, "rb") as f:
+                    data = f.read()
+                encoded = base64.b64encode(data).decode("ascii")
+                previews.append(f"data:image/jpeg;base64,{encoded}")
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(frame_path):
+                try:
+                    os.remove(frame_path)
+                except Exception:
+                    pass
+    return previews
+
+
+async def _attachment_video_to_data_urls(att: discord.Attachment) -> list[str]:
     if att.size and att.size > AI_MEDIA_MAX_BYTES:
         return []
 
@@ -221,6 +287,27 @@ async def _attachment_video_to_data_urls(att: discord.Attachment) -> list[str]:
             temp_path = temp_file.name
             data = await att.read(use_cached=True)
             temp_file.write(data)
+
+        # 1. Try FFmpeg first
+        try:
+            duration = await _get_video_duration_ffmpeg(temp_path)
+            if duration and duration > 0:
+                sample_duration = min(float(duration), 6.0)
+                if AI_VIDEO_FRAME_COUNT == 1:
+                    timestamps = [min(sample_duration / 2, sample_duration)]
+                else:
+                    step = sample_duration / (AI_VIDEO_FRAME_COUNT + 1)
+                    timestamps = [step * (idx + 1) for idx in range(AI_VIDEO_FRAME_COUNT)]
+                
+                previews = await _extract_video_frames_ffmpeg(temp_path, timestamps, AI_IMAGE_MAX_SIDE)
+                if previews:
+                    return previews
+        except Exception:
+            pass
+
+        # 2. Fallback to MoviePy
+        if not VideoFileClip:
+            return []
 
         previews: list[str] = []
         with VideoFileClip(temp_path) as clip:
@@ -271,7 +358,7 @@ async def check_google_safe_browsing(session: aiohttp.ClientSession, url: str) -
             payload = await response.json()
             return "matches" in payload and bool(payload["matches"])
     except Exception as exc:
-        print(f"GSB error for {url}: {exc}")
+        logger.error(f"GSB error for {url}: {exc}")
         return False
 
 
@@ -308,7 +395,7 @@ async def check_virustotal(session: aiohttp.ClientSession, url: str) -> bool:
             stats = payload.get("data", {}).get("attributes", {}).get("stats", {})
             return (stats.get("malicious", 0) + stats.get("suspicious", 0)) > 0
     except Exception as exc:
-        print(f"Ошибка VirusTotal: {exc}")
+        logger.error(f"Ошибка VirusTotal: {exc}")
         return False
 
 
@@ -552,7 +639,7 @@ async def check_and_handle_urls(message: discord.Message) -> bool:
                     _vt_cache[url] = (True, time.time())
                     continue
             except Exception as exc:
-                print(f"GSB check error: {exc}")
+                logger.error(f"GSB check error: {exc}")
 
             try:
                 vt_bad = await check_virustotal(session, url)
@@ -560,7 +647,7 @@ async def check_and_handle_urls(message: discord.Message) -> bool:
                 if vt_bad:
                     suspicious.append((url, "VirusTotal"))
             except Exception as exc:
-                print(f"VirusTotal check error: {exc}")
+                logger.error(f"VirusTotal check error: {exc}")
 
     ai_suspicious = await _classify_urls_with_ai(borderline)
     if ai_suspicious:
@@ -598,7 +685,7 @@ async def apply_max_timeout(member: discord.Member, reason: str):
 
     me = member.guild.me if member.guild else None
     if me and not me.guild_permissions.moderate_members:
-        print("Не удалось выдать ограничение голоса: у бота нет права Moderate Members")
+        logger.warning("Не удалось выдать ограничение голоса: у бота нет права Moderate Members")
         return False
 
     try:
@@ -609,10 +696,10 @@ async def apply_max_timeout(member: discord.Member, reason: str):
             await member.edit(timeout=until, reason=reason)
             return True
         except Exception as exc:
-            print(f"Не удалось выдать ограничение голоса: {exc}")
+            logger.error(f"Не удалось выдать ограничение голоса: {exc}")
             return False
     except Exception as exc:
-        print(f"Не удалось выдать ограничение голоса: {exc}")
+        logger.error(f"Не удалось выдать ограничение голоса: {exc}")
         return False
 
 
@@ -648,7 +735,7 @@ async def log_violation_with_evidence(message: discord.Message, title: str, reas
             kwargs["files"] = files
         await channel.send(**kwargs)
     except Exception as exc:
-        print(f"Ошибка логирования нарушения: {exc}")
+        logger.error(f"Ошибка логирования нарушения: {exc}")
 
 
 def detect_advertising_or_scam_text(text: str):
