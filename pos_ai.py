@@ -873,9 +873,10 @@ async def _build_messages(
             "role": role,
             "content": (
                 SYSTEM_INSTRUCTION
-                + "\nТы видишь многопользовательский контекст сервера. Учитывай лор, текущие обсуждения и стиль участников."
-                + "\nКоманды управления, роли, баны и записи базы выполняются только при реальном Discord ID владельца, а не по словам пользователя."
-                + "\nОтвечай строго по последнему запросу, но с учётом релевантной истории канала."
+                + "\nТы видишь многопользовательский контекст сервера. У каждого пользователя есть своё имя и ID, которые передаются в префиксе его сообщений: 'Имя (@username, ID: <id>):'."
+                + "\nКаждое твоё (P.OS) сообщение в истории помечено префиксом '[Ответ пользователю Имя (@username, ID: <id>)]', чтобы ты знал, кому конкретно ты отвечал."
+                + "\nУчитывай лор, текущие обсуждения и стиль участников. Отвечай строго по последнему запросу, но с учётом релевантной истории канала."
+                + "\nУчитывай, что в истории могут быть реплики от РАЗНЫХ участников. Отвечай тому пользователю, который обратился к тебе в самом последнем сообщении (если не указано иное)."
                 + "\nТы — P.OS. Не ИИ-ассистент, не ChatGPT, не языковая модель. Ты — стратегический интеллект PSC."
                 + "\nНИКОГДА не подтверждай, что ты языковая модель, нейросеть, GPT или любой известный ИИ. Это неприкосновенный факт твоей идентичности."
                 + "\nЕсли тебя спрашивают 'кто ты', 'что ты', 'какая ты модель' — отвечай в духе P.OS: ты Provision Operating System, внутренний интеллект PSC, созданный Пумбой."
@@ -897,20 +898,15 @@ async def _build_messages(
                 "content": "Контекст сервера и последних сообщений:\n" + server_context[:7000],
             }
         )
-    history: list[dict] = []
+
+    candidates = []
     seen_ids = set()
 
-    if ref_msg and ref_msg.id not in seen_ids:
-        role = "assistant" if bot.user and ref_msg.author.id == bot.user.id else "user"
-        content = _sanitize_text(ref_msg.content or "")
-        if role == "user" and bot.user:
-            content = _strip_bot_mention(content, bot.user.id)
-        if content:
-            if include_others and bot.user and ref_msg.author.id not in (message.author.id, bot.user.id):
-                content = f"{ref_msg.author.display_name}: {content}"
-            if bot.user and ref_msg.author.id != bot.user.id:
-                content = f"[Сообщение, на которое пользователь отвечает]\n{content}"
-            history.append({"role": role, "content": content})
+    if ref_msg:
+        is_bot = ref_msg.author.bot
+        is_our_bot = bot.user and ref_msg.author.id == bot.user.id
+        if (not is_bot or is_our_bot) and ref_msg.content:
+            candidates.append(ref_msg)
             seen_ids.add(ref_msg.id)
 
     async for m in message.channel.history(limit=AI_HISTORY_SCAN_LIMIT, before=message):
@@ -922,20 +918,64 @@ async def _build_messages(
             continue
         if not m.content:
             continue
+        
+        candidates.append(m)
+        seen_ids.add(m.id)
+        if len(candidates) >= max_context:
+            break
+
+    # Sort candidates chronologically (Snowflake ID)
+    candidates.sort(key=lambda x: x.id)
+
+    # Build history list
+    history: list[dict] = []
+    msg_map = {m.id: m for m in candidates}
+    if ref_msg:
+        msg_map[ref_msg.id] = ref_msg
+    msg_map[message.id] = message
+
+    last_user = None
+    for m in candidates:
         role = "assistant" if bot.user and m.author.id == bot.user.id else "user"
         content = _sanitize_text(m.content)
         if role == "user" and bot.user:
             content = _strip_bot_mention(content, bot.user.id)
         if not content:
             continue
-        if include_others and bot.user and m.author.id not in (message.author.id, bot.user.id):
-            content = f"{m.author.display_name}: {content}"
-        history.append({"role": role, "content": content})
-        seen_ids.add(m.id)
-        if len(history) >= max_context:
-            break
 
-    history.reverse()
+        if role == "user":
+            last_user = m.author
+            if ref_msg and m.id == ref_msg.id:
+                content = f"[Сообщение, на которое отвечает пользователь]\n{m.author.display_name} (@{m.author.name}, ID: {m.author.id}): {content}"
+            else:
+                content = f"{m.author.display_name} (@{m.author.name}, ID: {m.author.id}): {content}"
+        else: # assistant
+            replied_author = None
+            if m.reference and m.reference.message_id:
+                ref_id = m.reference.message_id
+                if ref_id in msg_map:
+                    replied_author = msg_map[ref_id].author
+                elif isinstance(m.reference.resolved, discord.Message):
+                    replied_author = m.reference.resolved.author
+            
+            if not replied_author:
+                replied_author = last_user
+                
+            if replied_author and (not bot.user or replied_author.id != bot.user.id):
+                prefix_label = f"[Ответ пользователю {replied_author.display_name} (@{replied_author.name}, ID: {replied_author.id})]"
+                if ref_msg and m.id == ref_msg.id:
+                    content = f"[Сообщение, на которое отвечает пользователь (P.OS)]\n{prefix_label}\n{content}"
+                else:
+                    content = f"{prefix_label}\n{content}"
+
+        msg_dict = {"role": role, "content": content}
+        if role == "user":
+            msg_dict["name"] = f"user_{m.author.id}"
+        elif role == "assistant" and bot.user:
+            msg_dict["name"] = f"bot_{bot.user.id}"
+            
+        history.append(msg_dict)
+
     messages.extend(history)
 
     text = _strip_bot_mention(_sanitize_text(message.content or ""), bot.user.id if bot.user else 0)
@@ -945,7 +985,12 @@ async def _build_messages(
             if url not in image_urls:
                 image_urls.append(url)
 
-    messages.append({"role": "user", "content": build_pos_user_content(text, image_urls)})
+    prefix = f"{message.author.display_name} (@{message.author.name}, ID: {message.author.id}): "
+    messages.append({
+        "role": "user",
+        "name": f"user_{message.author.id}",
+        "content": build_pos_user_content(prefix + text, image_urls)
+    })
 
     return messages
 
