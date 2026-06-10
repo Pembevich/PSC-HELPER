@@ -131,10 +131,7 @@ class GeneralCog(commands.Cog):
         except Exception:
             pass
 
-        try:
-            await _send_update_log_if_needed(self.bot)
-        except Exception:
-            pass
+
 
     @commands.command(name="gif")
     async def gif(self, ctx: commands.Context, *, args: str = ""):
