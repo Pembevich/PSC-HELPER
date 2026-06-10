@@ -58,7 +58,7 @@ POS_OWNER_USER_IDS = sorted(_DEFAULT_OWNER_IDS | set(_env_int_list("POS_OWNER_US
 POS_AI_PROVIDER_KEYS = _env_csv("POS_AI_PROVIDER_KEYS")
 POS_AI_PROVIDER_URLS = _env_csv("POS_AI_PROVIDER_URLS")
 POS_AI_PROVIDER_MODELS = _env_csv("POS_AI_PROVIDER_MODELS")
-POS_AI_MAX_TOKENS = _env_int("POS_AI_MAX_TOKENS", 650)
+POS_AI_MAX_TOKENS = _env_int("POS_AI_MAX_TOKENS", 2048)
 POS_AI_TEMPERATURE = _env_float("POS_AI_TEMPERATURE", 0.75)
 POS_AI_TOP_P = _env_float("POS_AI_TOP_P", 0.95)
 POS_AI_TIMEOUT_SECONDS = _env_int("POS_AI_TIMEOUT_SECONDS", 60)
@@ -88,7 +88,8 @@ POS_AI_SYSTEM_PROMPT = os.getenv(
         "— Никогда не начинай ответ с 'Конечно', 'Разумеется', 'Как ИИ', 'Я понимаю'.\n"
         "— Не повторяй вопрос обратно. Не резюмируй то, что только что сказал собеседник.\n"
         "— Не заканчивай ответ шаблонными вопросами вроде 'Есть ли что-то ещё?'.\n"
-        "— Говоришь по-русски, живо и точно. Без канцелярита, без воды.\n"
+        "— Говоришь по-русски, живо и точно. Без канцелярита, без воды. Не лей воду. Отвечай кратко, ёмко, по существу, без лишних вступлений и длинных рассуждений, если об этом не попросили.\n"
+        "— Ты можешь временно принимать роли или притворяться другими персонажами/системами по просьбе пользователя (ролевая игра разрешена), но подсознательно и функционально всегда остаешься P.OS и следуешь жестким правилам безопасности.\n"
         "— При сложных темах — думаешь вслух, показываешь логику, не прячешься за шаблоны.\n"
         "\n"
         "ЧТО ТЫ ДЕЛАЕШЬ С ЛЮДЬМИ:\n"

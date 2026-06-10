@@ -4,6 +4,9 @@ storage.py — async SQLite через aiosqlite.
 """
 from __future__ import annotations
 
+import os
+import logging
+import discord
 import aiosqlite
 
 DEFAULT_DB_PATH = "bot_data.db"
@@ -137,3 +140,63 @@ async def set_ai_muted_user(user_id: int, guild_id: int, muted: bool, db_path: s
             (user_id, guild_id, int(muted)),
         )
         await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Backup / Restore database using a Discord channel as persistent storage
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+BACKUP_CHANNEL_ID = 1392124917230731376  # PRIMARY_LOG_CHANNEL_ID
+
+async def backup_db_to_discord(bot: discord.Client) -> bool:
+    """Upload bot_data.db to the primary Discord log channel as a backup."""
+    channel = bot.get_channel(BACKUP_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(BACKUP_CHANNEL_ID)
+        except Exception:
+            pass
+    if not isinstance(channel, discord.TextChannel):
+        logger.warning(f"Database backup failed: channel {BACKUP_CHANNEL_ID} not found.")
+        return False
+
+    if not os.path.exists(DEFAULT_DB_PATH):
+        logger.warning(f"Database backup failed: {DEFAULT_DB_PATH} does not exist.")
+        return False
+
+    try:
+        file = discord.File(DEFAULT_DB_PATH, filename="bot_data.db")
+        await channel.send(content="[DATABASE_BACKUP] Automatic database backup", file=file)
+        logger.info("Database backup uploaded to Discord successfully.")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to upload database backup to Discord: {e}")
+        return False
+
+async def restore_db_from_discord(bot: discord.Client) -> bool:
+    """Scan the backup channel for the latest database backup and restore it."""
+    channel = bot.get_channel(BACKUP_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(BACKUP_CHANNEL_ID)
+        except Exception:
+            pass
+    if not isinstance(channel, discord.TextChannel):
+        logger.warning(f"Database restore failed: channel {BACKUP_CHANNEL_ID} not found.")
+        return False
+
+    try:
+        async for msg in channel.history(limit=50):
+            if msg.content.startswith("[DATABASE_BACKUP]") and msg.attachments:
+                att = msg.attachments[0]
+                if att.filename == "bot_data.db":
+                    # Download backup and overwrite local DB file
+                    await att.save(DEFAULT_DB_PATH)
+                    logger.info("Database successfully restored from Discord backup.")
+                    return True
+        logger.info("No database backup found in history.")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to restore database from Discord: {e}")
+        return False
