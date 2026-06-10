@@ -68,6 +68,11 @@ async def run_bot() -> None:
 
     async def _shutdown() -> None:
         print("⚠️ Получен сигнал завершения, закрываем бота...")
+        try:
+            from storage import backup_db_to_discord
+            await backup_db_to_discord(bot)
+        except Exception as e:
+            print(f"Ошибка сохранения бэкапа перед остановкой: {e}")
         await bot.close()
 
     for sig in (signal.SIGTERM, signal.SIGINT):

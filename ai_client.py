@@ -91,15 +91,26 @@ def _provider_cooldown_remaining(index: int) -> float:
     return remaining if remaining > 0 else 0.0
 
 
-def _pick_provider_index() -> int | None:
+def _pick_provider_index(provider_type: str | None = None) -> int | None:
     if not _AI_PROVIDER_POOL:
         return None
     total = len(_AI_PROVIDER_POOL)
     start = _provider_cursor % total
+    
+    # 1. Try to find a working provider matching the requested provider_type
+    for offset in range(total):
+        idx = (start + offset) % total
+        if _provider_cooldown_remaining(idx) <= 0:
+            p = _AI_PROVIDER_POOL[idx]
+            if provider_type is None or p["provider"] == provider_type:
+                return idx
+                
+    # 2. If no matched provider is available/uncool, fallback to any available provider in the pool
     for offset in range(total):
         idx = (start + offset) % total
         if _provider_cooldown_remaining(idx) <= 0:
             return idx
+            
     return None
 
 
@@ -200,6 +211,7 @@ async def pos_chat_completion(
     temperature: float = POS_AI_TEMPERATURE,
     top_p: float = POS_AI_TOP_P,
     timeout: int = POS_AI_TIMEOUT_SECONDS,
+    provider_type: str | None = None,
 ) -> dict[str, Any] | None:
     if not _AI_PROVIDER_POOL or not any(provider.get("api_key") for provider in _AI_PROVIDER_POOL):
         return None
@@ -217,7 +229,7 @@ async def pos_chat_completion(
                     )
                     return None
 
-                provider_index = _pick_provider_index()
+                provider_index = _pick_provider_index(provider_type)
                 if provider_index is None:
                     shortest = min((_provider_cooldown_remaining(i) for i in range(len(_AI_PROVIDER_POOL))), default=5.0)
                     _set_ai_backoff(shortest, "all_providers_rate_limited")

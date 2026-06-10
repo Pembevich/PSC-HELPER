@@ -10,7 +10,7 @@ import logging
 import discord
 from PIL import Image, ImageOps
 from discord import Embed, Color
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 try:
     from moviepy import VideoFileClip, vfx
@@ -72,10 +72,33 @@ async def _send_update_log_if_needed(bot: commands.Bot):
 class GeneralCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.db_backup_task.start()
+
+    def cog_unload(self):
+        self.db_backup_task.cancel()
+
+    @tasks.loop(minutes=10)
+    async def db_backup_task(self):
+        await self.bot.wait_until_ready()
+        try:
+            from storage import backup_db_to_discord
+            await backup_db_to_discord(self.bot)
+        except Exception as e:
+            logger.error(f"Error backing up DB in task: {e}")
 
     @commands.Cog.listener()
     async def on_ready(self):
         logger.info(f"✅ Бот запущен как {self.bot.user} (id: {self.bot.user.id})")
+        
+        try:
+            from storage import restore_db_from_discord
+            did_restore = await restore_db_from_discord(self.bot)
+            if did_restore:
+                logger.info("✅ База данных успешно восстановлена из Discord резервной копии.")
+            else:
+                logger.info("ℹ️ Резервная копия базы данных не найдена на Discord. Сессия с чистого листа.")
+        except Exception as e:
+            logger.error(f"Ошибка при восстановлении базы данных: {e}", exc_info=True)
         runtime = collect_runtime_health()
         missing_optional = [k for k, available in runtime.items() if not available and k != "DISCORD_TOKEN"]
         if missing_optional:
