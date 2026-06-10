@@ -407,11 +407,16 @@ async def _format_author_profile(message: discord.Message) -> str:
     roles = []
     if isinstance(message.author, discord.Member):
         roles = [role.name for role in message.author.roles if role.name != "@everyone"][-12:]
+    
+    # Check if this user is the owner (Pumba)
+    is_owner = message.author.id in POS_OWNER_USER_IDS or message.author.id == 968698192411652176
+    status = "ВЛАДЕЛЕЦ / СОЗДАТЕЛЬ ПУМБА (Pumba)" if is_owner else "участник сервера"
+
     # Собираем поведенческий профиль: частота, стиль, темы
     word_counts = [len(m.split()) for m in recent if m]
     avg_len = round(sum(word_counts) / len(word_counts), 1) if word_counts else 0
     lines = [
-        f"Собеседник: {message.author.display_name} (`{message.author.id}`)",
+        f"Собеседник: {message.author.display_name} (Имя пользователя: @{message.author.name}, ID: `{message.author.id}`, Статус: {status})",
         f"Роли: {', '.join(roles) if roles else 'нет данных'}",
         f"Активность: {len(recent)} сообщений в памяти, средняя длина: {avg_len} слов",
     ]
