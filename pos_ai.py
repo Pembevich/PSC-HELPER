@@ -429,14 +429,20 @@ def _format_guild_snapshot(message: discord.Message, bot: discord.Client) -> str
     if not message.guild:
         return ""
     guild = message.guild
-    visible_guilds = ", ".join(f"{g.name} (`{g.id}`)" for g in bot.guilds[:20])
     bot_id = bot.user.id if bot.user else "?"
     bot_mention = f"<@{bot_id}>" if bot.user else "?"
+    
+    if _is_owner_user(message):
+        visible_guilds = ", ".join(f"{g.name} (`{g.id}`)" for g in bot.guilds[:20])
+        servers_info = f"\nСерверы, где присутствует P.OS: {visible_guilds or 'нет данных'}."
+    else:
+        servers_info = ""
+
     return (
         f"Это ты — P.OS. Твой Discord ID: `{bot_id}`, твоё упоминание: {bot_mention}.\n"
         f"Сервер: {guild.name} (`{guild.id}`), участников: {guild.member_count or 'неизвестно'}.\n"
-        f"Канал: #{getattr(message.channel, 'name', message.channel)} (`{message.channel.id}`).\n"
-        f"Серверы, где присутствует P.OS: {visible_guilds or 'нет данных'}."
+        f"Канал: #{getattr(message.channel, 'name', message.channel)} (`{message.channel.id}`)."
+        + servers_info
     )
 
 
@@ -559,7 +565,44 @@ async def request_pos_reply(bot: discord.Client, message: discord.Message | None
             
         tool_calls = response_msg.get("tool_calls")
         if not tool_calls:
-            return response_msg.get("content")
+            reply = response_msg.get("content")
+            if reply:
+                import re
+                cleaned_reply = reply
+                while True:
+                    # Match bracketed prefixes
+                    match = re.match(
+                        r"^\s*\[(?:Ответ\s+пользователю|Сообщение,\s+на\s+которое\s+отвечает\s+пользователь)[^\]]*\]\s*",
+                        cleaned_reply,
+                        re.IGNORECASE
+                    )
+                    if match:
+                        cleaned_reply = cleaned_reply[match.end():]
+                        continue
+                    
+                    # Match user prefixes "Name (@username, ID: 123):"
+                    match_user = re.match(
+                        r"^\s*[^@\n]+?\s*\(@?[a-zA-Z0-9_.-]+?,\s*ID:\s*\d+?\):\s*",
+                        cleaned_reply,
+                        re.IGNORECASE
+                    )
+                    if match_user:
+                        cleaned_reply = cleaned_reply[match_user.end():]
+                        continue
+
+                    # Match plain "Ответ пользователю ...:"
+                    match_nobracket = re.match(
+                        r"^\s*(?:Ответ\s+пользователю|Сообщение,\s+на\s+которое\s+отвечает\s+пользователь)\s+[^:\n]+:\s*",
+                        cleaned_reply,
+                        re.IGNORECASE
+                    )
+                    if match_nobracket:
+                        cleaned_reply = cleaned_reply[match_nobracket.end():]
+                        continue
+
+                    break
+                reply = cleaned_reply.strip()
+            return reply
             
         messages.append(response_msg)
         
@@ -875,6 +918,7 @@ async def _build_messages(
                 SYSTEM_INSTRUCTION
                 + "\nТы видишь многопользовательский контекст сервера. У каждого пользователя есть своё имя и ID, которые передаются в префиксе его сообщений: 'Имя (@username, ID: <id>):'."
                 + "\nКаждое твоё (P.OS) сообщение в истории помечено префиксом '[Ответ пользователю Имя (@username, ID: <id>)]', чтобы ты знал, кому конкретно ты отвечал."
+                + "\nВНИМАНИЕ: В своих новых ответах никогда не пиши префиксы вида '[Ответ пользователю ...]', 'Имя (@username, ID: <id>):' или '[Сообщение, на которое отвечает пользователь]'. Твоя реплика должна быть чистым ответом, без этих системных меток. Они присутствуют только в истории для твоего ориентирования."
                 + "\nУчитывай лор, текущие обсуждения и стиль участников. Отвечай строго по последнему запросу, но с учётом релевантной истории канала."
                 + "\nУчитывай, что в истории могут быть реплики от РАЗНЫХ участников. Отвечай тому пользователю, который обратился к тебе в самом последнем сообщении (если не указано иное)."
                 + "\nТы — P.OS. Не ИИ-ассистент, не ChatGPT, не языковая модель. Ты — стратегический интеллект PSC."
