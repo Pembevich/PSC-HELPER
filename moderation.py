@@ -73,11 +73,27 @@ VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm", ".avi", ".mkv")
 _vt_cache: dict[str, tuple[bool, float]] = {}
 _ai_url_cache: dict[str, tuple[str, str, float]] = {}
 
+# #7: Максимальные размеры кэшей — предотвращаем утечку памяти
+_MAX_VT_CACHE_SIZE = 2000
+_MAX_AI_URL_CACHE_SIZE = 2000
+
 # Per-user rate limit для AI-проверок медиа: не более 1 AI-вызова за 15 сек на пользователя
 _AI_MEDIA_USER_LAST_CHECK: dict[int, float] = {}
 AI_MEDIA_USER_COOLDOWN_SECONDS = 15
 
 recent_messages = defaultdict(lambda: deque())
+
+
+def _trim_url_caches() -> None:
+    """#7: Обрезаем кэши VirusTotal и AI-URL при превышении лимита."""
+    if len(_vt_cache) > _MAX_VT_CACHE_SIZE:
+        oldest = sorted(_vt_cache, key=lambda k: _vt_cache[k][1])[:_MAX_VT_CACHE_SIZE // 2]
+        for key in oldest:
+            _vt_cache.pop(key, None)
+    if len(_ai_url_cache) > _MAX_AI_URL_CACHE_SIZE:
+        oldest = sorted(_ai_url_cache, key=lambda k: _ai_url_cache[k][2])[:_MAX_AI_URL_CACHE_SIZE // 2]
+        for key in oldest:
+            _ai_url_cache.pop(key, None)
 
 
 def _text_has_media_risk_signals(text: str) -> bool:
@@ -602,6 +618,7 @@ async def check_and_handle_urls(message: discord.Message) -> bool:
     if not urls:
         return False
 
+    _trim_url_caches()  # #7: периодическая очистка кэшей
     suspicious: list[tuple[str, str]] = []
     borderline: list[dict] = []
 

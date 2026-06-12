@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import base64
+import datetime
 import io
+import json
+import random as _random
 import re
+import shutil
 import asyncio
 import time
 from collections import defaultdict, deque
@@ -33,13 +37,20 @@ from commands import generate_gif_from_attachments, parse_gif_options_from_text
 from logging_utils import is_log_channel
 from storage import add_entry, delete_entry, list_entries, get_ai_context, update_ai_context, is_ai_muted, set_ai_muted_user
 from cogs.ai_tools import POS_AI_TOOLS
-import json
+
+
+# --- Константа: инструменты только для владельца ---
+_OWNER_ONLY_TOOLS = frozenset({
+    "ban_user", "unban_user", "timeout_user",
+    "add_role", "remove_role",
+    "mute_ai_for_user", "unmute_ai_for_user",
+})
 
 
 async def execute_pos_tool(bot: discord.Client, message: discord.Message | None, tool_call: dict) -> str:
     if not message or not message.guild:
         return "Ошибка: инструмент можно использовать только на сервере."
-    
+
     func = tool_call.get("function", {})
     name = func.get("name")
     args_raw = func.get("arguments", "{}")
@@ -47,44 +58,63 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
         args = json.loads(args_raw)
     except Exception:
         args = {}
-        
+
     user_id = int(args.get("user_id", 0)) if args.get("user_id") else None
-    
-    if name in ("ban_user", "unban_user", "timeout_user", "add_role", "remove_role"):
+
+    # --- #1/#2: Все инструменты управления требуют прав владельца ---
+    if name in _OWNER_ONLY_TOOLS:
         if message.author.id not in POS_OWNER_USER_IDS:
             owner_id = POS_OWNER_USER_IDS[0] if POS_OWNER_USER_IDS else 968698192411652176
             owner = bot.get_user(owner_id)
             if owner:
-                action_name = {"ban_user": "бан", "unban_user": "разбан", "timeout_user": "мут", "add_role": "выдачу роли", "remove_role": "снятие роли"}.get(name, name)
-                user_name = getattr(message.guild.get_member(user_id), "name", str(user_id)) if user_id and message.guild else str(user_id)
+                action_name = {
+                    "ban_user": "бан", "unban_user": "разбан", "timeout_user": "мут",
+                    "add_role": "выдачу роли", "remove_role": "снятие роли",
+                    "mute_ai_for_user": "блокировку ответов", "unmute_ai_for_user": "снятие блокировки",
+                }.get(name, name)
+                user_name = getattr(message.guild.get_member(user_id), "name", str(user_id)) if user_id else str(user_id)
                 reason = args.get("reason", args.get("role_id_or_name", "Причина не указана"))
                 try:
-                    await owner.send(f"⚠️ **Запрос на {action_name} от ИИ P.OS**\nПользователь: {user_name} (`{user_id}`)\nПричина/Роль: {reason}\nКонтекст: {message.jump_url}")
+                    await owner.send(
+                        f"⚠️ **Запрос на {action_name} от ИИ P.OS**\n"
+                        f"Пользователь: {user_name} (`{user_id}`)\n"
+                        f"Причина/Роль: {reason}\nКонтекст: {message.jump_url}"
+                    )
                 except Exception:
                     pass
-            return f"Отказано в доступе. Запрос на {name} отправлен владельцу на подтверждение. Я не могу наказывать сам, поэтому уведомил владельца."
+            return f"Отказано в доступе. Запрос на {name} отправлен владельцу на подтверждение."
+
+    # --- #8: Защита бота и владельца от инструментов ---
+    _protected_ids = set(POS_OWNER_USER_IDS)
+    if bot.user:
+        _protected_ids.add(bot.user.id)
+    if user_id and user_id in _protected_ids:
+        return "Ошибка: это действие нельзя применить к владельцу или к самому боту."
 
     if name == "ban_user":
-        if not user_id: return "Ошибка: не указан user_id"
+        if not user_id:
+            return "Ошибка: не указан user_id"
         reason = args.get("reason", "Бан от P.OS")
         try:
             await message.guild.ban(discord.Object(id=user_id), reason=reason)
             return f"Пользователь {user_id} успешно забанен."
         except Exception as e:
             return f"Ошибка при бане: {e}"
-            
+
     elif name == "unban_user":
-        if not user_id: return "Ошибка: не указан user_id"
+        if not user_id:
+            return "Ошибка: не указан user_id"
         try:
             await message.guild.unban(discord.Object(id=user_id))
             return f"Пользователь {user_id} успешно разбанен."
         except Exception as e:
             return f"Ошибка при разбане: {e}"
-            
+
     elif name == "timeout_user":
-        if not user_id: return "Ошибка: не указан user_id"
+        if not user_id:
+            return "Ошибка: не указан user_id"
         try:
-            minutes = int(args.get("minutes", 10))
+            minutes = max(1, min(int(args.get("minutes", 10)), 40320))  # #14: bounds 1..40320 мин
         except (ValueError, TypeError):
             minutes = 10
         reason = args.get("reason", "Тайм-аут от P.OS")
@@ -94,17 +124,18 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
                 member = await message.guild.fetch_member(user_id)
             except Exception:
                 pass
-        if not member: return f"Ошибка: пользователь {user_id} не найден на сервере."
-        import datetime
+        if not member:
+            return f"Ошибка: пользователь {user_id} не найден на сервере."
         try:
             until = discord.utils.utcnow() + datetime.timedelta(minutes=minutes)
             await member.timeout(until, reason=reason)
             return f"Пользователю {user_id} выдан тайм-аут на {minutes} минут."
         except Exception as e:
             return f"Ошибка при муте: {e}"
-            
+
     elif name == "add_role":
-        if not user_id: return "Ошибка: не указан user_id"
+        if not user_id:
+            return "Ошибка: не указан user_id"
         role_ident = args.get("role_id_or_name", "")
         member = message.guild.get_member(user_id)
         if not member:
@@ -112,21 +143,24 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
                 member = await message.guild.fetch_member(user_id)
             except Exception:
                 pass
-        if not member: return "Ошибка: пользователь не найден."
+        if not member:
+            return "Ошибка: пользователь не найден."
         role = None
         if role_ident.isdigit():
             role = message.guild.get_role(int(role_ident))
         if not role:
             role = discord.utils.find(lambda r: r.name.lower() == role_ident.lower(), message.guild.roles)
-        if not role: return f"Ошибка: роль '{role_ident}' не найдена."
+        if not role:
+            return f"Ошибка: роль '{role_ident}' не найдена."
         try:
             await member.add_roles(role, reason="Выдано P.OS")
             return f"Роль {role.name} успешно выдана пользователю {user_id}."
         except Exception as e:
             return f"Ошибка при выдаче роли: {e}"
-            
+
     elif name == "remove_role":
-        if not user_id: return "Ошибка: не указан user_id"
+        if not user_id:
+            return "Ошибка: не указан user_id"
         role_ident = args.get("role_id_or_name", "")
         member = message.guild.get_member(user_id)
         if not member:
@@ -134,35 +168,39 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
                 member = await message.guild.fetch_member(user_id)
             except Exception:
                 pass
-        if not member: return "Ошибка: пользователь не найден."
+        if not member:
+            return "Ошибка: пользователь не найден."
         role = None
         if role_ident.isdigit():
             role = message.guild.get_role(int(role_ident))
         if not role:
             role = discord.utils.find(lambda r: r.name.lower() == role_ident.lower(), message.guild.roles)
-        if not role: return f"Ошибка: роль '{role_ident}' не найдена."
+        if not role:
+            return f"Ошибка: роль '{role_ident}' не найдена."
         try:
             await member.remove_roles(role, reason="Снято P.OS")
             return f"Роль {role.name} успешно снята с пользователя {user_id}."
         except Exception as e:
             return f"Ошибка при снятии роли: {e}"
-            
+
     elif name == "mute_ai_for_user":
-        if not user_id: return "Ошибка: не указан user_id"
+        if not user_id:
+            return "Ошибка: не указан user_id"
         try:
             await set_ai_muted_user(user_id, message.guild.id, True)
-            return f"Я добавил пользователя {user_id} в черный список (я больше не буду ему отвечать)."
+            return f"Пользователь {user_id} добавлен в чёрный список."
         except Exception as e:
             return f"Ошибка базы данных: {e}"
-            
+
     elif name == "unmute_ai_for_user":
-        if not user_id: return "Ошибка: не указан user_id"
+        if not user_id:
+            return "Ошибка: не указан user_id"
         try:
             await set_ai_muted_user(user_id, message.guild.id, False)
-            return f"Я удалил пользователя {user_id} из черного списка (теперь буду отвечать)."
+            return f"Пользователь {user_id} удалён из чёрного списка."
         except Exception as e:
             return f"Ошибка базы данных: {e}"
-            
+
     return f"Неизвестный инструмент: {name}"
 
 AI_COOLDOWN_SECONDS = 1.5  # уменьшен для живого диалога
@@ -188,6 +226,9 @@ _muted_users: set[tuple[int, int]] = set()
 # In-memory per-(guild, user) message cache — populated by remember_server_message.
 # Used by _format_author_profile to build behavioural context without hitting the DB.
 _user_memory: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=20))
+
+# --- #4: Максимальные размеры кэшей для предотвращения утечки памяти ---
+_MAX_CACHE_SIZE = 5000
 AI_NAME_PATTERN = re.compile(r"(?<!\w)(?:p[\s.\-_]*o[\s.\-_]*s|п[\s.\-_]*о[\s.\-_]*с)(?!\w)", re.IGNORECASE)
 GIF_INTENT_PATTERN = re.compile(r"\b(сделай|создай|собери|сгенерируй|convert|make)\b.*\b(gif|гиф)\b|\b(gif|гиф)\b", re.IGNORECASE)
 MUTE_PATTERN = re.compile(r"(не\s*отвечай|не\s*пиши|игнорируй\s*меня|молчи\s*со\s*мной)", re.IGNORECASE)
@@ -522,8 +563,7 @@ def _is_unmute_request(text: str) -> bool:
     return bool(UNMUTE_PATTERN.search(text or ""))
 
 
-def _looks_like_admin_action(text: str) -> bool:
-    return False
+# #15: функция-заглушка убрана — проверка прав реализована явно в execute_pos_tool
 
 
 def _should_send_rate_limit_notice(channel_id: int, window_seconds: int = 20) -> bool:
@@ -726,14 +766,23 @@ def _resolve_guild(bot: discord.Client, message: discord.Message, text: str) -> 
     return message.guild
 
 
-def _resolve_target_user_id(message: discord.Message, text: str, ref_msg: Optional[discord.Message], guild: discord.Guild | None = None) -> int | None:
+def _resolve_target_user_id(message: discord.Message, text: str, ref_msg: Optional[discord.Message], guild: discord.Guild | None = None, bot: discord.Client | None = None) -> int | None:
+    # #11: Исключаем из поиска владельцев и самого бота
+    _protected: set[int] = set(POS_OWNER_USER_IDS)
+    if bot and bot.user:
+        _protected.add(bot.user.id)
+
     if message.mentions:
-        return message.mentions[0].id
+        candidate = message.mentions[0].id
+        if candidate not in _protected:
+            return candidate
     if ref_msg and ref_msg.author and not ref_msg.author.bot:
-        return ref_msg.author.id
+        if ref_msg.author.id not in _protected:
+            return ref_msg.author.id
 
     ignored_ids = {guild.id} if guild else set()
     ignored_ids.update(role.id for role in message.role_mentions)
+    ignored_ids.update(_protected)
     for user_id in _extract_discord_ids(text):
         if user_id not in ignored_ids:
             return user_id
@@ -742,6 +791,8 @@ def _resolve_target_user_id(message: discord.Message, text: str, ref_msg: Option
     if guild:
         lowered = (text or "").lower()
         for member in guild.members:
+            if member.id in _protected:
+                continue
             uname = (member.name or "").lower()
             dname = (member.display_name or "").lower()
             if uname and uname in lowered:
@@ -1163,7 +1214,7 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
             return True
 
     if BAN_PATTERN.search(text):
-        target_id = _resolve_target_user_id(message, text, ref_msg, guild)
+        target_id = _resolve_target_user_id(message, text, ref_msg, guild, bot)
         if not target_id:
             await message.reply(
                 "Укажи пользователя для бана: упоминанием, ответом на сообщение или ID.",
@@ -1237,8 +1288,28 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
         return True
 
 
+def _trim_cache_if_needed() -> None:
+    """#4: Обрезаем глобальные кэши при превышении лимита."""
+    if len(_last_user_call) > _MAX_CACHE_SIZE:
+        # Удаляем самые старые записи (наименьшее время)
+        oldest = sorted(_last_user_call, key=lambda k: _last_user_call[k])[:_MAX_CACHE_SIZE // 2]
+        for key in oldest:
+            _last_user_call.pop(key, None)
+    if len(_last_rate_limit_notice) > _MAX_CACHE_SIZE:
+        oldest = sorted(_last_rate_limit_notice, key=lambda k: _last_rate_limit_notice[k])[:_MAX_CACHE_SIZE // 2]
+        for key in oldest:
+            _last_rate_limit_notice.pop(key, None)
+    if len(_conversation_state) > _MAX_CACHE_SIZE:
+        # Удаляем самые старые по last_ts
+        oldest = sorted(_conversation_state, key=lambda k: _conversation_state[k].get("last_ts", 0))[:_MAX_CACHE_SIZE // 2]
+        for key in oldest:
+            _conversation_state.pop(key, None)
+
+
 async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
     global _missing_key_warned
+
+    _trim_cache_if_needed()  # #4: периодическая очистка кэшей
 
     if _should_skip_message(message, bot):
         return False
@@ -1250,15 +1321,7 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
     if not explicit_addressing:
         return False
 
-    if _looks_like_admin_action(message.content or "") and not _is_owner_user(message):
-        await message.reply(
-            "Команды управления P.OS принимает только от владельца с подтверждённым Discord ID.",
-            mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        return True
-
-    if await _handle_owner_actions(message, ref_msg, bot):
+    if await _handle_owner_actions(message, ref_msg, bot):  # type: ignore[arg-type]
         _touch_state(message.channel, message.author.id, bot_replied=True)
         return True
 
@@ -1393,7 +1456,6 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
                     "На связи. Дай немного времени.",
                     "Слушаю. Потребуется момент.",
                 ]
-                import random as _random
                 try:
                     await message.reply(
                         _random.choice(_FALLBACK_REPLIES),

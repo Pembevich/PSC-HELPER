@@ -147,10 +147,17 @@ async def set_ai_muted_user(user_id: int, guild_id: int, muted: bool, db_path: s
 # ---------------------------------------------------------------------------
 
 logger = logging.getLogger(__name__)
-BACKUP_CHANNEL_ID = 1392124917230731376  # PRIMARY_LOG_CHANNEL_ID
+# #13: Бэкап базы идёт в отдельный канал, НЕ совпадающий с логами модерации.
+# Если переменная среды не задана — бэкап отключен и данные хранятся только локально.
+BACKUP_CHANNEL_ID = int(os.getenv("DB_BACKUP_CHANNEL_ID", "0")) or 0
+_SQLITE_MAGIC = b"SQLite format 3"  # первые 15 байт любого валидного файла SQLite
 
 async def backup_db_to_discord(bot: discord.Client) -> bool:
-    """Upload bot_data.db to the primary Discord log channel as a backup."""
+    """Upload bot_data.db to the dedicated DB backup channel (DB_BACKUP_CHANNEL_ID env var)."""
+    # #13: Не делаем бэкап, если канал не настроен
+    if not BACKUP_CHANNEL_ID:
+        logger.info("Database backup skipped: DB_BACKUP_CHANNEL_ID not configured.")
+        return False
     channel = bot.get_channel(BACKUP_CHANNEL_ID)
     if not channel:
         try:
@@ -176,6 +183,10 @@ async def backup_db_to_discord(bot: discord.Client) -> bool:
 
 async def restore_db_from_discord(bot: discord.Client) -> bool:
     """Scan the backup channel for the latest database backup and restore it."""
+    # #13: Не выполняем восстановление, если канал не настроен
+    if not BACKUP_CHANNEL_ID:
+        logger.info("Database restore skipped: DB_BACKUP_CHANNEL_ID not configured.")
+        return False
     channel = bot.get_channel(BACKUP_CHANNEL_ID)
     if not channel:
         try:
@@ -191,8 +202,17 @@ async def restore_db_from_discord(bot: discord.Client) -> bool:
             if msg.content.startswith("[DATABASE_BACKUP]") and msg.attachments:
                 att = msg.attachments[0]
                 if att.filename == "bot_data.db":
-                    # Download backup and overwrite local DB file
-                    await att.save(DEFAULT_DB_PATH)
+                    # #3: Проверяем максимальный размер (100 МБ) и magic bytes SQLite
+                    if att.size and att.size > 100 * 1024 * 1024:
+                        logger.warning(f"Database restore aborted: backup file too large ({att.size} bytes).")
+                        return False
+                    raw = await att.read()
+                    if not raw.startswith(_SQLITE_MAGIC):
+                        logger.warning("Database restore aborted: backup file does not look like a valid SQLite database.")
+                        return False
+                    # Всё проверено — записываем
+                    with open(DEFAULT_DB_PATH, "wb") as f:
+                        f.write(raw)
                     logger.info("Database successfully restored from Discord backup.")
                     return True
         logger.info("No database backup found in history.")
