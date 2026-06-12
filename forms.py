@@ -38,10 +38,25 @@ class ConfirmView(View):
         if interaction.user.bot:
             await interaction.response.send_message("Ботам тут делать нечего.", ephemeral=True)
             return False
-        if interaction.guild:
-            return True
-        await interaction.response.send_message("❌ Не удалось проверить участника сервера.", ephemeral=True)
-        return False
+        if not interaction.guild:
+            await interaction.response.send_message("❌ Не удалось проверить участника сервера.", ephemeral=True)
+            return False
+        # #9: Проверяем, что нажимающий имеет одну из разрешённых ролей проверяющего
+        if self.allowed_checker_role_ids:
+            member = interaction.guild.get_member(interaction.user.id)
+            if not member:
+                try:
+                    member = await interaction.guild.fetch_member(interaction.user.id)
+                except Exception:
+                    member = None
+            if not member:
+                await interaction.response.send_message("❌ Не удалось найти участника сервера.", ephemeral=True)
+                return False
+            user_role_ids = {role.id for role in member.roles}
+            if not user_role_ids.intersection(self.allowed_checker_role_ids):
+                await interaction.response.send_message("❌ У вас нет прав для обработки этой заявки.", ephemeral=True)
+                return False
+        return True
 
     @button(label="Принять", style=discord.ButtonStyle.green)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
