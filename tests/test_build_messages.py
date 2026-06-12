@@ -121,6 +121,46 @@ class BuildMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chat_msgs[3]["name"], "user_968698192411652176")
         self.assertIn("Pumba (@pumba, ID: 968698192411652176): Тест", chat_msgs[3]["content"])
 
+    @patch("pos_ai.pos_chat_completion")
+    async def test_request_pos_reply_strips_metadata(self, mock_chat):
+        from pos_ai import request_pos_reply
+        
+        bot = MagicMock(spec=discord.Client)
+        bot.user = MagicMock(spec=discord.ClientUser)
+        bot.user.id = 999999
+        
+        # Test case 1: strips bracketed reply prefix
+        mock_chat.return_value = {
+            "role": "assistant",
+            "content": "[Ответ пользователю Pumba (@pumba, ID: 968698192411652176)]\nПривет!"
+        }
+        res = await request_pos_reply(bot, None, [])
+        self.assertEqual(res, "Привет!")
+
+        # Test case 2: strips multiple prefixes (reply + source)
+        mock_chat.return_value = {
+            "role": "assistant",
+            "content": "[Сообщение, на которое отвечает пользователь (P.OS)]\n[Ответ пользователю Pumba (@pumba, ID: 968698192411652176)]\nПривет!"
+        }
+        res = await request_pos_reply(bot, None, [])
+        self.assertEqual(res, "Привет!")
+
+        # Test case 3: strips unbracketed reply prefix
+        mock_chat.return_value = {
+            "role": "assistant",
+            "content": "Ответ пользователю Pumba (@pumba, ID: 968698192411652176): Привет!"
+        }
+        res = await request_pos_reply(bot, None, [])
+        self.assertEqual(res, "Привет!")
+
+        # Test case 4: strips user script header prefix
+        mock_chat.return_value = {
+            "role": "assistant",
+            "content": "Pumba (@pumba, ID: 968698192411652176): Привет!"
+        }
+        res = await request_pos_reply(bot, None, [])
+        self.assertEqual(res, "Привет!")
+
 
 if __name__ == "__main__":
     unittest.main()
