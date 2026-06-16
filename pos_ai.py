@@ -16,6 +16,9 @@ import discord
 from PIL import Image, ImageOps
 from discord.utils import escape_markdown, escape_mentions
 
+# #4: Защита от декомпрессионных бомб (см. moderation.py).
+Image.MAX_IMAGE_PIXELS = 24_000_000
+
 from ai_client import (
     ai_cooldown_remaining,
     ai_is_temporarily_unavailable,
@@ -222,7 +225,6 @@ _last_user_call: dict[int, float] = {}
 _conversation_state: dict[int, dict] = {}
 _last_rate_limit_notice: dict[int, float] = {}
 _missing_key_warned = False
-_muted_users: set[tuple[int, int]] = set()
 # In-memory per-(guild, user) message cache — populated by remember_server_message.
 # Used by _format_author_profile to build behavioural context without hitting the DB.
 _user_memory: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=20))
@@ -252,6 +254,22 @@ def _strip_bot_mention(text: str, bot_id: int) -> str:
     if not text:
         return ""
     return text.replace(f"<@{bot_id}>", "").replace(f"<@!{bot_id}>", "").strip()
+
+
+def _strip_address_prefix(text: str, bot: discord.Client) -> str:
+    """#11: Снять обращение к боту в начале строки, вернуть тело команды.
+
+    Убирает ведущий меншен бота и имя P.OS/пос с разделителями, чтобы
+    последующий .match() видел глагол команды первым. Так "P.OS, забань ..."
+    распознаётся как команда, а "P.OS, думаешь стоит забанить?" — нет.
+    """
+    body = text or ""
+    if bot.user:
+        body = _strip_bot_mention(body, bot.user.id)
+    body = body.lstrip(" \t\n.,:;!—-")
+    # Снимаем ведущее имя бота (P.OS / П.ОС в разных написаниях) + разделители.
+    body = re.sub(r"^\s*(?:p[\s.\-_]*o[\s.\-_]*s|п[\s.\-_]*о[\s.\-_]*с)\b[\s,.:;!—-]*", "", body, flags=re.IGNORECASE)
+    return body.strip()
 
 
 def _is_image_attachment(att: discord.Attachment) -> bool:
@@ -540,19 +558,8 @@ async def _collect_recent_media_attachments(message: discord.Message, limit: int
     return attachments
 
 
-def _mute_key(message: discord.Message) -> tuple[int, int] | None:
-    if not message.guild:
-        return None
-    return (message.guild.id, message.author.id)
-
-
 def _is_owner_user(message: discord.Message) -> bool:
     return message.author.id in POS_OWNER_USER_IDS
-
-
-def _is_user_muted(message: discord.Message) -> bool:
-    key = _mute_key(message)
-    return bool(key and key in _muted_users)
 
 
 def _is_mute_request(text: str) -> bool:
@@ -1096,6 +1103,10 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
     if not _is_owner_user(message):
         return False
     text = (message.content or "").strip()
+    # #11: тело команды без обращения к боту в начале строки. Деструктивные действия
+    # (бан/разбан/роли) выполняем ТОЛЬКО если глагол стоит в начале команды, иначе
+    # владелец, обсуждая "может стоит забанить васю?", случайно банит.
+    command_body = _strip_address_prefix(text, bot)
 
     if HELP_PATTERN.search(text):
         return await _send_owner_help(message, bot)
@@ -1141,7 +1152,7 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
             )
         return True
 
-    if ADD_ROLE_PATTERN.search(text) or REMOVE_ROLE_PATTERN.search(text):
+    if ADD_ROLE_PATTERN.match(command_body) or REMOVE_ROLE_PATTERN.match(command_body):
         # Сначала резолвим роль — по @mention роли или по ID из guild.roles
         role = _resolve_role(message, guild, text)
 
@@ -1193,7 +1204,7 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
             return True
 
         try:
-            if ADD_ROLE_PATTERN.search(text):
+            if ADD_ROLE_PATTERN.match(command_body):
                 await member.add_roles(role, reason=f"P.OS owner command by {message.author}")
                 action_text = "выдана"
             else:
@@ -1213,7 +1224,7 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
             )
             return True
 
-    if BAN_PATTERN.search(text):
+    if BAN_PATTERN.match(command_body):
         target_id = _resolve_target_user_id(message, text, ref_msg, guild, bot)
         if not target_id:
             await message.reply(
@@ -1241,7 +1252,7 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
             )
             return True
 
-    if not UNBAN_PATTERN.search(text):
+    if not UNBAN_PATTERN.match(command_body):
         return False
 
     target_id: int | None = None
@@ -1288,6 +1299,21 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
         return True
 
 
+def check_user_cooldown(user_id: int, *, update: bool = True) -> bool:
+    """#6: Единая проверка per-user кулдауна для запросов к P.OS.
+
+    Возвращает True, если пользователь СЕЙЧАС на кулдауне (запрос надо отклонить).
+    При update=True и отсутствии кулдауна обновляет отметку времени.
+    """
+    now = time.time()
+    last = _last_user_call.get(user_id, 0.0)
+    if now - last < AI_COOLDOWN_SECONDS:
+        return True
+    if update:
+        _last_user_call[user_id] = now
+    return False
+
+
 def _trim_cache_if_needed() -> None:
     """#4: Обрезаем глобальные кэши при превышении лимита."""
     if len(_last_user_call) > _MAX_CACHE_SIZE:
@@ -1326,10 +1352,10 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
         return True
 
     text = message.content or ""
-    mute_key = _mute_key(message)
     if _is_mute_request(text):
-        if mute_key:
-            _muted_users.add(mute_key)
+        # #9: пишем мут в БД (единый источник истины), чтобы он переживал рестарт
+        # и совпадал с tool-инструментом mute_ai_for_user.
+        await set_ai_muted_user(message.author.id, message.guild.id, True)
         await message.reply(
             "Принято. Для тебя в этом сервере замолкаю до команды на возврат.",
             mention_author=False,
@@ -1338,8 +1364,7 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
         return True
 
     if _is_unmute_request(text):
-        if mute_key:
-            _muted_users.discard(mute_key)
+        await set_ai_muted_user(message.author.id, message.guild.id, False)
         await message.reply(
             "Принято. Снова на связи и готов работать по твоим запросам.",
             mention_author=False,
@@ -1394,11 +1419,8 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
             )
             return True
 
-    now = time.time()
-    last = _last_user_call.get(message.author.id, 0.0)
-    if now - last < AI_COOLDOWN_SECONDS:
+    if check_user_cooldown(message.author.id):
         return False
-    _last_user_call[message.author.id] = now
 
     if not POS_AI_API_KEY:
         if not _missing_key_warned:

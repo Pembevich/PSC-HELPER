@@ -21,6 +21,11 @@ from PIL import Image, ImageOps
 from discord import Color, Embed
 import imageio_ffmpeg
 
+# #4: Защита от декомпрессионных бомб. Маленький файл может развернуться в
+# гигабайты пикселей и положить процесс при .convert()/.thumbnail().
+# 24 Мп с запасом хватает для легитимных фото (6000x4000), бомбы отсекаются.
+Image.MAX_IMAGE_PIXELS = 24_000_000
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,6 +87,22 @@ _AI_MEDIA_USER_LAST_CHECK: dict[int, float] = {}
 AI_MEDIA_USER_COOLDOWN_SECONDS = 15
 
 recent_messages = defaultdict(lambda: deque())
+_last_spam_prune = 0.0
+_SPAM_PRUNE_INTERVAL = 60.0
+
+
+def _prune_spam_tracker(now: float) -> None:
+    """#8: Удаляем очереди, в которых не осталось свежих сообщений."""
+    global _last_spam_prune
+    if now - _last_spam_prune < _SPAM_PRUNE_INTERVAL:
+        return
+    _last_spam_prune = now
+    for uid in list(recent_messages.keys()):
+        queue = recent_messages[uid]
+        while queue and now - queue[0][1] > SPAM_WINDOW_SECONDS:
+            queue.popleft()
+        if not queue:
+            recent_messages.pop(uid, None)
 
 
 def _trim_url_caches() -> None:
@@ -139,13 +160,28 @@ def _normalize_domain(raw_domain: str) -> str:
         return raw_domain.lower()
 
 
+def _keyword_is_domain_token(keyword: str, normalized_domain: str) -> bool:
+    """True, если keyword присутствует в домене как отдельный токен.
+
+    Токен ограничен краями строки или не-буквенными символами. Так "bet"
+    матчит bet.com, my-bet.net, bet365.com (граница перед цифрами), но НЕ
+    betterhelp.com и не essex.com. Дефисы в keyword (free-robux) экранируются.
+    """
+    if not keyword:
+        return False
+    pattern = r"(?<![a-z0-9])" + re.escape(keyword.lower()) + r"(?![a-z])"
+    return re.search(pattern, normalized_domain) is not None
+
+
 def _domain_matches_blacklist(domain: str) -> bool:
     normalized = _normalize_domain(domain)
     for bad in SUSPICIOUS_DOMAINS:
         if normalized == bad or normalized.endswith("." + bad):
             return True
+    # #7: keyword сверяем как отдельный токен в пределах домена, а не подстрокой.
+    # Иначе "sex" ловит essex.com, "bet" — betterhelp.com, "cams" — любой *cams*.
     for keyword in SUSPICIOUS_KEYWORDS:
-        if keyword in normalized:
+        if _keyword_is_domain_token(keyword, normalized):
             return True
     return False
 
@@ -834,6 +870,10 @@ async def handle_spam_if_needed(message: discord.Message):
 
     while queue and now - queue[0][1] > SPAM_WINDOW_SECONDS:
         queue.popleft()
+
+    # #8: периодически выметаем пустые/протухшие очереди ушедших пользователей,
+    # иначе recent_messages растёт по числу всех когда-либо писавших юзеров.
+    _prune_spam_tracker(now)
 
     count = sum(1 for entry_key, _, _, _ in queue if entry_key == key)
     if count < SPAM_DUPLICATES_THRESHOLD:

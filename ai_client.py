@@ -27,6 +27,10 @@ from config import (
 )
 
 _AI_REQUEST_SEMAPHORE = asyncio.Semaphore(max(1, POS_AI_MAX_CONCURRENT_REQUESTS))
+# #14: защищаем read-modify-write общих _provider_cursor/_provider_backoff_until,
+# чтобы при POS_AI_MAX_CONCURRENT_REQUESTS > 1 два запроса не выбрали один индекс
+# и курсор не «перескакивал».
+_provider_lock = asyncio.Lock()
 _ai_backoff_until = 0.0
 _ai_backoff_reason = ""
 _ai_last_backoff_log_at = 0.0
@@ -112,6 +116,24 @@ def _pick_provider_index(provider_type: str | None = None) -> int | None:
             return idx
             
     return None
+
+
+async def _reserve_provider_index(provider_type: str | None = None) -> int | None:
+    """#14: Атомарно выбрать провайдера и сдвинуть курсор под локом."""
+    global _provider_cursor
+    async with _provider_lock:
+        idx = _pick_provider_index(provider_type)
+        if idx is not None:
+            _provider_cursor = (idx + 1) % len(_AI_PROVIDER_POOL)
+        return idx
+
+
+async def _mark_provider_backoff(index: int, seconds: float) -> None:
+    """#14: Атомарно продлить кулдаун провайдера под локом."""
+    async with _provider_lock:
+        _provider_backoff_until[index] = max(
+            _provider_backoff_until.get(index, 0.0), time.monotonic() + seconds
+        )
 
 
 def _set_ai_backoff(seconds: float, reason: str) -> None:
@@ -229,7 +251,7 @@ async def pos_chat_completion(
                     )
                     return None
 
-                provider_index = _pick_provider_index(provider_type)
+                provider_index = await _reserve_provider_index(provider_type)
                 if provider_index is None:
                     shortest = min((_provider_cooldown_remaining(i) for i in range(len(_AI_PROVIDER_POOL))), default=5.0)
                     _set_ai_backoff(shortest, "all_providers_rate_limited")
@@ -239,7 +261,6 @@ async def pos_chat_completion(
                     return None
 
                 provider = _AI_PROVIDER_POOL[provider_index]
-                _provider_cursor = (provider_index + 1) % len(_AI_PROVIDER_POOL)
 
                 accept_header = "application/vnd.github+json" if provider["provider"] == "github_models" else "application/json"
                 payload = {
@@ -269,23 +290,18 @@ async def pos_chat_completion(
                         response_text = await resp.text()
                         if _looks_like_rate_limit(resp.status, response_text, resp.headers):
                             retry_after = _parse_retry_after(resp.headers) or POS_AI_RATE_LIMIT_FALLBACK_SECONDS
-                            _provider_backoff_until[provider_index] = max(
-                                _provider_backoff_until.get(provider_index, 0.0), time.monotonic() + retry_after
-                            )
+                            await _mark_provider_backoff(provider_index, retry_after)
                             _log_ai_backoff_once(
                                 f"P.OS API rate limited ({provider['name']}): pause for {retry_after:.0f}s."
                             )
-                            next_idx = _pick_provider_index()
+                            next_idx = await _reserve_provider_index()
                             if next_idx is not None and next_idx != provider_index:
-                                _provider_cursor = next_idx
                                 continue  # retry next provider
                             _set_ai_backoff(min(retry_after, 30.0), "rate_limited")
                             return None
 
                         if resp.status >= 500:
-                            _provider_backoff_until[provider_index] = max(
-                                _provider_backoff_until.get(provider_index, 0.0), time.monotonic() + 8.0
-                            )
+                            await _mark_provider_backoff(provider_index, 8.0)
                             print(f"P.OS upstream error {resp.status} ({provider['name']}): {response_text[:300]}")
                             if _pick_provider_index() is not None:
                                 continue  # retry next provider
@@ -297,7 +313,7 @@ async def pos_chat_completion(
                                 print("P.OS GitHub Models auth error.")
                             print(f"P.OS API error {resp.status} ({provider['name']}): {response_text[:500]}")
                             # Cool down this provider for 1 hour to prevent hitting bad credentials/models repeatedly
-                            _provider_backoff_until[provider_index] = time.monotonic() + 3600.0
+                            await _mark_provider_backoff(provider_index, 3600.0)
                             if attempt < max_attempts - 1:
                                 continue
                             return None
@@ -309,9 +325,9 @@ async def pos_chat_completion(
         except Exception as exc:
             exc_str = str(exc).lower()
             if "rate" in exc_str or "limit" in exc_str or "quota" in exc_str:
-                _provider_backoff_until[provider_index] = time.monotonic() + 20.0
+                await _mark_provider_backoff(provider_index, 20.0)
             else:
-                _provider_backoff_until[provider_index] = time.monotonic() + 60.0
+                await _mark_provider_backoff(provider_index, 60.0)
             print(f"P.OS API request failed ({provider['name']}): {exc}")
             if attempt < max_attempts - 1:
                 continue

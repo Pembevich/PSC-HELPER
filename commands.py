@@ -15,6 +15,9 @@ from PIL import Image, ImageOps
 from discord import Embed, Color
 from discord.ext import commands
 
+# #4: Защита от декомпрессионных бомб (см. moderation.py).
+Image.MAX_IMAGE_PIXELS = 24_000_000
+
 try:
     from moviepy import VideoFileClip, vfx
 except Exception:

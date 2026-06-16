@@ -71,6 +71,10 @@ async def _send_update_log_if_needed(bot: commands.Bot):
 class GeneralCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        # #2: on_ready срабатывает при КАЖDOM реконнекте. Восстановление БД
+        # должно выполняться один раз за процесс, иначе свежие данные затираются
+        # последним бэкапом после любого обрыва соединения.
+        self._restored_once = False
         self.db_backup_task.start()
 
     def cog_unload(self):
@@ -88,16 +92,19 @@ class GeneralCog(commands.Cog):
     @commands.Cog.listener()
     async def on_ready(self):
         logger.info(f"✅ Бот запущен как {self.bot.user} (id: {self.bot.user.id})")
-        
-        try:
-            from storage import restore_db_from_discord
-            did_restore = await restore_db_from_discord(self.bot)
-            if did_restore:
-                logger.info("✅ База данных успешно восстановлена из Discord резервной копии.")
-            else:
-                logger.info("ℹ️ Резервная копия базы данных не найдена на Discord. Сессия с чистого листа.")
-        except Exception as e:
-            logger.error(f"Ошибка при восстановлении базы данных: {e}", exc_info=True)
+
+        # #2: восстанавливаем БД только один раз за процесс, а не на каждый reconnect.
+        if not self._restored_once:
+            self._restored_once = True
+            try:
+                from storage import restore_db_from_discord
+                did_restore = await restore_db_from_discord(self.bot)
+                if did_restore:
+                    logger.info("✅ База данных успешно восстановлена из Discord резервной копии.")
+                else:
+                    logger.info("ℹ️ Резервная копия базы данных не найдена на Discord. Сессия с чистого листа.")
+            except Exception as e:
+                logger.error(f"Ошибка при восстановлении базы данных: {e}", exc_info=True)
         runtime = collect_runtime_health()
         missing_optional = [k for k, available in runtime.items() if not available and k != "DISCORD_TOKEN"]
         if missing_optional:
