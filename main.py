@@ -73,6 +73,11 @@ async def run_bot() -> None:
             await backup_db_to_discord(bot)
         except Exception as e:
             print(f"Ошибка сохранения бэкапа перед остановкой: {e}")
+        try:
+            from storage import close_all_connections
+            await close_all_connections()
+        except Exception as e:
+            print(f"Ошибка закрытия соединений с БД: {e}")
         await bot.close()
 
     for sig in (signal.SIGTERM, signal.SIGINT):

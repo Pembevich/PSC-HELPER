@@ -6,3 +6,5 @@ __pycache__/
 .venv/
 bot_data.db
 temp/
+.DS_Store
+.claude/
