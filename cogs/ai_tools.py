@@ -54,8 +54,8 @@ POS_AI_TOOLS = [
                         "description": "Discord ID пользователя."
                     },
                     "minutes": {
-                        "type": "integer",
-                        "description": "Длительность тайм-аута в минутах."
+                        "type": "string",
+                        "description": "Длительность тайм-аута в минутах (например, '10' или '30')."
                     },
                     "reason": {
                         "type": "string",
@@ -105,6 +105,86 @@ POS_AI_TOOLS = [
                     }
                 },
                 "required": ["user_id", "role_id_or_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_role",
+            "description": "Создаёт новую роль на сервере.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Название новой роли."
+                    },
+                    "color": {
+                        "type": "string",
+                        "description": "Необязательно. Цвет роли в HEX, например 'ff0000' или '#3498db'."
+                    },
+                    "hoist": {
+                        "type": "string",
+                        "description": "Необязательно. 'true', если роль должна отображаться отдельно в списке участников."
+                    },
+                    "mentionable": {
+                        "type": "string",
+                        "description": "Необязательно. 'true', если роль можно упоминать."
+                    }
+                },
+                "required": ["name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_role",
+            "description": "Полностью удаляет роль с сервера (не путать с remove_role, который снимает роль с пользователя).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "role_id_or_name": {
+                        "type": "string",
+                        "description": "ID или имя роли, которую нужно удалить с сервера."
+                    }
+                },
+                "required": ["role_id_or_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_messages",
+            "description": "Удаляет указанное количество последних сообщений в текущем канале.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "string",
+                        "description": "Сколько последних сообщений удалить (от 1 до 100)."
+                    }
+                },
+                "required": ["count"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "setup_logging",
+            "description": "Создаёт на текущем сервере систему логов: категорию и набор каналов для логирования (модерация, сообщения, участники, роли, каналы, голос и т.д.), видимых только администраторам. Если что-то уже создано — дополняет недостающее и чинит права. Вызывать ТОЛЬКО когда об этом прямо попросили.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category_name": {
+                        "type": "string",
+                        "description": "Необязательно. Название категории логов. По умолчанию 'логи'."
+                    }
+                },
+                "required": []
             }
         }
     },

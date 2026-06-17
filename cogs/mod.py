@@ -28,7 +28,6 @@ class ModerationCog(commands.Cog):
                 return
         except Exception as e:
             logger.error(f"Ошибка проверки ссылок: {e}", exc_info=True)
-            return
 
         try:
             if await handle_spam_if_needed(message):
@@ -38,7 +37,7 @@ class ModerationCog(commands.Cog):
 
         try:
             text_reasons = detect_advertising_or_scam_text(message.content or "")
-            attachment_reasons = await detect_attachment_violations(message.attachments, message.content or "")
+            attachment_reasons = await detect_attachment_violations(message.attachments, message.content or "", message.author.id)
             moderation_reasons = text_reasons + attachment_reasons
             
             if moderation_reasons:

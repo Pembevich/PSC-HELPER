@@ -25,8 +25,8 @@ from config import (
     form_channel_id,
     punishment_roles,
     squad_roles,
-    WELCOME_CHANNEL_ID,
-    GOODBYE_CHANNEL_ID,
+    WELCOME_CHANNEL_IDS,
+    GOODBYE_CHANNEL_IDS,
     TARGET_CHANNELS,
     TARGET_OUTPUT_CHANNEL,
     NEW_MEMBER_ROLE_IDS,
@@ -58,6 +58,85 @@ def _format_attachments(message: discord.Message) -> str:
     return "\n".join(a.url for a in message.attachments[:5])
 
 
+def _build_welcome_embed(member: discord.Member) -> discord.Embed:
+    """Красивое приветствие в стиле P.OS для нового участника."""
+    guild = member.guild
+    position = guild.member_count or 0
+    created = discord.utils.format_dt(member.created_at, style="R") if member.created_at else "неизвестно"
+
+    embed = discord.Embed(
+        title="🛰️ P.OS // Регистрация нового пользователя",
+        description=(
+            f"————————————————————\n"
+            f"```ansi\n"
+            f"[0;32m[ACCESS GRANTED][0m\n"
+            f"Идентификация: {member.name}\n"
+            f"Статус: пользователь внесён в базу P.S.C\n"
+            f"```\n"
+            f"Приветствую, {member.mention}.\n"
+            f"Добро пожаловать в связанный центр фракции **P.S.C**.\n\n"
+            f"> **Ознакомься с <#1340596281986383912> — там вся нужная информация.**"
+        ),
+        color=discord.Color.from_rgb(46, 204, 113),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Порядковый номер", value=f"`#{position}` участник", inline=True)
+    embed.add_field(name="Аккаунт создан", value=created, inline=True)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text="Provision Operating System • запись в базу")
+    return embed
+
+
+def _build_goodbye_embed(member: discord.Member) -> discord.Embed:
+    """Красивое прощание в стиле P.OS для покинувшего участника."""
+    guild = member.guild
+    remaining = max((guild.member_count or 1) - 1, 0)
+    joined = discord.utils.format_dt(member.joined_at, style="R") if member.joined_at else "неизвестно"
+
+    embed = discord.Embed(
+        title="📤 P.OS // Выписка из базы данных",
+        description=(
+            f"————————————————————\n"
+            f"```ansi\n"
+            f"[0;31m[SESSION CLOSED][0m\n"
+            f"Пользователь: {member.name}\n"
+            f"Статус: запись перемещена в архив\n"
+            f"```\n"
+            f"Удачи, **{member.name}**.\n"
+            f"Ты выписан из базы данных P.S.C. Двери остаются открытыми — ждём снова."
+        ),
+        color=discord.Color.from_rgb(231, 76, 60),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Был с нами", value=joined, inline=True)
+    embed.add_field(name="Осталось в базе", value=f"`{remaining}` участников", inline=True)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text="Provision Operating System • архивация записи")
+    return embed
+
+
+async def _broadcast_embed(
+    guild: discord.Guild,
+    channel_ids: list[int],
+    embed: discord.Embed,
+    *,
+    error_label: str,
+) -> None:
+    """Отправляет embed во все указанные каналы, не падая на одном недоступном."""
+    seen: set[int] = set()
+    for channel_id in channel_ids:
+        if not channel_id or channel_id in seen:
+            continue
+        seen.add(channel_id)
+        channel = guild.get_channel(channel_id)
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            continue
+        try:
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except Exception as e:
+            print(f"{error_label} (канал {channel_id}): {e}")
+
+
 def _should_log_message(message: discord.Message) -> bool:
     if not message.guild:
         return False
@@ -85,13 +164,13 @@ async def _send_update_log_if_needed(bot: commands.Bot):
 
     release_message = (
         f"[{UPDATE_LOG_MARKER}]\n"
-        "Лог обновления P.S.C Helper:\n"
-        "- обновлён стек зависимостей и приведён в рабочее состояние под Railway;\n"
-        "- P.OS переведён на GitHub Models через OpenAI-compatible endpoint;\n"
-        "- команда !ai снова отвечает, а диалоговый P.OS использует тот же AI-клиент и тот же характер;\n"
-        "- улучшена конфигурация через env-переменные для модели, промпта и таймингов;\n"
-        "- сохранены и актуализированы фильтрация, GIF-генерация, логи и форма с \"ОТПИСКИ\";\n"
-        "- добавлены базовые тесты и dev-конфиг для дальнейшей поддержки."
+        "Лог обновления P.S.C Helper — версия 0.7:\n"
+        "- P.OS закрепил идентичность: Provision Operating System (P-O.S), без ложных расшифровок;\n"
+        "- улучшено распознавание ответов — P.OS больше не пишет служебные префиксы с ником и ID в тексте;\n"
+        "- P.OS умеет по команде разворачивать систему логов на сервере (категория и каналы, видимые только админам);\n"
+        "- новые красивые приветствия и прощания участников в нескольких каналах;\n"
+        "- укреплена защита tool-вызовов и обработка ошибок AI;\n"
+        "- расширено покрытие тестами."
     )
 
     try:
@@ -397,22 +476,12 @@ class LoggingCog(commands.Cog):
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         try:
-            channel = member.guild.get_channel(WELCOME_CHANNEL_ID)
-            if channel:
-                embed = discord.Embed(
-                    title="## Запись в дата-базу P - O.S…",
-                    description=(
-                        f"————————————\n"
-                        f"```\n"
-                        f"Приветствую, {member.name}!\n"
-                        f"Добро пожаловать на связанной центр фракции P.S.C!\n"
-                        f"Вы записаны в базу хранения.\n"
-                        f"```\n\n"
-                        f"> **Ознакомьтесь с <#1340596281986383912>, там вы найдёте нужную вам информацию!**"
-                    ),
-                    color=discord.Color.green()
-                )
-                await channel.send(embed=embed)
+            await _broadcast_embed(
+                member.guild,
+                WELCOME_CHANNEL_IDS,
+                _build_welcome_embed(member),
+                error_label="Ошибка приветствия on_member_join",
+            )
         except Exception as e:
             print(f"Ошибка приветствия on_member_join: {e}")
 
@@ -439,20 +508,12 @@ class LoggingCog(commands.Cog):
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
         try:
-            channel = member.guild.get_channel(GOODBYE_CHANNEL_ID)
-            if channel:
-                embed = Embed(
-                    title="## Выписываю из базы данных…",
-                    description=(
-                        f"```\n"
-                        f"Желаем удачи, {member.name}!\n"
-                        f"Вы выписаны из базы данных.\n"
-                        f"Ждём вас снова у нас!\n"
-                        f"```"
-                    ),
-                    color=Color.red()
-                )
-                await channel.send(embed=embed)
+            await _broadcast_embed(
+                member.guild,
+                GOODBYE_CHANNEL_IDS,
+                _build_goodbye_embed(member),
+                error_label="Ошибка прощания on_member_remove",
+            )
         except Exception as e:
             print(f"Ошибка on_member_remove: {e}")
 

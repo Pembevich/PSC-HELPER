@@ -6,6 +6,9 @@ import json
 import os
 import tempfile
 import time
+import re
+import subprocess
+import logging
 from collections import defaultdict, deque
 from datetime import timedelta
 from urllib.parse import urlparse, unquote
@@ -16,6 +19,15 @@ import discord
 import idna
 from PIL import Image, ImageOps
 from discord import Color, Embed
+import imageio_ffmpeg
+
+# #4: Защита от декомпрессионных бомб. Маленький файл может развернуться в
+# гигабайты пикселей и положить процесс при .convert()/.thumbnail().
+# 24 Мп с запасом хватает для легитимных фото (6000x4000), бомбы отсекаются.
+Image.MAX_IMAGE_PIXELS = 24_000_000
+
+logger = logging.getLogger(__name__)
+
 
 from ai_client import ai_is_temporarily_unavailable, extract_json_block, pos_chat_completion
 from config import (
@@ -66,11 +78,43 @@ VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm", ".avi", ".mkv")
 _vt_cache: dict[str, tuple[bool, float]] = {}
 _ai_url_cache: dict[str, tuple[str, str, float]] = {}
 
+# #7: Максимальные размеры кэшей — предотвращаем утечку памяти
+_MAX_VT_CACHE_SIZE = 2000
+_MAX_AI_URL_CACHE_SIZE = 2000
+
 # Per-user rate limit для AI-проверок медиа: не более 1 AI-вызова за 15 сек на пользователя
 _AI_MEDIA_USER_LAST_CHECK: dict[int, float] = {}
 AI_MEDIA_USER_COOLDOWN_SECONDS = 15
 
 recent_messages = defaultdict(lambda: deque())
+_last_spam_prune = 0.0
+_SPAM_PRUNE_INTERVAL = 60.0
+
+
+def _prune_spam_tracker(now: float) -> None:
+    """#8: Удаляем очереди, в которых не осталось свежих сообщений."""
+    global _last_spam_prune
+    if now - _last_spam_prune < _SPAM_PRUNE_INTERVAL:
+        return
+    _last_spam_prune = now
+    for uid in list(recent_messages.keys()):
+        queue = recent_messages[uid]
+        while queue and now - queue[0][1] > SPAM_WINDOW_SECONDS:
+            queue.popleft()
+        if not queue:
+            recent_messages.pop(uid, None)
+
+
+def _trim_url_caches() -> None:
+    """#7: Обрезаем кэши VirusTotal и AI-URL при превышении лимита."""
+    if len(_vt_cache) > _MAX_VT_CACHE_SIZE:
+        oldest = sorted(_vt_cache, key=lambda k: _vt_cache[k][1])[:_MAX_VT_CACHE_SIZE // 2]
+        for key in oldest:
+            _vt_cache.pop(key, None)
+    if len(_ai_url_cache) > _MAX_AI_URL_CACHE_SIZE:
+        oldest = sorted(_ai_url_cache, key=lambda k: _ai_url_cache[k][2])[:_MAX_AI_URL_CACHE_SIZE // 2]
+        for key in oldest:
+            _ai_url_cache.pop(key, None)
 
 
 def _text_has_media_risk_signals(text: str) -> bool:
@@ -116,13 +160,28 @@ def _normalize_domain(raw_domain: str) -> str:
         return raw_domain.lower()
 
 
+def _keyword_is_domain_token(keyword: str, normalized_domain: str) -> bool:
+    """True, если keyword присутствует в домене как отдельный токен.
+
+    Токен ограничен краями строки или не-буквенными символами. Так "bet"
+    матчит bet.com, my-bet.net, bet365.com (граница перед цифрами), но НЕ
+    betterhelp.com и не essex.com. Дефисы в keyword (free-robux) экранируются.
+    """
+    if not keyword:
+        return False
+    pattern = r"(?<![a-z0-9])" + re.escape(keyword.lower()) + r"(?![a-z])"
+    return re.search(pattern, normalized_domain) is not None
+
+
 def _domain_matches_blacklist(domain: str) -> bool:
     normalized = _normalize_domain(domain)
     for bad in SUSPICIOUS_DOMAINS:
         if normalized == bad or normalized.endswith("." + bad):
             return True
+    # #7: keyword сверяем как отдельный токен в пределах домена, а не подстрокой.
+    # Иначе "sex" ловит essex.com, "bet" — betterhelp.com, "cams" — любой *cams*.
     for keyword in SUSPICIOUS_KEYWORDS:
-        if keyword in normalized:
+        if _keyword_is_domain_token(keyword, normalized):
             return True
     return False
 
@@ -208,9 +267,68 @@ async def _attachment_image_to_data_url(att: discord.Attachment) -> str | None:
     return _build_data_url_from_image_bytes(data)
 
 
-async def _attachment_video_to_data_urls(att: discord.Attachment) -> list[str]:
-    if not VideoFileClip:
+async def _get_video_duration_ffmpeg(video_path: str) -> float | None:
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        def run_info():
+            return subprocess.run([ffmpeg_exe, "-i", video_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        res = await asyncio.to_thread(run_info)
+        stderr = res.stderr
+        
+        duration_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
+        if duration_match:
+            hours = int(duration_match.group(1))
+            minutes = int(duration_match.group(2))
+            seconds = float(duration_match.group(3))
+            return hours * 3600 + minutes * 60 + seconds
+    except Exception:
+        pass
+    return None
+
+
+async def _extract_video_frames_ffmpeg(video_path: str, timestamps: list[float], max_side: int = 1280) -> list[str]:
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
         return []
+
+    previews = []
+    for ts in timestamps:
+        with tempfile.NamedTemporaryFile(delete=True, suffix=".jpg") as tmp:
+            frame_path = tmp.name
+        
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-ss", f"{ts:.3f}",
+            "-i", video_path,
+            "-frames:v", "1",
+            "-vf", f"scale='if(gt(iw,ih),min(iw,{max_side}),-1)':'if(gt(ih,iw),min(ih,{max_side}))':flags=lanczos",
+            frame_path
+        ]
+        
+        try:
+            def run_cmd():
+                return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
+            
+            res = await asyncio.to_thread(run_cmd)
+            if res.returncode == 0 and os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
+                with open(frame_path, "rb") as f:
+                    data = f.read()
+                encoded = base64.b64encode(data).decode("ascii")
+                previews.append(f"data:image/jpeg;base64,{encoded}")
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(frame_path):
+                try:
+                    os.remove(frame_path)
+                except Exception:
+                    pass
+    return previews
+
+
+async def _attachment_video_to_data_urls(att: discord.Attachment) -> list[str]:
     if att.size and att.size > AI_MEDIA_MAX_BYTES:
         return []
 
@@ -221,6 +339,27 @@ async def _attachment_video_to_data_urls(att: discord.Attachment) -> list[str]:
             temp_path = temp_file.name
             data = await att.read(use_cached=True)
             temp_file.write(data)
+
+        # 1. Try FFmpeg first
+        try:
+            duration = await _get_video_duration_ffmpeg(temp_path)
+            if duration and duration > 0:
+                sample_duration = min(float(duration), 6.0)
+                if AI_VIDEO_FRAME_COUNT == 1:
+                    timestamps = [min(sample_duration / 2, sample_duration)]
+                else:
+                    step = sample_duration / (AI_VIDEO_FRAME_COUNT + 1)
+                    timestamps = [step * (idx + 1) for idx in range(AI_VIDEO_FRAME_COUNT)]
+                
+                previews = await _extract_video_frames_ffmpeg(temp_path, timestamps, AI_IMAGE_MAX_SIDE)
+                if previews:
+                    return previews
+        except Exception:
+            pass
+
+        # 2. Fallback to MoviePy
+        if not VideoFileClip:
+            return []
 
         previews: list[str] = []
         with VideoFileClip(temp_path) as clip:
@@ -271,7 +410,7 @@ async def check_google_safe_browsing(session: aiohttp.ClientSession, url: str) -
             payload = await response.json()
             return "matches" in payload and bool(payload["matches"])
     except Exception as exc:
-        print(f"GSB error for {url}: {exc}")
+        logger.error(f"GSB error for {url}: {exc}")
         return False
 
 
@@ -308,7 +447,7 @@ async def check_virustotal(session: aiohttp.ClientSession, url: str) -> bool:
             stats = payload.get("data", {}).get("attributes", {}).get("stats", {})
             return (stats.get("malicious", 0) + stats.get("suspicious", 0)) > 0
     except Exception as exc:
-        print(f"Ошибка VirusTotal: {exc}")
+        logger.error(f"Ошибка VirusTotal: {exc}")
         return False
 
 
@@ -332,11 +471,15 @@ async def _classify_urls_with_ai(url_contexts: list[dict]) -> list[tuple[str, st
         return blocked
 
     system_prompt = (
-        "Ты классификатор автомодерации Discord. "
-        "Нужно определить, какие URL реально стоит блокировать. "
-        "Блокируй только явные случаи: скам, фишинг, казино, NSFW, вредоносные ссылки, агрессивная реклама. "
-        "Надёжные медиадомены и CDN вроде tenor.com, giphy.com, discord CDN нельзя блокировать просто из-за слов в URL. "
-        "Если нет явной уверенности — ставь allow. Верни только JSON."
+        "Ты экспертный классификатор автомодерации ссылок в Discord. "
+        "Твоя задача — определять вредоносные, фишинговые и скамерские ссылки, а также рекламу казино и порнографии.\n"
+        "ПРАВИЛА БЕЗОПАСНОСТИ ДЛЯ ИЗБЕЖАНИЯ ОШИБОЧНЫХ БЛОКИРОВОК (ЛОЖНЫХ СРАБАТЫВАНИЙ):\n"
+        "1. Блокируй ТОЛЬКО на 100% подтвержденный вредоносный контент. Если есть малейшее сомнение — возвращай 'allow'.\n"
+        "2. НИКОГДА НЕ БЛОКИРУЙ ссылки на общеизвестные доверенные ресурсы: github.com, youtube.com, youtu.be, steamcommunity.com, steampowered.com, "
+        "roblox.com, google.com, yandex.ru, wikipedia.org, discord.com, discord.gg, t.me (если это не реклама скам-ботов), tenor.com, giphy.com.\n"
+        "3. Никогда не блокируй ссылки просто потому, что в их адресе есть слова вроде 'verify', 'free', 'roblox', если домен является легитимным (например, roblox.com/games/...). Внимательно сверяй домен!\n"
+        "4. Обычные новостные сайты, ссылки на музыку (Spotify, Soundcloud) или официальные ресурсы блокировать ЗАПРЕЩЕНО.\n"
+        "Если ссылка безопасна или ты сомневаешься — всегда пиши 'allow'."
     )
     user_payload = {
         "policy": "Если сомневаешься, не блокируй.",
@@ -361,6 +504,7 @@ async def _classify_urls_with_ai(url_contexts: list[dict]) -> list[tuple[str, st
         temperature=0.1,
         top_p=0.9,
         timeout=45,
+        provider_type="gemini",
     )
     parsed = extract_json_block((response or {}).get("content", ""))
     if not parsed:
@@ -414,13 +558,16 @@ async def _classify_media_with_ai(attachments: list[discord.Attachment], text: s
         {
             "type": "text",
             "text": (
-                "Проверь вложения для Discord-модерации. "
-                "Блокировать только явные случаи NSFW, порнографии, казино, скама, фишинга или откровенно рекламного мусора. "
-                "Обычные мемы, GIF, скриншоты, арты и нейтральные видео не блокируй. "
-                "Если уверенность низкая — allow. "
-                f"Текст сообщения: {text[:600] or '(без текста)'}\n"
-                "Верни только JSON формата "
-                "{\"results\":[{\"file\":\"name\",\"label\":\"allow|block\",\"reason\":\"...\",\"confidence\":0.0}]}"
+                "Проверь вложенные медиафайлы для автомодерации Discord.\n"
+                "ПРАВИЛА БЕЗОПАСНОСТИ ДЛЯ ИЗБЕЖАНИЯ ОШИБОЧНЫХ БЛОКИРОВОК:\n"
+                "1. Блокируй ТОЛЬКО явное насилие, откровенное порно (NSFW/18+), рекламу казино/ставок или фишинг/скам.\n"
+                "2. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО блокировать обычные мемы, скриншоты из игр (Roblox, Minecraft и др.), "
+                "рисунки/арты, обычные фотографии людей/природы, даже если на них есть шутливый или двусмысленный текст.\n"
+                "3. Не блокируй текстовые файлы, логи или нейтральные скриншоты переписок.\n"
+                "4. Если ты сомневаешься в нарушении — всегда ставь 'allow'. Будь максимально лоялен.\n"
+                f"Текст сообщения пользователя: {text[:600] or '(без текста)'}\n"
+                "Верни ответ строго в формате JSON: "
+                "{\"results\":[{\"file\":\"name\",\"label\":\"allow|block\",\"reason\":\"reason\",\"confidence\":0.0}]}"
             ),
         }
     ]
@@ -475,6 +622,7 @@ async def _classify_media_with_ai(attachments: list[discord.Attachment], text: s
         temperature=0.1,
         top_p=0.9,
         timeout=60,
+        provider_type="gemini",
     )
     parsed = extract_json_block((response or {}).get("content", ""))
     if not parsed:
@@ -506,6 +654,7 @@ async def check_and_handle_urls(message: discord.Message) -> bool:
     if not urls:
         return False
 
+    _trim_url_caches()  # #7: периодическая очистка кэшей
     suspicious: list[tuple[str, str]] = []
     borderline: list[dict] = []
 
@@ -552,7 +701,7 @@ async def check_and_handle_urls(message: discord.Message) -> bool:
                     _vt_cache[url] = (True, time.time())
                     continue
             except Exception as exc:
-                print(f"GSB check error: {exc}")
+                logger.error(f"GSB check error: {exc}")
 
             try:
                 vt_bad = await check_virustotal(session, url)
@@ -560,7 +709,7 @@ async def check_and_handle_urls(message: discord.Message) -> bool:
                 if vt_bad:
                     suspicious.append((url, "VirusTotal"))
             except Exception as exc:
-                print(f"VirusTotal check error: {exc}")
+                logger.error(f"VirusTotal check error: {exc}")
 
     ai_suspicious = await _classify_urls_with_ai(borderline)
     if ai_suspicious:
@@ -598,7 +747,7 @@ async def apply_max_timeout(member: discord.Member, reason: str):
 
     me = member.guild.me if member.guild else None
     if me and not me.guild_permissions.moderate_members:
-        print("Не удалось выдать ограничение голоса: у бота нет права Moderate Members")
+        logger.warning("Не удалось выдать ограничение голоса: у бота нет права Moderate Members")
         return False
 
     try:
@@ -609,10 +758,10 @@ async def apply_max_timeout(member: discord.Member, reason: str):
             await member.edit(timeout=until, reason=reason)
             return True
         except Exception as exc:
-            print(f"Не удалось выдать ограничение голоса: {exc}")
+            logger.error(f"Не удалось выдать ограничение голоса: {exc}")
             return False
     except Exception as exc:
-        print(f"Не удалось выдать ограничение голоса: {exc}")
+        logger.error(f"Не удалось выдать ограничение голоса: {exc}")
         return False
 
 
@@ -648,7 +797,7 @@ async def log_violation_with_evidence(message: discord.Message, title: str, reas
             kwargs["files"] = files
         await channel.send(**kwargs)
     except Exception as exc:
-        print(f"Ошибка логирования нарушения: {exc}")
+        logger.error(f"Ошибка логирования нарушения: {exc}")
 
 
 def detect_advertising_or_scam_text(text: str):
@@ -721,6 +870,10 @@ async def handle_spam_if_needed(message: discord.Message):
 
     while queue and now - queue[0][1] > SPAM_WINDOW_SECONDS:
         queue.popleft()
+
+    # #8: периодически выметаем пустые/протухшие очереди ушедших пользователей,
+    # иначе recent_messages растёт по числу всех когда-либо писавших юзеров.
+    _prune_spam_tracker(now)
 
     count = sum(1 for entry_key, _, _, _ in queue if entry_key == key)
     if count < SPAM_DUPLICATES_THRESHOLD:

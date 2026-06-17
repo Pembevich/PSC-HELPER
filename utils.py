@@ -28,7 +28,9 @@ def collect_runtime_health() -> dict:
 
 
 def extract_clean_keyword(text: str):
-    return re.sub(r"[^a-z]", "", (text or "").lower())
+    # #10: оставляем латиницу И кириллицу. Раньше [^a-z] вырезал все русские
+    # буквы, из-за чего русские ответы в формах превращались в пустую строку.
+    return re.sub(r"[^a-zа-яё]", "", (text or "").lower())
 
 
 def sanitize_discord_token(raw_token: str | None) -> str | None:

@@ -38,22 +38,49 @@ class ConfirmView(View):
         if interaction.user.bot:
             await interaction.response.send_message("Ботам тут делать нечего.", ephemeral=True)
             return False
-        if interaction.guild:
-            return True
-        await interaction.response.send_message("❌ Не удалось проверить участника сервера.", ephemeral=True)
-        return False
+        if not interaction.guild:
+            await interaction.response.send_message("❌ Не удалось проверить участника сервера.", ephemeral=True)
+            return False
+        # #9: Проверяем, что нажимающий имеет одну из разрешённых ролей проверяющего
+        if self.allowed_checker_role_ids:
+            member = interaction.guild.get_member(interaction.user.id)
+            if not member:
+                try:
+                    member = await interaction.guild.fetch_member(interaction.user.id)
+                except Exception:
+                    member = None
+            if not member:
+                await interaction.response.send_message("❌ Не удалось найти участника сервера.", ephemeral=True)
+                return False
+            user_role_ids = {role.id for role in member.roles}
+            if not user_role_ids.intersection(self.allowed_checker_role_ids):
+                await interaction.response.send_message("❌ У вас нет прав для обработки этой заявки.", ephemeral=True)
+                return False
+        return True
 
     @button(label="Принять", style=discord.ButtonStyle.green)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         member = interaction.guild.get_member(self.target_user_id)
+        if not member:
+            try:
+                member = await interaction.guild.fetch_member(self.target_user_id)
+            except Exception:
+                pass
         if member:
+            granted_roles: list[str] = []
+            failed_roles: list[str] = []
             for role_id in self.role_ids:
                 role = interaction.guild.get_role(role_id)
-                if role:
-                    try:
-                        await member.add_roles(role)
-                    except Exception:
-                        pass
+                if not role:
+                    failed_roles.append(f"`{role_id}` (роль не найдена на сервере)")
+                    continue
+                try:
+                    await member.add_roles(role, reason="Принят в отряд через форму")
+                    granted_roles.append(role.name)
+                except discord.Forbidden:
+                    failed_roles.append(f"{role.name} (недостаточно прав / иерархия ролей)")
+                except Exception as e:
+                    failed_roles.append(f"{role.name} ({e})")
             try:
                 dm_embed = Embed(
                     title="⏳ Ваша заявка принята!",
@@ -69,26 +96,30 @@ class ConfirmView(View):
                 pass
 
             try:
-                role_names = []
-                for role_id in self.role_ids:
-                    role = interaction.guild.get_role(role_id)
-                    if role:
-                        role_names.append(role.name)
+                log_fields = [
+                    ("Модератор", interaction.user.mention, False),
+                    ("Выданные роли", ", ".join(granted_roles) or "—", False),
+                ]
+                if failed_roles:
+                    log_fields.append(("⚠️ НЕ выданы", "\n".join(failed_roles), False))
                 await send_log_embed(
                     interaction.guild,
                     "forms",
-                    "✅ Заявка принята",
+                    "✅ Заявка принята" if not failed_roles else "⚠️ Заявка принята (роли выданы частично)",
                     f"{member.mention} принят в отряд **{self.squad_name}**.",
-                    color=Color.green(),
-                    fields=[
-                        ("Модератор", interaction.user.mention, False),
-                        ("Выданные роли", ", ".join(role_names) or "—", False)
-                    ]
+                    color=Color.green() if not failed_roles else Color.orange(),
+                    fields=log_fields,
                 )
             except Exception:
                 pass
         await self._finalize_view(interaction)
-        await interaction.response.send_message("Принято.", ephemeral=True)
+        if not member:
+            confirm_text = "⚠️ Участник не найден на сервере — роли не выданы."
+        elif failed_roles:
+            confirm_text = "⚠️ Принято, но часть ролей не выдана:\n" + "\n".join(failed_roles)
+        else:
+            confirm_text = "✅ Принято, роли выданы."
+        await interaction.response.send_message(confirm_text, ephemeral=True)
         self.stop()
 
     @button(label="Отказать", style=discord.ButtonStyle.red)

@@ -187,23 +187,44 @@ class FormsCog(commands.Cog):
                     logger.error(f"Failed to send complaint embed/files: {e}", exc_info=True)
             return
 
-        # Форма TAC
+        # Форма Arbaiter
         if message.channel.id == FORM_CHANNEL_ID:
-            template = "1. Ваш roblox никнейм (НЕ ДИСПЛЕЙ)\n2. Ваш Discord ник\n3. tac"
+            template = (
+                "1. Ваш Роблокс никнейм  (не дисплей)\n"
+                "2. Ваш Дискорд никнейм  (не дисплей)\n"
+                "3. Почему решили вступить в отряд ?\n"
+                "4. Отряд , в который в желаете вступить : Arbaiter"
+            )
             lines = [line.strip() for line in (message.content or "").strip().split("\n") if line.strip()]
-            if len(lines) != 3:
+            if len(lines) != 4:
                 try:
-                    await message.reply(embed=Embed(title="❌ Неверный шаблон", description="Форма должна содержать 3 строки.", color=Color.red()).add_field(name="Пример", value=f"```{template}```"))
+                    embed = Embed(
+                        title="❌ Неверный шаблон",
+                        description="Форма должна содержать четыре строки.",
+                        color=Color.red()
+                    )
+                    embed.add_field(name="Пример", value=f"```{template}```", inline=False)
+                    await message.reply(embed=embed)
                 except Exception:
                     pass
                 return
 
-            user_line, discord_nick_line, choice_line = lines
+            user_line, discord_nick_line, why_line, choice_line = lines
             keyword = extract_clean_keyword(choice_line)
 
-            if keyword != "tac":
+            # Принимаем разные написания отряда: arbaiter / arbeiter (нем.) и
+            # кириллические арбайтер / арбейтер. Раньше принималось только
+            # "arbaiter", из-за чего правильное "Arbeiter"/"Арбайтер" отклонялось.
+            arbaiter_aliases = ("arbaiter", "arbeiter", "арбайтер", "арбейтер")
+            if not any(alias in keyword for alias in arbaiter_aliases):
                 try:
-                    await message.reply(embed=Embed(title="❌ Неизвестный отряд", description="Третий пункт должен содержать только **tac**.", color=Color.red()).add_field(name="Пример", value=f"```{template}```"))
+                    embed = Embed(
+                        title="❌ Неверный шаблон",
+                        description="Форма должна содержать четыре строки.",
+                        color=Color.red()
+                    )
+                    embed.add_field(name="Пример", value=f"```{template}```", inline=False)
+                    await message.reply(embed=embed)
                 except Exception:
                     pass
                 return
@@ -211,7 +232,7 @@ class FormsCog(commands.Cog):
             target_channel = message.guild.get_channel(TAC_CHANNEL_ID)
             if not target_channel:
                 try:
-                    await message.reply("❌ Ошибка конфигурации: канал TAC не найден.")
+                    await message.reply("❌ Ошибка конфигурации: канал Arbaiter не найден.")
                 except Exception:
                     pass
                 return
@@ -220,11 +241,12 @@ class FormsCog(commands.Cog):
             risk_text = "\n".join(f"⚠️ {flag}" for flag in risk_flags) if risk_flags else "✅ Явных рисков не обнаружено"
 
             embed = Embed(
-                title="📋 Подтверждение вступления в TAC",
+                title="📋 Подтверждение вступления в Arbaiter",
                 description=(
-                    f"{message.author.mention} хочет вступить в отряд **TAC**\n"
+                    f"{message.author.mention} хочет вступить в отряд **Arbaiter**\n"
                     f"Roblox ник: `{user_line}`\n"
-                    f"Discord ник: `{discord_nick_line}`"
+                    f"Discord ник: `{discord_nick_line}`\n"
+                    f"Почему решили вступить: {why_line}"
                 ),
                 color=Color.blue()
             )
@@ -234,7 +256,7 @@ class FormsCog(commands.Cog):
             view = ConfirmView(
                 TAC_REVIEWER_ROLE_IDS,
                 target_message=message,
-                squad_name="TAC",
+                squad_name="Arbaiter",
                 role_ids=TAC_ROLE_REWARDS,
                 target_user_id=message.author.id
             )
@@ -246,12 +268,20 @@ class FormsCog(commands.Cog):
                     mentions.append(role.mention)
 
             try:
+                await message.reply(
+                    "✅ **Ваша заявка на стадии рассмотрения**\n\n"
+                    "Это займёт некоторое время так как заявку принимает настоящий человек ."
+                )
+            except Exception:
+                pass
+
+            try:
                 if mentions:
                     await target_channel.send(content=" ".join(mentions), embed=embed, view=view)
                 else:
                     await target_channel.send(embed=embed, view=view)
             except Exception as e:
-                logger.error(f"Failed to send TAC form embed: {e}", exc_info=True)
+                logger.error(f"Failed to send Arbaiter form embed: {e}", exc_info=True)
             return
 
         # Форма наказаний
@@ -285,6 +315,11 @@ class FormsCog(commands.Cog):
                 return
 
             member = message.guild.get_member(user_id)
+            if not member:
+                try:
+                    member = await message.guild.fetch_member(user_id)
+                except Exception:
+                    pass
             if not member:
                 try:
                     await message.reply("❌ Пользователь с таким ID не найден на сервере.")
