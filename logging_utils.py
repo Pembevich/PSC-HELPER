@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import discord
 from discord import Embed, Color
-from typing import Dict
+from typing import Dict, List, Optional, TypedDict
 
 from config import LOG_CATEGORY_ID, LOG_CATEGORY_NAME, PRIMARY_LOG_CHANNEL_ID
 
-LOG_CHANNEL_CONFIGS = [
+
+class LogChannelConfig(TypedDict):
+    key: str
+    names: List[str]
+    topic: str
+
+
+LOG_CHANNEL_CONFIGS: List[LogChannelConfig] = [
     {
         "key": "moderation",
         "names": ["логи-модерации", "mod-logs", "moderation-logs"],
@@ -205,6 +212,121 @@ async def await_move_channel(channel: discord.TextChannel, category: discord.Cat
     await channel.edit(category=category, reason="Перенос в категорию логов")
 
 
+def _admin_only_overwrites(guild: discord.Guild) -> dict:
+    """Права для лог-категории: всё скрыто от @everyone, на чтение видно только
+    самому боту и ролям с правом «Администратор» или «Просмотр журнала аудита»
+    (модераторы). Писать в логи может только бот."""
+    overwrites: dict = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+    }
+    if guild.me:
+        overwrites[guild.me] = discord.PermissionOverwrite(
+            read_messages=True, send_messages=True, manage_channels=True
+        )
+    for role in guild.roles:
+        if role.is_default():
+            continue
+        if role.permissions.administrator or role.permissions.view_audit_log:
+            overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=False)
+    return overwrites
+
+
+def _find_log_channel_in_category(
+    category: discord.CategoryChannel | None,
+    names: list[str],
+) -> discord.TextChannel | None:
+    """Строгий поиск лог-канала ТОЛЬКО внутри уже существующей лог-категории.
+
+    В отличие от _find_channel_by_names, не делает поиск по всему серверу и не
+    цепляет обычные каналы по подстроке (voice, roles, server и т.п.). Используется
+    в setup_guild_logging, чтобы случайно не перенести/не скрыть посторонний канал.
+    """
+    if not category:
+        return None
+    names_l = {n.lower() for n in names}
+    for ch in category.channels:
+        if isinstance(ch, discord.TextChannel) and ch.name.lower() in names_l:
+            return ch
+    return None
+
+
+async def setup_guild_logging(
+    guild: discord.Guild,
+    category_name: str | None = None,
+) -> tuple[bool, str]:
+    """Разворачивает систему логов на сервере по запросу: создаёт (или дополняет)
+    категорию и каналы логов, видимые только администраторам.
+
+    Возвращает (успех, текст-отчёт для пользователя).
+    """
+    if not guild.me or not guild.me.guild_permissions.manage_channels:
+        return False, "У меня нет права «Управление каналами» на этом сервере — не могу развернуть логи."
+
+    overwrites = _admin_only_overwrites(guild)
+    cat_name = (category_name or LOG_CATEGORY_NAME or "логи").strip()[:100]
+
+    category = _find_category(guild)
+    created_category = False
+    if not category:
+        try:
+            category = await guild.create_category(
+                name=cat_name,
+                overwrites=overwrites,
+                reason="P.OS: разворачивание системы логов по запросу",
+            )
+            created_category = True
+        except Exception as exc:
+            return False, f"Не смог создать категорию логов: {exc}"
+    else:
+        try:
+            await category.edit(overwrites=overwrites, reason="P.OS: обновление прав категории логов")
+        except Exception:
+            pass
+
+    created_channels: list[str] = []
+    existing_channels = 0
+    failed = 0
+    for cfg in LOG_CHANNEL_CONFIGS:
+        # Строго ищем только внутри лог-категории — не трогаем посторонние каналы.
+        ch = _find_log_channel_in_category(category, cfg["names"])
+        if ch:
+            existing_channels += 1
+            try:
+                await ch.edit(sync_permissions=True, reason="P.OS: синхронизация прав лог-канала")
+            except Exception:
+                pass
+            continue
+        try:
+            ch = await guild.create_text_channel(
+                name=cfg["names"][0],
+                category=category,
+                topic=cfg.get("topic"),
+                overwrites=overwrites,
+                reason="P.OS: создание канала логов по запросу",
+            )
+            created_channels.append(ch.name)
+        except Exception:
+            failed += 1
+
+    resolved: dict[str, int] = {}
+    for cfg in LOG_CHANNEL_CONFIGS:
+        ch = _find_log_channel_in_category(category, cfg["names"])
+        if ch:
+            resolved[cfg["key"]] = ch.id
+    if resolved:
+        _LOG_CHANNEL_CACHE[guild.id] = resolved
+    _LOG_INIT_DONE.add(guild.id)
+
+    report_parts = [
+        f"Категория `{category.name}` {'создана' if created_category else 'уже была'}.",
+        f"Создано каналов: `{len(created_channels)}`, уже существовало: `{existing_channels}`.",
+    ]
+    if failed:
+        report_parts.append(f"Не удалось создать: `{failed}` (проверь права и лимит каналов).")
+    report_parts.append("Доступ к логам открыт только ролям администраторов.")
+    return True, " ".join(report_parts)
+
+
 def get_log_channel(guild: discord.Guild | None, log_type: str = "server") -> discord.TextChannel | None:
     if not guild:
         return None
@@ -222,13 +344,9 @@ def get_log_channel(guild: discord.Guild | None, log_type: str = "server") -> di
             return ch
 
     if guild.id not in _LOG_INIT_DONE:
-        # попробуем создать/обновить
-        try:
-            # ensure_log_category_and_channels is async, но вызываем синхронно
-            # реальная инициализация выполняется в on_ready
-            pass
-        except Exception:
-            pass
+        # Полная инициализация выполняется асинхронно в on_ready
+        # (ensure_log_category_and_channels). Здесь — только поиск по имени ниже.
+        pass
 
     # fallback: поиск по имени
     category = _find_category(guild)
