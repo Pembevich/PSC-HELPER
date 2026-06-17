@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Git commit policy
+
+- Do NOT add a `Co-Authored-By: Claude ...` trailer or any "Generated with Claude" line to commit messages or PR descriptions in this repository.
+- Keep commit messages concise and plain. The repository owner (Pembevich) is the sole author.
+
 ## Overview
 
 PSC-HELPER is a Discord bot (discord.py) for the P.S.C. server. It combines automoderation, application/complaint forms, detailed server logging, GIF generation, and an in-character AI persona called **P.OS** that talks to members and can request moderation actions through tool calls. The codebase and most user-facing strings are in Russian. Deployment target is Railway (env-var driven); a local `.env` is only for development.
