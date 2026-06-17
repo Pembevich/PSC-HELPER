@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import datetime
+import difflib
 import io
 import json
 import random as _random
@@ -46,8 +47,81 @@ from cogs.ai_tools import POS_AI_TOOLS
 _OWNER_ONLY_TOOLS = frozenset({
     "ban_user", "unban_user", "timeout_user",
     "add_role", "remove_role",
+    "create_role", "delete_role", "delete_messages",
     "mute_ai_for_user", "unmute_ai_for_user",
 })
+
+
+def _normalize_role_name(name: str) -> str:
+    """Приводит имя роли к виду для нечёткого сравнения: только буквы/цифры, нижний
+    регистр. Убирает эмодзи, пробелы, пунктуацию и декоративные символы."""
+    return re.sub(r"[^0-9a-zа-яё]", "", (name or "").lower())
+
+
+def resolve_role_smart(guild: discord.Guild, ident: str) -> discord.Role | None:
+    """Находит роль по ID, точному имени, нормализованному имени, подстроке или
+    нечёткому совпадению. Возвращает None, если уверенного совпадения нет."""
+    if not ident:
+        return None
+    ident = str(ident).strip()
+
+    # 1. По ID (в т.ч. формат <@&123>)
+    digits = re.sub(r"[^0-9]", "", ident)
+    if digits and ident.replace("<@&", "").replace(">", "").strip().isdigit():
+        role = guild.get_role(int(digits))
+        if role:
+            return role
+
+    roles = [r for r in guild.roles if r.name != "@everyone"]
+
+    # 2. Точное совпадение имени (без учёта регистра)
+    lowered = ident.lower()
+    for r in roles:
+        if r.name.lower() == lowered:
+            return r
+
+    # 3. Нормализованное совпадение (без эмодзи/пробелов/пунктуации)
+    norm = _normalize_role_name(ident)
+    if norm:
+        for r in roles:
+            if _normalize_role_name(r.name) == norm:
+                return r
+
+    # 4. Подстрока (предпочитаем самое длинное имя роли, чтобы не цеплять короткие)
+    if norm:
+        substring_hits = [r for r in roles if norm in _normalize_role_name(r.name) or _normalize_role_name(r.name) in norm]
+        if len(substring_hits) == 1:
+            return substring_hits[0]
+        if substring_hits:
+            return max(substring_hits, key=lambda r: len(r.name))
+
+    # 5. Нечёткое совпадение по нормализованным именам
+    if norm:
+        normalized_map = {_normalize_role_name(r.name): r for r in roles if _normalize_role_name(r.name)}
+        close = difflib.get_close_matches(norm, list(normalized_map.keys()), n=1, cutoff=0.82)
+        if close:
+            return normalized_map[close[0]]
+
+    return None
+
+
+def _role_not_found_hint(guild: discord.Guild, ident: str) -> str:
+    """Сообщение об ошибке с подсказкой похожих ролей, чтобы модель могла
+    повторить вызов с точным именем вместо «не знаю такую роль»."""
+    roles = [r.name for r in guild.roles if r.name != "@everyone"]
+    norm = _normalize_role_name(ident)
+    suggestions: list[str] = []
+    if norm:
+        normalized_map = {_normalize_role_name(n): n for n in roles if _normalize_role_name(n)}
+        close = difflib.get_close_matches(norm, list(normalized_map.keys()), n=3, cutoff=0.5)
+        suggestions = [normalized_map[c] for c in close]
+    if suggestions:
+        return (
+            f"Роль '{ident}' не найдена. Возможно, ты имел в виду: "
+            + ", ".join(f"'{s}'" for s in suggestions)
+            + ". Повтори вызов с точным именем или ID роли."
+        )
+    return f"Ошибка: роль '{ident}' не найдена на сервере."
 
 
 async def execute_pos_tool(bot: discord.Client, message: discord.Message | None, tool_call: dict) -> str:
@@ -73,6 +147,8 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
                 action_name = {
                     "ban_user": "бан", "unban_user": "разбан", "timeout_user": "мут",
                     "add_role": "выдачу роли", "remove_role": "снятие роли",
+                    "create_role": "создание роли", "delete_role": "удаление роли",
+                    "delete_messages": "удаление сообщений",
                     "mute_ai_for_user": "блокировку ответов", "unmute_ai_for_user": "снятие блокировки",
                 }.get(name, name)
                 user_name = getattr(message.guild.get_member(user_id), "name", str(user_id)) if user_id else str(user_id)
@@ -139,7 +215,7 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
     elif name == "add_role":
         if not user_id:
             return "Ошибка: не указан user_id"
-        role_ident = args.get("role_id_or_name", "")
+        role_ident = str(args.get("role_id_or_name", ""))
         member = message.guild.get_member(user_id)
         if not member:
             try:
@@ -148,23 +224,21 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
                 pass
         if not member:
             return "Ошибка: пользователь не найден."
-        role = None
-        if role_ident.isdigit():
-            role = message.guild.get_role(int(role_ident))
+        role = resolve_role_smart(message.guild, role_ident)
         if not role:
-            role = discord.utils.find(lambda r: r.name.lower() == role_ident.lower(), message.guild.roles)
-        if not role:
-            return f"Ошибка: роль '{role_ident}' не найдена."
+            return _role_not_found_hint(message.guild, role_ident)
         try:
             await member.add_roles(role, reason="Выдано P.OS")
             return f"Роль {role.name} успешно выдана пользователю {user_id}."
+        except discord.Forbidden:
+            return f"Ошибка: недостаточно прав, чтобы выдать роль '{role.name}'. Проверь, что роль P.OS выше неё в иерархии."
         except Exception as e:
             return f"Ошибка при выдаче роли: {e}"
 
     elif name == "remove_role":
         if not user_id:
             return "Ошибка: не указан user_id"
-        role_ident = args.get("role_id_or_name", "")
+        role_ident = str(args.get("role_id_or_name", ""))
         member = message.guild.get_member(user_id)
         if not member:
             try:
@@ -173,18 +247,85 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
                 pass
         if not member:
             return "Ошибка: пользователь не найден."
-        role = None
-        if role_ident.isdigit():
-            role = message.guild.get_role(int(role_ident))
+        role = resolve_role_smart(message.guild, role_ident)
         if not role:
-            role = discord.utils.find(lambda r: r.name.lower() == role_ident.lower(), message.guild.roles)
-        if not role:
-            return f"Ошибка: роль '{role_ident}' не найдена."
+            return _role_not_found_hint(message.guild, role_ident)
         try:
             await member.remove_roles(role, reason="Снято P.OS")
             return f"Роль {role.name} успешно снята с пользователя {user_id}."
+        except discord.Forbidden:
+            return f"Ошибка: недостаточно прав, чтобы снять роль '{role.name}'. Проверь иерархию ролей."
         except Exception as e:
             return f"Ошибка при снятии роли: {e}"
+
+    elif name == "create_role":
+        role_name = str(args.get("name", "")).strip()
+        if not role_name:
+            return "Ошибка: не указано имя роли (name)."
+        existing = resolve_role_smart(message.guild, role_name)
+        if existing and existing.name.lower() == role_name.lower():
+            return f"Роль с именем '{existing.name}' уже существует (ID {existing.id})."
+        color = discord.Color.default()
+        color_raw = str(args.get("color", "")).strip().lstrip("#")
+        if color_raw:
+            try:
+                color = discord.Color(int(color_raw, 16))
+            except (ValueError, TypeError):
+                color = discord.Color.default()
+        hoist = str(args.get("hoist", "")).lower() in {"true", "1", "да", "yes"}
+        mentionable = str(args.get("mentionable", "")).lower() in {"true", "1", "да", "yes"}
+        try:
+            new_role = await message.guild.create_role(
+                name=role_name,
+                color=color,
+                hoist=hoist,
+                mentionable=mentionable,
+                reason="Создано P.OS",
+            )
+            return f"Роль '{new_role.name}' создана (ID {new_role.id})."
+        except discord.Forbidden:
+            return "Ошибка: недостаточно прав для создания роли (нужно право «Управление ролями»)."
+        except Exception as e:
+            return f"Ошибка при создании роли: {e}"
+
+    elif name == "delete_role":
+        role_ident = str(args.get("role_id_or_name", ""))
+        if not role_ident:
+            return "Ошибка: не указана роль (role_id_or_name)."
+        role = resolve_role_smart(message.guild, role_ident)
+        if not role:
+            return _role_not_found_hint(message.guild, role_ident)
+        if role.is_default() or role.managed:
+            return f"Ошибка: роль '{role.name}' системная или управляется интеграцией — её нельзя удалить."
+        role_name = role.name
+        try:
+            await role.delete(reason="Удалено P.OS")
+            return f"Роль '{role_name}' удалена с сервера."
+        except discord.Forbidden:
+            return f"Ошибка: недостаточно прав, чтобы удалить роль '{role_name}'. Проверь иерархию ролей."
+        except Exception as e:
+            return f"Ошибка при удалении роли: {e}"
+
+    elif name == "delete_messages":
+        channel = message.channel
+        if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
+            return "Ошибка: удаление сообщений доступно только в текстовых каналах."
+        try:
+            count = int(args.get("count", 0))
+        except (ValueError, TypeError):
+            count = 0
+        if count < 1:
+            return "Ошибка: укажи количество сообщений (count) от 1 до 100."
+        count = min(count, 100)
+        try:
+            # +1: не считаем само командное сообщение владельца частью лимита
+            deleted = await channel.purge(limit=count + 1, check=lambda m: m.id != message.id)
+            num = len([m for m in deleted if m.id != message.id])
+            return f"Удалено сообщений: {num}."
+        except discord.Forbidden:
+            return "Ошибка: недостаточно прав для удаления сообщений (нужно право «Управление сообщениями»)."
+        except Exception as e:
+            return f"Ошибка при удалении сообщений: {e}"
 
     elif name == "mute_ai_for_user":
         if not user_id:
@@ -494,14 +635,22 @@ def _format_guild_snapshot(message: discord.Message, bot: discord.Client) -> str
     if _is_owner_user(message):
         visible_guilds = ", ".join(f"{g.name} (`{g.id}`)" for g in bot.guilds[:20])
         servers_info = f"\nСерверы, где присутствует P.OS: {visible_guilds or 'нет данных'}."
+        # Полный список ролей сервера — чтобы модель сопоставляла названия с точными
+        # именами/ID и не отвечала «не знаю такую роль».
+        guild_roles = [r for r in guild.roles if r.name != "@everyone"]
+        guild_roles.sort(key=lambda r: r.position, reverse=True)
+        roles_list = "; ".join(f"{r.name} (`{r.id}`)" for r in guild_roles[:60])
+        roles_info = f"\nРоли сервера (имя и ID): {roles_list or 'нет данных'}."
     else:
         servers_info = ""
+        roles_info = ""
 
     return (
         f"Это ты — P.OS. Твой Discord ID: `{bot_id}`, твоё упоминание: {bot_mention}.\n"
         f"Сервер: {guild.name} (`{guild.id}`), участников: {guild.member_count or 'неизвестно'}.\n"
         f"Канал: #{getattr(message.channel, 'name', message.channel)} (`{message.channel.id}`)."
         + servers_info
+        + roles_info
     )
 
 

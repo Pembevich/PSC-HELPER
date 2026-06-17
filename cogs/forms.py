@@ -212,7 +212,11 @@ class FormsCog(commands.Cog):
             user_line, discord_nick_line, why_line, choice_line = lines
             keyword = extract_clean_keyword(choice_line)
 
-            if "arbaiter" not in keyword:
+            # Принимаем разные написания отряда: arbaiter / arbeiter (нем.) и
+            # кириллические арбайтер / арбейтер. Раньше принималось только
+            # "arbaiter", из-за чего правильное "Arbeiter"/"Арбайтер" отклонялось.
+            arbaiter_aliases = ("arbaiter", "arbeiter", "арбайтер", "арбейтер")
+            if not any(alias in keyword for alias in arbaiter_aliases):
                 try:
                     embed = Embed(
                         title="❌ Неверный шаблон",
