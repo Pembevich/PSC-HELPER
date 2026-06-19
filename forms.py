@@ -144,6 +144,84 @@ class ConfirmView(View):
         self.stop()
 
 
+class PosActionConfirmView(View):
+    """Кнопки подтверждения для запросов P.OS на управляющие действия.
+
+    Когда не-владелец (или сам P.OS) инициирует управляющее действие, P.OS отправляет
+    владельцу это сообщение с кнопками «Разрешить»/«Запретить». Нажатие реально
+    выполняет действие через переданный async-callback или отклоняет его.
+
+    `executor` — async-функция без аргументов, возвращающая текст-результат (str).
+    Так мы избегаем циклического импорта pos_ai <-> forms: вся логика выполнения
+    остаётся в pos_ai, сюда передаётся только замыкание.
+    """
+
+    def __init__(self, owner_user_ids, executor, action_summary: str, requester_label: str = ""):
+        super().__init__(timeout=3600)  # 1 час на решение
+        self.owner_user_ids = set(owner_user_ids or [])
+        self.executor = executor
+        self.action_summary = action_summary
+        self.requester_label = requester_label
+        self.resolved = False
+
+    def _disable_buttons(self):
+        for item in self.children:
+            item.disabled = True
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.resolved:
+            await interaction.response.send_message("Этот запрос уже обработан.", ephemeral=True)
+            return False
+        if self.owner_user_ids and interaction.user.id not in self.owner_user_ids:
+            await interaction.response.send_message("Решение по этому запросу может принять только владелец.", ephemeral=True)
+            return False
+        return True
+
+    async def _finalize(self, interaction: discord.Interaction):
+        self.resolved = True
+        self._disable_buttons()
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+
+    @button(label="✅ Разрешить", style=discord.ButtonStyle.green)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        try:
+            result = await self.executor()
+        except Exception as e:
+            result = f"Ошибка при выполнении: {e}"
+        await self._finalize(interaction)
+        try:
+            await interaction.followup.send(f"✅ Действие выполнено.\n{result}", ephemeral=True)
+        except Exception:
+            pass
+        try:
+            await interaction.message.reply(
+                f"✅ Запрос одобрен владельцем и выполнен:\n> {self.action_summary}\n{result}",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception:
+            pass
+        self.stop()
+
+    @button(label="❌ Запретить", style=discord.ButtonStyle.red)
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finalize(interaction)
+        await interaction.response.send_message("❌ Запрос отклонён. Действие не выполнено.", ephemeral=True)
+        try:
+            await interaction.message.reply(
+                f"❌ Запрос отклонён владельцем:\n> {self.action_summary}",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception:
+            pass
+        self.stop()
+
+
 class RejectModal(Modal):
     def __init__(self, submitter: discord.Member, complaint_channel_id: int):
         super().__init__(title="Причина отклонения")

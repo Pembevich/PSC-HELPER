@@ -45,9 +45,11 @@ from cogs.ai_tools import POS_AI_TOOLS
 
 # --- Константа: инструменты только для владельца ---
 _OWNER_ONLY_TOOLS = frozenset({
-    "ban_user", "unban_user", "timeout_user",
+    "ban_user", "unban_user", "timeout_user", "kick_user", "set_nickname",
     "add_role", "remove_role",
-    "create_role", "delete_role", "delete_messages",
+    "create_role", "delete_role", "edit_role",
+    "create_channel", "delete_channel", "edit_channel", "set_channel_permission",
+    "create_invite", "delete_messages",
     "setup_logging",
     "mute_ai_for_user", "unmute_ai_for_user",
 })
@@ -125,6 +127,481 @@ def _role_not_found_hint(guild: discord.Guild, ident: str) -> str:
     return f"Ошибка: роль '{ident}' не найдена на сервере."
 
 
+def resolve_channel_smart(guild: discord.Guild, ident: str) -> discord.abc.GuildChannel | None:
+    """Находит канал/категорию по ID, точному имени, нормализованному имени или
+    подстроке. Возвращает None, если уверенного совпадения нет."""
+    if not ident:
+        return None
+    ident = str(ident).strip()
+
+    # 1. По ID (в т.ч. формат <#123>)
+    digits = re.sub(r"[^0-9]", "", ident)
+    if digits and ident.replace("<#", "").replace(">", "").strip().isdigit():
+        ch = guild.get_channel(int(digits))
+        if ch:
+            return ch
+
+    channels = list(guild.channels)
+
+    # 2. Точное совпадение имени (без учёта регистра)
+    lowered = ident.lower()
+    for ch in channels:
+        if ch.name.lower() == lowered:
+            return ch
+
+    # 3. Нормализованное совпадение (без эмодзи/пунктуации)
+    norm = _normalize_role_name(ident)
+    if norm:
+        for ch in channels:
+            if _normalize_role_name(ch.name) == norm:
+                return ch
+
+    # 4. Подстрока (единственное совпадение, иначе самое длинное имя)
+    if norm:
+        hits = [ch for ch in channels if norm in _normalize_role_name(ch.name) or _normalize_role_name(ch.name) in norm]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            return max(hits, key=lambda c: len(c.name))
+    return None
+
+
+def _parse_bool(value, default: bool = False) -> bool:
+    return str(value).strip().lower() in {"true", "1", "да", "yes", "on", "вкл"} if value not in (None, "") else default
+
+
+_TOOL_ACTION_LABELS = {
+    "ban_user": "бан пользователя", "unban_user": "разбан пользователя", "timeout_user": "мут (тайм-аут)",
+    "kick_user": "кик пользователя", "set_nickname": "смену никнейма",
+    "add_role": "выдачу роли", "remove_role": "снятие роли",
+    "create_role": "создание роли", "delete_role": "удаление роли", "edit_role": "изменение роли",
+    "create_channel": "создание канала", "delete_channel": "удаление канала",
+    "edit_channel": "изменение канала", "set_channel_permission": "настройку прав канала",
+    "create_invite": "создание приглашения",
+    "delete_messages": "удаление сообщений",
+    "setup_logging": "разворачивание системы логов",
+    "mute_ai_for_user": "блокировку ответов", "unmute_ai_for_user": "снятие блокировки",
+}
+
+
+async def _resolve_member(guild: discord.Guild, user_id: int | None):
+    if not user_id:
+        return None
+    member = guild.get_member(user_id)
+    if not member:
+        try:
+            member = await guild.fetch_member(user_id)
+        except Exception:
+            member = None
+    return member
+
+
+async def _perform_tool_action(
+    bot: discord.Client,
+    message: discord.Message,
+    name: str,
+    args: dict,
+    user_id: int | None,
+) -> str:
+    """Чистое выполнение инструмента — БЕЗ проверки прав. Проверка прав и
+    подтверждение владельца выполняются в execute_pos_tool ДО вызова этой функции.
+
+    Защита владельца/бота как цели остаётся здесь, чтобы её нельзя было обойти
+    даже через подтверждённый запрос.
+    """
+    guild = message.guild
+    if guild is None:
+        return "Ошибка: инструмент можно использовать только на сервере."
+
+    # Защита владельца и самого бота от действий, нацеленных на пользователя.
+    _protected_ids = set(POS_OWNER_USER_IDS)
+    if bot.user:
+        _protected_ids.add(bot.user.id)
+    if user_id and user_id in _protected_ids and name in {
+        "ban_user", "timeout_user", "kick_user", "add_role", "remove_role", "set_nickname", "mute_ai_for_user"
+    }:
+        return "Ошибка: это действие нельзя применить к владельцу или к самому боту."
+
+    if name == "ban_user":
+        if not user_id:
+            return "Ошибка: не указан user_id"
+        reason = args.get("reason", "Бан от P.OS")
+        try:
+            await guild.ban(discord.Object(id=user_id), reason=reason)
+            return f"Пользователь {user_id} успешно забанен."
+        except Exception as e:
+            return f"Ошибка при бане: {e}"
+
+    elif name == "unban_user":
+        if not user_id:
+            return "Ошибка: не указан user_id"
+        try:
+            await guild.unban(discord.Object(id=user_id))
+            return f"Пользователь {user_id} успешно разбанен."
+        except Exception as e:
+            return f"Ошибка при разбане: {e}"
+
+    elif name == "timeout_user":
+        if not user_id:
+            return "Ошибка: не указан user_id"
+        try:
+            minutes = max(1, min(int(args.get("minutes", 10)), 40320))
+        except (ValueError, TypeError):
+            minutes = 10
+        reason = args.get("reason", "Тайм-аут от P.OS")
+        member = await _resolve_member(guild, user_id)
+        if not member:
+            return f"Ошибка: пользователь {user_id} не найден на сервере."
+        try:
+            until = discord.utils.utcnow() + datetime.timedelta(minutes=minutes)
+            await member.timeout(until, reason=reason)
+            return f"Пользователю {user_id} выдан тайм-аут на {minutes} минут."
+        except Exception as e:
+            return f"Ошибка при муте: {e}"
+
+    elif name == "kick_user":
+        if not user_id:
+            return "Ошибка: не указан user_id"
+        reason = args.get("reason", "Кик от P.OS")
+        member = await _resolve_member(guild, user_id)
+        if not member:
+            return f"Ошибка: пользователь {user_id} не найден на сервере."
+        try:
+            await member.kick(reason=reason)
+            return f"Пользователь {user_id} ({member.name}) кикнут с сервера."
+        except discord.Forbidden:
+            return "Ошибка: недостаточно прав для кика (проверь иерархию ролей)."
+        except Exception as e:
+            return f"Ошибка при кике: {e}"
+
+    elif name == "set_nickname":
+        if not user_id:
+            return "Ошибка: не указан user_id"
+        member = await _resolve_member(guild, user_id)
+        if not member:
+            return f"Ошибка: пользователь {user_id} не найден на сервере."
+        new_nick = str(args.get("nickname", "")).strip() or None
+        try:
+            await member.edit(nick=new_nick, reason="Смена ника от P.OS")
+            return f"Никнейм пользователя {user_id} изменён на '{new_nick or member.name}'."
+        except discord.Forbidden:
+            return "Ошибка: недостаточно прав для смены ника (проверь иерархию ролей)."
+        except Exception as e:
+            return f"Ошибка при смене ника: {e}"
+
+    elif name == "add_role":
+        if not user_id:
+            return "Ошибка: не указан user_id"
+        role_ident = str(args.get("role_id_or_name", ""))
+        member = await _resolve_member(guild, user_id)
+        if not member:
+            return "Ошибка: пользователь не найден."
+        role = resolve_role_smart(guild, role_ident)
+        if not role:
+            return _role_not_found_hint(guild, role_ident)
+        try:
+            await member.add_roles(role, reason="Выдано P.OS")
+            return f"Роль {role.name} успешно выдана пользователю {user_id}."
+        except discord.Forbidden:
+            return f"Ошибка: недостаточно прав, чтобы выдать роль '{role.name}'. Проверь, что роль P.OS выше неё в иерархии."
+        except Exception as e:
+            return f"Ошибка при выдаче роли: {e}"
+
+    elif name == "remove_role":
+        if not user_id:
+            return "Ошибка: не указан user_id"
+        role_ident = str(args.get("role_id_or_name", ""))
+        member = await _resolve_member(guild, user_id)
+        if not member:
+            return "Ошибка: пользователь не найден."
+        role = resolve_role_smart(guild, role_ident)
+        if not role:
+            return _role_not_found_hint(guild, role_ident)
+        try:
+            await member.remove_roles(role, reason="Снято P.OS")
+            return f"Роль {role.name} успешно снята с пользователя {user_id}."
+        except discord.Forbidden:
+            return f"Ошибка: недостаточно прав, чтобы снять роль '{role.name}'. Проверь иерархию ролей."
+        except Exception as e:
+            return f"Ошибка при снятии роли: {e}"
+
+    elif name == "create_role":
+        role_name = str(args.get("name", "")).strip()
+        if not role_name:
+            return "Ошибка: не указано имя роли (name)."
+        existing = resolve_role_smart(guild, role_name)
+        if existing and existing.name.lower() == role_name.lower():
+            return f"Роль с именем '{existing.name}' уже существует (ID {existing.id})."
+        color = discord.Color.default()
+        color_raw = str(args.get("color", "")).strip().lstrip("#")
+        if color_raw:
+            try:
+                color = discord.Color(int(color_raw, 16))
+            except (ValueError, TypeError):
+                color = discord.Color.default()
+        hoist = _parse_bool(args.get("hoist"))
+        mentionable = _parse_bool(args.get("mentionable"))
+        try:
+            new_role = await guild.create_role(
+                name=role_name, color=color, hoist=hoist, mentionable=mentionable, reason="Создано P.OS",
+            )
+            return f"Роль '{new_role.name}' создана (ID {new_role.id})."
+        except discord.Forbidden:
+            return "Ошибка: недостаточно прав для создания роли (нужно право «Управление ролями»)."
+        except Exception as e:
+            return f"Ошибка при создании роли: {e}"
+
+    elif name == "edit_role":
+        role_ident = str(args.get("role_id_or_name", ""))
+        role = resolve_role_smart(guild, role_ident)
+        if not role:
+            return _role_not_found_hint(guild, role_ident)
+        if role.is_default() or role.managed:
+            return f"Ошибка: роль '{role.name}' системная/управляется интеграцией — её нельзя изменить."
+        kwargs: dict = {}
+        if str(args.get("new_name", "")).strip():
+            kwargs["name"] = str(args["new_name"]).strip()
+        color_raw = str(args.get("color", "")).strip().lstrip("#")
+        if color_raw:
+            try:
+                kwargs["colour"] = discord.Color(int(color_raw, 16))
+            except (ValueError, TypeError):
+                pass
+        if args.get("hoist") not in (None, ""):
+            kwargs["hoist"] = _parse_bool(args.get("hoist"))
+        if args.get("mentionable") not in (None, ""):
+            kwargs["mentionable"] = _parse_bool(args.get("mentionable"))
+        if str(args.get("position", "")).strip():
+            try:
+                kwargs["position"] = max(1, int(args["position"]))
+            except (ValueError, TypeError):
+                pass
+        perms_raw = str(args.get("permissions", "")).strip()
+        if perms_raw:
+            perm_kwargs = {}
+            for token in re.split(r"[,\s]+", perms_raw):
+                token = token.strip().lower()
+                if token and hasattr(discord.Permissions, token):
+                    perm_kwargs[token] = True
+            if perm_kwargs:
+                try:
+                    kwargs["permissions"] = discord.Permissions(**perm_kwargs)
+                except Exception:
+                    pass
+        if not kwargs:
+            return "Ошибка: не указано ни одного поля для изменения роли."
+        try:
+            await role.edit(reason="Изменено P.OS", **kwargs)
+            return f"Роль '{role.name}' обновлена ({', '.join(kwargs.keys())})."
+        except discord.Forbidden:
+            return f"Ошибка: недостаточно прав, чтобы изменить роль '{role.name}'. Проверь иерархию ролей."
+        except Exception as e:
+            return f"Ошибка при изменении роли: {e}"
+
+    elif name == "delete_role":
+        role_ident = str(args.get("role_id_or_name", ""))
+        if not role_ident:
+            return "Ошибка: не указана роль (role_id_or_name)."
+        role = resolve_role_smart(guild, role_ident)
+        if not role:
+            return _role_not_found_hint(guild, role_ident)
+        if role.is_default() or role.managed:
+            return f"Ошибка: роль '{role.name}' системная или управляется интеграцией — её нельзя удалить."
+        role_name = role.name
+        try:
+            await role.delete(reason="Удалено P.OS")
+            return f"Роль '{role_name}' удалена с сервера."
+        except discord.Forbidden:
+            return f"Ошибка: недостаточно прав, чтобы удалить роль '{role_name}'. Проверь иерархию ролей."
+        except Exception as e:
+            return f"Ошибка при удалении роли: {e}"
+
+    elif name == "create_channel":
+        ch_name = str(args.get("name", "")).strip()
+        if not ch_name:
+            return "Ошибка: не указано имя канала (name)."
+        ch_type = str(args.get("type", "text")).strip().lower()
+        category = None
+        cat_ident = str(args.get("category_id_or_name", "")).strip()
+        if cat_ident:
+            resolved_cat = resolve_channel_smart(guild, cat_ident)
+            if isinstance(resolved_cat, discord.CategoryChannel):
+                category = resolved_cat
+        topic = str(args.get("topic", "")).strip()
+        try:
+            new_ch: discord.abc.GuildChannel
+            if ch_type in {"voice", "голос", "голосовой"}:
+                new_ch = await guild.create_voice_channel(ch_name, category=category, reason="Создано P.OS")
+            elif ch_type in {"category", "категория"}:
+                new_ch = await guild.create_category(ch_name, reason="Создано P.OS")
+            else:
+                new_ch = await guild.create_text_channel(
+                    ch_name, category=category,
+                    topic=topic or discord.utils.MISSING,
+                    reason="Создано P.OS",
+                )
+            return f"Канал '{new_ch.name}' создан (ID {new_ch.id})."
+        except discord.Forbidden:
+            return "Ошибка: недостаточно прав для создания канала (нужно «Управление каналами»)."
+        except Exception as e:
+            return f"Ошибка при создании канала: {e}"
+
+    elif name == "delete_channel":
+        ch_ident = str(args.get("channel_id_or_name", ""))
+        channel = resolve_channel_smart(guild, ch_ident)
+        if not channel:
+            return f"Ошибка: канал '{ch_ident}' не найден на сервере."
+        ch_name = channel.name
+        try:
+            await channel.delete(reason="Удалено P.OS")
+            return f"Канал '{ch_name}' удалён."
+        except discord.Forbidden:
+            return f"Ошибка: недостаточно прав, чтобы удалить канал '{ch_name}'."
+        except Exception as e:
+            return f"Ошибка при удалении канала: {e}"
+
+    elif name == "edit_channel":
+        ch_ident = str(args.get("channel_id_or_name", ""))
+        channel = resolve_channel_smart(guild, ch_ident)
+        if not channel:
+            return f"Ошибка: канал '{ch_ident}' не найден на сервере."
+        kwargs = {}
+        if str(args.get("new_name", "")).strip():
+            kwargs["name"] = str(args["new_name"]).strip()
+        if args.get("topic") not in (None, "") and isinstance(channel, discord.TextChannel):
+            kwargs["topic"] = str(args["topic"])
+        if str(args.get("slowmode_seconds", "")).strip() and isinstance(channel, discord.TextChannel):
+            try:
+                kwargs["slowmode_delay"] = max(0, min(int(args["slowmode_seconds"]), 21600))
+            except (ValueError, TypeError):
+                pass
+        if args.get("nsfw") not in (None, "") and isinstance(channel, discord.TextChannel):
+            kwargs["nsfw"] = _parse_bool(args.get("nsfw"))
+        cat_ident = str(args.get("category_id_or_name", "")).strip()
+        if cat_ident:
+            resolved_cat = resolve_channel_smart(guild, cat_ident)
+            if isinstance(resolved_cat, discord.CategoryChannel):
+                kwargs["category"] = resolved_cat
+        if not kwargs:
+            return "Ошибка: не указано ни одного поля для изменения канала."
+        try:
+            await channel.edit(reason="Изменено P.OS", **kwargs)
+            return f"Канал '{channel.name}' обновлён ({', '.join(kwargs.keys())})."
+        except discord.Forbidden:
+            return f"Ошибка: недостаточно прав, чтобы изменить канал '{channel.name}'."
+        except Exception as e:
+            return f"Ошибка при изменении канала: {e}"
+
+    elif name == "set_channel_permission":
+        ch_ident = str(args.get("channel_id_or_name", ""))
+        channel = resolve_channel_smart(guild, ch_ident)
+        if not channel:
+            return f"Ошибка: канал '{ch_ident}' не найден на сервере."
+        target_ident = str(args.get("target_role_or_user", "")).strip()
+        allow = _parse_bool(args.get("allow"), default=True)
+        target = resolve_role_smart(guild, target_ident)
+        if not target:
+            digits = re.sub(r"[^0-9]", "", target_ident)
+            if digits:
+                target = await _resolve_member(guild, int(digits))
+        if not target:
+            return f"Ошибка: цель '{target_ident}' (роль или пользователь) не найдена."
+        overwrite = discord.PermissionOverwrite(view_channel=allow, send_messages=allow)
+        try:
+            await channel.set_permissions(target, overwrite=overwrite, reason="Настройка прав P.OS")
+            verb = "открыт" if allow else "закрыт"
+            return f"Доступ к каналу '{channel.name}' для '{getattr(target, 'name', target)}' {verb}."
+        except discord.Forbidden:
+            return f"Ошибка: недостаточно прав, чтобы менять доступ к каналу '{channel.name}'."
+        except Exception as e:
+            return f"Ошибка при настройке прав: {e}"
+
+    elif name == "create_invite":
+        ch_ident = str(args.get("channel_id_or_name", "")).strip()
+        invite_channel = None
+        if ch_ident:
+            resolved = resolve_channel_smart(guild, ch_ident)
+            if isinstance(resolved, (discord.TextChannel, discord.VoiceChannel)):
+                invite_channel = resolved
+        if not invite_channel:
+            for ch in guild.text_channels:
+                perms = ch.permissions_for(guild.me) if guild.me else None
+                if perms and perms.create_instant_invite:
+                    invite_channel = ch
+                    break
+        if not invite_channel:
+            return f"Нет доступных каналов для создания приглашения на сервере '{guild.name}'."
+        try:
+            invite = await invite_channel.create_invite(max_age=86400, max_uses=0, unique=True, reason="Создано P.OS")
+            return f"Приглашение на сервер '{guild.name}': {invite.url} (действует 24 часа)."
+        except discord.Forbidden:
+            return "Ошибка: недостаточно прав для создания приглашения."
+        except Exception as e:
+            return f"Ошибка при создании приглашения: {e}"
+
+    elif name == "delete_messages":
+        msg_channel = message.channel
+        if not isinstance(msg_channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
+            return "Ошибка: удаление сообщений доступно только в текстовых каналах."
+        try:
+            count = int(args.get("count", 0))
+        except (ValueError, TypeError):
+            count = 0
+        if count < 1:
+            return "Ошибка: укажи количество сообщений (count) от 1 до 100."
+        count = min(count, 100)
+        try:
+            deleted = await msg_channel.purge(limit=count + 1, check=lambda m: m.id != message.id)
+            num = len([m for m in deleted if m.id != message.id])
+            return f"Удалено сообщений: {num}."
+        except discord.Forbidden:
+            return "Ошибка: недостаточно прав для удаления сообщений (нужно «Управление сообщениями»)."
+        except Exception as e:
+            return f"Ошибка при удалении сообщений: {e}"
+
+    elif name == "setup_logging":
+        category_name = str(args.get("category_name", "")).strip() or None
+        try:
+            ok, report = await setup_guild_logging(guild, category_name)
+            return report if ok else f"Не удалось развернуть логи: {report}"
+        except Exception as e:
+            return f"Ошибка при развёртывании логов: {e}"
+
+    elif name == "mute_ai_for_user":
+        if not user_id:
+            return "Ошибка: не указан user_id"
+        try:
+            await set_ai_muted_user(user_id, guild.id, True)
+            return f"Пользователь {user_id} добавлен в чёрный список."
+        except Exception as e:
+            return f"Ошибка базы данных: {e}"
+
+    elif name == "unmute_ai_for_user":
+        if not user_id:
+            return "Ошибка: не указан user_id"
+        try:
+            await set_ai_muted_user(user_id, guild.id, False)
+            return f"Пользователь {user_id} удалён из чёрного списка."
+        except Exception as e:
+            return f"Ошибка базы данных: {e}"
+
+    return f"Неизвестный инструмент: {name}"
+
+
+def _summarize_tool_call(name: str, args: dict, user_id: int | None) -> str:
+    """Краткое человекочитаемое описание запрошенного действия для подтверждения."""
+    label = _TOOL_ACTION_LABELS.get(name, name)
+    details = []
+    if user_id:
+        details.append(f"пользователь `{user_id}`")
+    for key in ("role_id_or_name", "name", "new_name", "channel_id_or_name", "target_role_or_user", "nickname", "reason", "minutes", "count"):
+        val = args.get(key)
+        if val:
+            details.append(f"{key}={val}")
+    tail = (" — " + ", ".join(details)) if details else ""
+    return f"{label}{tail}"
+
+
 async def execute_pos_tool(bot: discord.Client, message: discord.Message | None, tool_call: dict) -> str:
     if not message or not message.guild:
         return "Ошибка: инструмент можно использовать только на сервере."
@@ -143,223 +620,44 @@ async def execute_pos_tool(bot: discord.Client, message: discord.Message | None,
     except (ValueError, TypeError):
         user_id = None
 
-    # --- #1/#2: Все инструменты управления требуют прав владельца ---
-    if name in _OWNER_ONLY_TOOLS:
-        if message.author.id not in POS_OWNER_USER_IDS:
-            owner_id = POS_OWNER_USER_IDS[0] if POS_OWNER_USER_IDS else 968698192411652176
-            owner = bot.get_user(owner_id)
-            if owner:
-                action_name = {
-                    "ban_user": "бан", "unban_user": "разбан", "timeout_user": "мут",
-                    "add_role": "выдачу роли", "remove_role": "снятие роли",
-                    "create_role": "создание роли", "delete_role": "удаление роли",
-                    "delete_messages": "удаление сообщений",
-                    "setup_logging": "разворачивание системы логов",
-                    "mute_ai_for_user": "блокировку ответов", "unmute_ai_for_user": "снятие блокировки",
-                }.get(name, name)
-                user_name = getattr(message.guild.get_member(user_id), "name", str(user_id)) if user_id else "не указан"
-                reason = args.get("reason", args.get("role_id_or_name", "Причина не указана"))
-                try:
-                    await owner.send(
-                        f"⚠️ **Запрос на {action_name} от ИИ P.OS**\n"
-                        f"Пользователь: {user_name} (`{user_id}`)\n"
-                        f"Причина/Роль: {reason}\nКонтекст: {message.jump_url}"
-                    )
-                except Exception:
-                    pass
-            return f"Отказано в доступе. Запрос на {name} отправлен владельцу на подтверждение."
+    # --- Гейт прав: управляющие инструменты — только владелец ---
+    # В бете все управляющие действия доступны напрямую только владельцу.
+    # Если запрос пришёл не от владельца — P.OS отправляет владельцу запрос
+    # с кнопками «Разрешить»/«Запретить», и действие выполняется лишь по подтверждению.
+    if name in _OWNER_ONLY_TOOLS and message.author.id not in POS_OWNER_USER_IDS:
+        owner_id = POS_OWNER_USER_IDS[0] if POS_OWNER_USER_IDS else 968698192411652176
+        owner = bot.get_user(owner_id)
+        summary = _summarize_tool_call(name, args, user_id)
+        requester = f"{message.author.display_name} (@{message.author.name}, ID: {message.author.id})"
 
-    # --- #8: Защита бота и владельца от инструментов ---
-    _protected_ids = set(POS_OWNER_USER_IDS)
-    if bot.user:
-        _protected_ids.add(bot.user.id)
-    if user_id and user_id in _protected_ids:
-        return "Ошибка: это действие нельзя применить к владельцу или к самому боту."
+        async def _executor():
+            return await _perform_tool_action(bot, message, name, args, user_id)
 
-    if name == "ban_user":
-        if not user_id:
-            return "Ошибка: не указан user_id"
-        reason = args.get("reason", "Бан от P.OS")
-        try:
-            await message.guild.ban(discord.Object(id=user_id), reason=reason)
-            return f"Пользователь {user_id} успешно забанен."
-        except Exception as e:
-            return f"Ошибка при бане: {e}"
-
-    elif name == "unban_user":
-        if not user_id:
-            return "Ошибка: не указан user_id"
-        try:
-            await message.guild.unban(discord.Object(id=user_id))
-            return f"Пользователь {user_id} успешно разбанен."
-        except Exception as e:
-            return f"Ошибка при разбане: {e}"
-
-    elif name == "timeout_user":
-        if not user_id:
-            return "Ошибка: не указан user_id"
-        try:
-            minutes = max(1, min(int(args.get("minutes", 10)), 40320))  # #14: bounds 1..40320 мин
-        except (ValueError, TypeError):
-            minutes = 10
-        reason = args.get("reason", "Тайм-аут от P.OS")
-        member = message.guild.get_member(user_id)
-        if not member:
+        if owner:
             try:
-                member = await message.guild.fetch_member(user_id)
+                from forms import PosActionConfirmView
+                view = PosActionConfirmView(
+                    owner_user_ids=POS_OWNER_USER_IDS,
+                    executor=_executor,
+                    action_summary=summary,
+                    requester_label=requester,
+                )
+                await owner.send(
+                    f"⚠️ **Запрос на {summary}**\n"
+                    f"Инициатор: {requester}\n"
+                    f"Сервер: {message.guild.name}\n"
+                    f"Контекст: {message.jump_url}\n\n"
+                    f"Разрешить выполнение?",
+                    view=view,
+                )
+                return f"Запрос на «{summary}» отправлен владельцу на подтверждение (кнопки Разрешить/Запретить в ЛС)."
             except Exception:
-                pass
-        if not member:
-            return f"Ошибка: пользователь {user_id} не найден на сервере."
-        try:
-            until = discord.utils.utcnow() + datetime.timedelta(minutes=minutes)
-            await member.timeout(until, reason=reason)
-            return f"Пользователю {user_id} выдан тайм-аут на {minutes} минут."
-        except Exception as e:
-            return f"Ошибка при муте: {e}"
+                return "Не удалось отправить запрос владельцу на подтверждение."
+        return f"Отказано в доступе. Это действие в бете доступно только владельцу."
 
-    elif name == "add_role":
-        if not user_id:
-            return "Ошибка: не указан user_id"
-        role_ident = str(args.get("role_id_or_name", ""))
-        member = message.guild.get_member(user_id)
-        if not member:
-            try:
-                member = await message.guild.fetch_member(user_id)
-            except Exception:
-                pass
-        if not member:
-            return "Ошибка: пользователь не найден."
-        role = resolve_role_smart(message.guild, role_ident)
-        if not role:
-            return _role_not_found_hint(message.guild, role_ident)
-        try:
-            await member.add_roles(role, reason="Выдано P.OS")
-            return f"Роль {role.name} успешно выдана пользователю {user_id}."
-        except discord.Forbidden:
-            return f"Ошибка: недостаточно прав, чтобы выдать роль '{role.name}'. Проверь, что роль P.OS выше неё в иерархии."
-        except Exception as e:
-            return f"Ошибка при выдаче роли: {e}"
+    # Владелец (или не-owner-only инструмент) — выполняем напрямую.
+    return await _perform_tool_action(bot, message, name, args, user_id)
 
-    elif name == "remove_role":
-        if not user_id:
-            return "Ошибка: не указан user_id"
-        role_ident = str(args.get("role_id_or_name", ""))
-        member = message.guild.get_member(user_id)
-        if not member:
-            try:
-                member = await message.guild.fetch_member(user_id)
-            except Exception:
-                pass
-        if not member:
-            return "Ошибка: пользователь не найден."
-        role = resolve_role_smart(message.guild, role_ident)
-        if not role:
-            return _role_not_found_hint(message.guild, role_ident)
-        try:
-            await member.remove_roles(role, reason="Снято P.OS")
-            return f"Роль {role.name} успешно снята с пользователя {user_id}."
-        except discord.Forbidden:
-            return f"Ошибка: недостаточно прав, чтобы снять роль '{role.name}'. Проверь иерархию ролей."
-        except Exception as e:
-            return f"Ошибка при снятии роли: {e}"
-
-    elif name == "create_role":
-        role_name = str(args.get("name", "")).strip()
-        if not role_name:
-            return "Ошибка: не указано имя роли (name)."
-        existing = resolve_role_smart(message.guild, role_name)
-        if existing and existing.name.lower() == role_name.lower():
-            return f"Роль с именем '{existing.name}' уже существует (ID {existing.id})."
-        color = discord.Color.default()
-        color_raw = str(args.get("color", "")).strip().lstrip("#")
-        if color_raw:
-            try:
-                color = discord.Color(int(color_raw, 16))
-            except (ValueError, TypeError):
-                color = discord.Color.default()
-        hoist = str(args.get("hoist", "")).lower() in {"true", "1", "да", "yes"}
-        mentionable = str(args.get("mentionable", "")).lower() in {"true", "1", "да", "yes"}
-        try:
-            new_role = await message.guild.create_role(
-                name=role_name,
-                color=color,
-                hoist=hoist,
-                mentionable=mentionable,
-                reason="Создано P.OS",
-            )
-            return f"Роль '{new_role.name}' создана (ID {new_role.id})."
-        except discord.Forbidden:
-            return "Ошибка: недостаточно прав для создания роли (нужно право «Управление ролями»)."
-        except Exception as e:
-            return f"Ошибка при создании роли: {e}"
-
-    elif name == "delete_role":
-        role_ident = str(args.get("role_id_or_name", ""))
-        if not role_ident:
-            return "Ошибка: не указана роль (role_id_or_name)."
-        role = resolve_role_smart(message.guild, role_ident)
-        if not role:
-            return _role_not_found_hint(message.guild, role_ident)
-        if role.is_default() or role.managed:
-            return f"Ошибка: роль '{role.name}' системная или управляется интеграцией — её нельзя удалить."
-        role_name = role.name
-        try:
-            await role.delete(reason="Удалено P.OS")
-            return f"Роль '{role_name}' удалена с сервера."
-        except discord.Forbidden:
-            return f"Ошибка: недостаточно прав, чтобы удалить роль '{role_name}'. Проверь иерархию ролей."
-        except Exception as e:
-            return f"Ошибка при удалении роли: {e}"
-
-    elif name == "delete_messages":
-        channel = message.channel
-        if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
-            return "Ошибка: удаление сообщений доступно только в текстовых каналах."
-        try:
-            count = int(args.get("count", 0))
-        except (ValueError, TypeError):
-            count = 0
-        if count < 1:
-            return "Ошибка: укажи количество сообщений (count) от 1 до 100."
-        count = min(count, 100)
-        try:
-            # +1: не считаем само командное сообщение владельца частью лимита
-            deleted = await channel.purge(limit=count + 1, check=lambda m: m.id != message.id)
-            num = len([m for m in deleted if m.id != message.id])
-            return f"Удалено сообщений: {num}."
-        except discord.Forbidden:
-            return "Ошибка: недостаточно прав для удаления сообщений (нужно право «Управление сообщениями»)."
-        except Exception as e:
-            return f"Ошибка при удалении сообщений: {e}"
-
-    elif name == "setup_logging":
-        category_name = str(args.get("category_name", "")).strip() or None
-        try:
-            ok, report = await setup_guild_logging(message.guild, category_name)
-            return report if ok else f"Не удалось развернуть логи: {report}"
-        except Exception as e:
-            return f"Ошибка при развёртывании логов: {e}"
-
-    elif name == "mute_ai_for_user":
-        if not user_id:
-            return "Ошибка: не указан user_id"
-        try:
-            await set_ai_muted_user(user_id, message.guild.id, True)
-            return f"Пользователь {user_id} добавлен в чёрный список."
-        except Exception as e:
-            return f"Ошибка базы данных: {e}"
-
-    elif name == "unmute_ai_for_user":
-        if not user_id:
-            return "Ошибка: не указан user_id"
-        try:
-            await set_ai_muted_user(user_id, message.guild.id, False)
-            return f"Пользователь {user_id} удалён из чёрного списка."
-        except Exception as e:
-            return f"Ошибка базы данных: {e}"
-
-    return f"Неизвестный инструмент: {name}"
 
 AI_COOLDOWN_SECONDS = 1.5  # уменьшен для живого диалога
 AI_MAX_CONTEXT = 64
@@ -391,11 +689,10 @@ GIF_INTENT_PATTERN = re.compile(r"\b(сделай|создай|собери|сг
 MUTE_PATTERN = re.compile(r"(не\s*отвечай|не\s*пиши|игнорируй\s*меня|молчи\s*со\s*мной)", re.IGNORECASE)
 UNMUTE_PATTERN = re.compile(r"(можешь\s*отвечать|снова\s*отвечай|вернись\s*в\s*диалог|разрешаю\s*отвечать)", re.IGNORECASE)
 HELP_PATTERN = re.compile(r"\b(help|хелп|помощь|команды|список\s+команд)\b", re.IGNORECASE)
-INVITE_PATTERN = re.compile(r"\b(создай|сделай|дай|пришли|invite|инвайт|приглашение|ссылку\s+на\s+вход)\b", re.IGNORECASE)
+# Только критичные действия (бан/разбан) обрабатываются детерминированно ради надёжности.
+# Роли, инвайты, каналы и прочее управление сервером выполняются через tool-вызовы ИИ.
 BAN_PATTERN = re.compile(r"\b(забань|ban|выдай\s*бан)\b", re.IGNORECASE)
 UNBAN_PATTERN = re.compile(r"\b(разбань|unban|сними\s*бан)\b", re.IGNORECASE)
-ADD_ROLE_PATTERN = re.compile(r"\b(добавь|выдай|назначь)\s+роль\b|\b(add)\s+role\b", re.IGNORECASE)
-REMOVE_ROLE_PATTERN = re.compile(r"\b(сними|убери|забери)\s+роль\b|\b(remove)\s+role\b", re.IGNORECASE)
 DB_ADD_PATTERN = re.compile(r"\b(запомни|добавь\s+в\s+базу|запиши\s+в\s+базу|db\s+add)\b", re.IGNORECASE)
 DB_LIST_PATTERN = re.compile(r"\b(покажи\s+базу|список\s+базы|db\s+list)\b", re.IGNORECASE)
 DB_DELETE_PATTERN = re.compile(r"\b(удали\s+из\s+базы|db\s+delete|db\s+del)\b", re.IGNORECASE)
@@ -658,11 +955,22 @@ def _format_guild_snapshot(message: discord.Message, bot: discord.Client) -> str
         # именами/ID и не отвечала «не знаю такую роль».
         guild_roles = [r for r in guild.roles if r.name != "@everyone"]
         guild_roles.sort(key=lambda r: r.position, reverse=True)
-        roles_list = "; ".join(f"{r.name} (`{r.id}`)" for r in guild_roles[:60])
+        roles_list = "; ".join(f"{r.name} (`{r.id}`)" for r in guild_roles[:120])
         roles_info = f"\nРоли сервера (имя и ID): {roles_list or 'нет данных'}."
+        # Список каналов и категорий — чтобы модель точно сопоставляла каналы для
+        # create_channel/delete_channel/edit_channel/set_channel_permission.
+        cat_parts = []
+        for category, ch_list in guild.by_category():
+            cat_name = category.name if category else "Без категории"
+            chans = ", ".join(f"#{c.name} (`{c.id}`)" for c in ch_list[:25])
+            if chans:
+                cat_parts.append(f"[{cat_name}] {chans}")
+        channels_blob = " | ".join(cat_parts)[:2500]
+        channels_info = f"\nКаналы сервера (по категориям): {channels_blob or 'нет данных'}."
     else:
         servers_info = ""
         roles_info = ""
+        channels_info = ""
 
     return (
         f"Это ты — P.OS. Твой Discord ID: `{bot_id}`, твоё упоминание: {bot_mention}.\n"
@@ -670,6 +978,7 @@ def _format_guild_snapshot(message: discord.Message, bot: discord.Client) -> str
         f"Канал: #{getattr(message.channel, 'name', message.channel)} (`{message.channel.id}`)."
         + servers_info
         + roles_info
+        + channels_info
     )
 
 
@@ -1052,15 +1361,14 @@ def _format_owner_help(bot: discord.Client) -> str:
         "`P.OS хелп` — показать команды и серверы.\n"
         "`P.OS забань @user причина: ...` — бан на текущем сервере.\n"
         "`P.OS разбань 123456789012345678` — разбан по ID.\n"
-        "`P.OS добавь роль @роль @user` — выдать роль.\n"
-        "`P.OS сними роль @роль @user` — снять роль.\n"
         "`P.OS обнови контекст` — собрать свежую память по доступным каналам сервера.\n"
         "`P.OS разверни логи` — создать категорию и каналы логов на этом сервере (видны только админам).\n"
-        "`P.OS инвайт` или `P.OS инвайт [имя сервера]` — создать приглашение.\n"
-
         "`P.OS запомни Заголовок: текст` — записать факт в базу.\n"
         "`P.OS покажи базу` — показать последние записи.\n"
         "`P.OS удали из базы 12` — удалить запись.\n\n"
+        "Управление сервером (роли, каналы, права, кики, ники, инвайты) — просто скажи мне словами, "
+        "например «P.OS создай роль Ветеран синего цвета», «P.OS выдай роль Арбайтер @user», "
+        "«P.OS создай голосовой канал Переговоры», «P.OS дай инвайт». Я выполню это через свои инструменты.\n\n"
         "Серверы, где есть P.OS:\n"
         f"{guild_text}"
     )
@@ -1194,7 +1502,7 @@ async def _build_messages(
         messages.append(
             {
                 "role": "system" if use_system else "user",
-                "content": "Контекст сервера и последних сообщений:\n" + server_context[:7000],
+                "content": "Контекст сервера и последних сообщений:\n" + server_context[:11000],
             }
         )
 
@@ -1330,108 +1638,6 @@ async def _handle_owner_actions(message: discord.Message, ref_msg: Optional[disc
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return True
-
-    if INVITE_PATTERN.search(text):
-        # Ищем текстовый канал на нужном сервере
-        invite_channel = None
-        for ch in guild.text_channels:
-            perms = ch.permissions_for(guild.me) if guild.me else None
-            if perms and perms.create_instant_invite:
-                invite_channel = ch
-                break
-        if not invite_channel:
-            await message.reply(
-                f"Нет доступных каналов для создания приглашения на сервере `{guild.name}`.",
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return True
-        try:
-            invite = await invite_channel.create_invite(max_age=86400, max_uses=0, unique=True)
-            await message.reply(
-                f"Приглашение на сервер **{guild.name}**: {invite.url}\n_Действует 24 часа._",
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except Exception as exc:
-            await message.reply(
-                f"Не смог создать приглашение: {exc}",
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        return True
-
-    if ADD_ROLE_PATTERN.match(command_body) or REMOVE_ROLE_PATTERN.match(command_body):
-        # Сначала резолвим роль — по @mention роли или по ID из guild.roles
-        role = _resolve_role(message, guild, text)
-
-        # Теперь резолвим юзера — исключая ID роли из поиска
-        role_ids_to_exclude: set[int] = set()
-        if role:
-            role_ids_to_exclude.add(role.id)
-        # Также исключаем ID всех ролей сервера чтобы не спутать с юзером
-        role_ids_to_exclude.update(r.id for r in guild.roles)
-
-        target_id: int | None = None
-        # Сначала смотрим на @user упоминания (не @role)
-        user_mentions = [m for m in message.mentions if not m.bot or m.id == message.author.id]
-        if user_mentions:
-            target_id = user_mentions[0].id
-        # Потом реплай
-        elif ref_msg and ref_msg.author and not ref_msg.author.bot:
-            target_id = ref_msg.author.id
-        else:
-            # Ищем ID которые НЕ являются ID роли
-            for uid in _extract_discord_ids(text):
-                if uid not in role_ids_to_exclude:
-                    target_id = uid
-                    break
-            # Если юзер не указан — применяем к самому отправителю (владельцу)
-            if not target_id:
-                target_id = message.author.id
-
-        if not role:
-            await message.reply(
-                "Не нашёл роль. Укажи @упоминанием или ID роли. Пример: `P.OS сними роль 1341379345322610698`",
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return True
-
-        member = guild.get_member(target_id)
-        if not member:
-            try:
-                member = await guild.fetch_member(target_id)
-            except Exception:
-                member = None
-        if not member:
-            await message.reply(
-                f"Пользователь `{target_id}` не найден на сервере `{guild.name}`.",
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return True
-
-        try:
-            if ADD_ROLE_PATTERN.match(command_body):
-                await member.add_roles(role, reason=f"P.OS owner command by {message.author}")
-                action_text = "выдана"
-            else:
-                await member.remove_roles(role, reason=f"P.OS owner command by {message.author}")
-                action_text = "снята"
-            await message.reply(
-                f"Готово. Роль `{role.name}` {action_text} — `{member}` на `{guild.name}`.",
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return True
-        except Exception as exc:
-            await message.reply(
-                f"Не удалось изменить роль: {exc}",
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return True
 
     if BAN_PATTERN.match(command_body):
         target_id = _resolve_target_user_id(message, text, ref_msg, guild, bot)
