@@ -21,7 +21,13 @@ from config import (
     TARGET_OUTPUT_CHANNEL,
 )
 from forms import ConfirmView, ComplaintView
-from utils import extract_clean_keyword, assess_applicant_risk, safe_send_dm
+from utils import (
+    extract_clean_keyword,
+    assess_applicant_risk,
+    assess_roblox_account,
+    classify_applicant_danger,
+    safe_send_dm,
+)
 from logging_utils import send_log_embed
 
 logger = logging.getLogger(__name__)
@@ -229,29 +235,78 @@ class FormsCog(commands.Cog):
                     pass
                 return
 
+            # Канал-приёмник заявок: get_channel, при промахе кэша — fetch_channel.
             target_channel = message.guild.get_channel(TAC_CHANNEL_ID)
             if not target_channel:
                 try:
-                    await message.reply("❌ Ошибка конфигурации: канал Arbaiter не найден.")
+                    target_channel = await self.bot.fetch_channel(TAC_CHANNEL_ID)
+                except Exception:
+                    target_channel = None
+            if not isinstance(target_channel, (discord.TextChannel, discord.Thread)):
+                logger.error(f"Arbaiter: канал-приёмник {TAC_CHANNEL_ID} не найден или не текстовый.")
+                try:
+                    await message.reply(
+                        "⚠️ Заявка принята, но канал рассмотрения временно недоступен — "
+                        "сообщи администрации."
+                    )
                 except Exception:
                     pass
                 return
 
-            risk_flags = assess_applicant_risk(user_line, discord_nick_line, message.author)
-            risk_text = "\n".join(f"⚠️ {flag}" for flag in risk_flags) if risk_flags else "✅ Явных рисков не обнаружено"
+            # --- Вердикт: проверяем Discord-аккаунт и Roblox-аккаунт по логину ---
+            discord_flags = assess_applicant_risk(user_line, discord_nick_line, message.author)
+            roblox = await assess_roblox_account(user_line)
+            danger_level, too_dangerous = classify_applicant_danger(discord_flags, roblox)
+
+            discord_text = "\n".join(f"⚠️ {flag}" for flag in discord_flags) or "✅ Явных рисков не обнаружено"
+
+            # Блок Roblox-аккаунта
+            if roblox.get("found") is True:
+                age = roblox.get("age_days")
+                age_text = f"{age} дн." if age is not None else "неизвестно"
+                roblox_lines = [
+                    f"Логин: `{roblox.get('name') or user_line}`"
+                    + (f" (дисплей: {roblox['display_name']})" if roblox.get("display_name") else ""),
+                    f"Возраст аккаунта: {age_text}",
+                    f"Бан: {'🚫 ДА' if roblox.get('banned') else 'нет'}",
+                ]
+                if roblox.get("profile_url"):
+                    roblox_lines.append(f"[Профиль Roblox]({roblox['profile_url']})")
+            elif roblox.get("found") is False:
+                roblox_lines = [f"❌ Roblox-аккаунт `{user_line}` не найден"]
+            else:
+                roblox_lines = [f"❓ Не удалось проверить Roblox `{user_line}` (API недоступен)"]
+            for flag in roblox.get("flags", []):
+                roblox_lines.append(f"⚠️ {flag}")
+            roblox_text = "\n".join(roblox_lines)
+
+            color = {"high": Color.red(), "medium": Color.gold(), "low": Color.green()}.get(danger_level, Color.blue())
+            title = "📋 Заявка в Arbaiter"
+            if too_dangerous:
+                title = "🚨 ОПАСНЫЙ КАНДИДАТ — заявка в Arbaiter"
 
             embed = Embed(
-                title="📋 Подтверждение вступления в Arbaiter",
+                title=title,
                 description=(
                     f"{message.author.mention} хочет вступить в отряд **Arbaiter**\n"
                     f"Roblox ник: `{user_line}`\n"
                     f"Discord ник: `{discord_nick_line}`\n"
                     f"Почему решили вступить: {why_line}"
                 ),
-                color=Color.blue()
+                color=color,
             )
-            embed.add_field(name="Автопроверка кандидата", value=risk_text[:1024], inline=False)
-            embed.set_footer(text=f"ID пользователя: {message.author.id} | {discord.utils.utcnow().strftime('%d.%m.%Y %H:%M:%S')}")
+            if too_dangerous:
+                embed.add_field(
+                    name="🚨 ВНИМАНИЕ",
+                    value="Кандидат помечен как **потенциально опасный**. Проверьте вручную перед принятием.",
+                    inline=False,
+                )
+            embed.add_field(name="🔎 Проверка Discord", value=discord_text[:1024], inline=False)
+            embed.add_field(name="🎮 Проверка Roblox", value=roblox_text[:1024], inline=False)
+            embed.set_footer(
+                text=f"ID пользователя: {message.author.id} | уровень риска: {danger_level.upper()} | "
+                f"{discord.utils.utcnow().strftime('%d.%m.%Y %H:%M:%S')}"
+            )
 
             view = ConfirmView(
                 TAC_REVIEWER_ROLE_IDS,
