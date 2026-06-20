@@ -308,8 +308,10 @@ class FormsCog(commands.Cog):
                 f"{discord.utils.utcnow().strftime('%d.%m.%Y %H:%M:%S')}"
             )
 
+            # Пустой список разрешённых ролей — кнопки может нажимать любой, у кого
+            # есть доступ к каналу заявок (проверяющих по-прежнему пингуем ниже).
             view = ConfirmView(
-                TAC_REVIEWER_ROLE_IDS,
+                [],
                 target_message=message,
                 squad_name="Arbaiter",
                 role_ids=TAC_ROLE_REWARDS,

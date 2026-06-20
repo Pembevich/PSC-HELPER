@@ -5,7 +5,10 @@ with patch("storage.add_entry"), \
      patch("storage.get_ai_context"), \
      patch("storage.update_ai_context"):
     import pos_ai
-    from pos_ai import _parse_bool, _summarize_tool_call, _OWNER_ONLY_TOOLS, _TOOL_ACTION_LABELS
+    from pos_ai import (
+        _parse_bool, _summarize_tool_call,
+        _OWNER_ONLY_TOOLS, _OWNER_INFO_TOOLS, _TOOL_ACTION_LABELS,
+    )
 
 from cogs.ai_tools import POS_AI_TOOLS
 
@@ -37,6 +40,18 @@ class ToolSchemaTests(unittest.TestCase):
             self.assertIn("description", fn)
             self.assertIn("parameters", fn)
             self.assertEqual(fn["parameters"]["type"], "object")
+
+    def test_list_servers_registered_and_owner_only(self):
+        names = {t["function"]["name"] for t in POS_AI_TOOLS}
+        self.assertIn("list_servers", names)
+        self.assertIn("list_servers", _OWNER_ONLY_TOOLS)
+        # list_servers — read-only owner info: для не-владельца отказ без подтверждения.
+        self.assertIn("list_servers", _OWNER_INFO_TOOLS)
+
+    def test_create_invite_supports_cross_server(self):
+        ci = next(t for t in POS_AI_TOOLS if t["function"]["name"] == "create_invite")
+        props = ci["function"]["parameters"]["properties"]
+        self.assertIn("server_id_or_name", props)
 
 
 class InviteBugRegressionTests(unittest.TestCase):

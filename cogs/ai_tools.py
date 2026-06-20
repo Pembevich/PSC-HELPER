@@ -291,12 +291,25 @@ POS_AI_TOOLS = [
         "type": "function",
         "function": {
             "name": "create_invite",
-            "description": "Создаёт приглашение (invite) на сервер. Действует 24 часа.",
+            "description": "Создаёт приглашение (invite) на сервер. Действует 24 часа. По умолчанию — текущий сервер; владелец может указать любой сервер, где есть P.OS.",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "server_id_or_name": {"type": "string", "description": "Необязательно. ID или название сервера, на который создать приглашение (из числа серверов, где есть P.OS). Если не указан — текущий сервер."},
                     "channel_id_or_name": {"type": "string", "description": "Необязательно. Канал, для которого создать приглашение. Если не указан — берётся первый доступный."}
                 },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_servers",
+            "description": "Возвращает список серверов (гильдий), где присутствует P.OS, с названиями, ID и числом участников. ТОЛЬКО для владельца.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
                 "required": []
             }
         }

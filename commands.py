@@ -223,10 +223,12 @@ def _build_gif_from_video(
     try:
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         
-        # scale logic: w=if(gt(iw,ih),640,-1), h=if(gt(iw,ih),-1,640)
+        # Ограничиваем по длинной стороне: landscape (iw>ih) — ширину, иначе высоту.
+        # Вторая сторона = -2 (авто, чётная). У обоих выражений ЕСТЬ else-ветка,
+        # иначе для горизонтального видео высота становилась невалидной и ffmpeg падал.
         filter_str = (
             f"fps={actual_fps},"
-            f"scale='if(gt(iw,ih),min(iw,{max_dim}),-1)':'if(gt(ih,iw),min(ih,{max_dim}))':flags=lanczos,"
+            f"scale='if(gt(iw,ih),min(iw,{max_dim}),-2)':'if(gt(iw,ih),-2,min(ih,{max_dim}))':flags=lanczos,"
             f"split[s0][s1];[s0]palettegen=stats_mode=single[p];[s1][p]paletteuse=dither=sierra2_4a"
         )
         
