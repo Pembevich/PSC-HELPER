@@ -15,9 +15,20 @@ from moderation import (
     log_violation_with_evidence,
 )
 from guild_config import get_settings as get_guild_settings
+from logging_utils import is_log_channel
+from config import FORM_CHANNEL_ID, COMPLAINT_INPUT_CHANNEL, form_channel_id
 import antiraid
 
 logger = logging.getLogger(__name__)
+
+# Функциональные каналы со структурированным вводом (заявки/жалобы/наказания):
+# здесь контент обрабатывают коги форм, автомодерация их трогать НЕ должна,
+# иначе она удаляет/таймаутит легитимные заявки. Логи тоже не модерируем.
+NO_MODERATION_CHANNEL_IDS = {
+    FORM_CHANNEL_ID,            # заявки Arbaiter (1510201947024789665)
+    COMPLAINT_INPUT_CHANNEL,    # жалобы
+    form_channel_id,            # форма наказаний
+}
 
 
 class ModerationCog(commands.Cog):
@@ -48,6 +59,12 @@ class ModerationCog(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if not message.guild or message.author.bot:
+            return
+
+        # Не модерируем функциональные каналы (заявки/жалобы/наказания) и логи —
+        # там структурированный ввод обрабатывают коги форм. Иначе автомодерация
+        # удаляет/таймаутит легитимные заявки и они «перестают работать».
+        if message.channel.id in NO_MODERATION_CHANNEL_IDS or is_log_channel(message.channel):
             return
 
         # Настройки модерации на сервер (с дефолтами). Общий выключатель и

@@ -259,9 +259,23 @@ class FormsCog(commands.Cog):
                 return
 
             # --- Вердикт: проверяем Discord-аккаунт и Roblox-аккаунт по логину ---
-            discord_flags = assess_applicant_risk(user_line, discord_nick_line, message.author)
-            roblox = await assess_roblox_account(user_line)
-            danger_level, too_dangerous = classify_applicant_danger(discord_flags, roblox)
+            # Любая ошибка проверки НЕ должна ронять заявку — она всё равно уйдёт
+            # проверяющим, просто без авто-вердикта.
+            try:
+                discord_flags = assess_applicant_risk(user_line, discord_nick_line, message.author)
+            except Exception as e:
+                logger.error(f"Arbaiter: ошибка assess_applicant_risk: {e}", exc_info=True)
+                discord_flags = []
+            try:
+                roblox = await assess_roblox_account(user_line)
+            except Exception as e:
+                logger.error(f"Arbaiter: ошибка assess_roblox_account: {e}", exc_info=True)
+                roblox = {"found": None, "flags": []}
+            try:
+                danger_level, too_dangerous = classify_applicant_danger(discord_flags, roblox)
+            except Exception as e:
+                logger.error(f"Arbaiter: ошибка classify_applicant_danger: {e}", exc_info=True)
+                danger_level, too_dangerous = "low", False
 
             discord_text = "\n".join(f"⚠️ {flag}" for flag in discord_flags) or "✅ Явных рисков не обнаружено"
 
