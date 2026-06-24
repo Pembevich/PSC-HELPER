@@ -16,6 +16,7 @@ from discord.ext import commands
 import antiraid
 from guild_config import get_settings as get_guild_settings
 from logging_utils import send_log_embed
+from moderation import quarantine_member
 from config import POS_OWNER_USER_IDS, POS_CREATOR_ID
 
 logger = logging.getLogger(__name__)
@@ -96,14 +97,13 @@ class SecurityCog(commands.Cog):
                 pass
             return
 
-        # kick / ban / lockdown — применяем действие к этому аккаунту.
+        # quarantine (по умолчанию) / kick / ban / lockdown — действие к аккаунту.
         applied = "ничего"
         try:
             if action == "ban":
                 await guild.ban(member, reason=f"Антирейд: {reason}"[:512], delete_message_days=1)
                 applied = "бан"
-            else:  # kick и lockdown — кикаем подозрительный аккаунт
-                # Сначала пытаемся предупредить пользователя в ЛС.
+            elif action == "kick":
                 try:
                     await member.send(
                         f"На сервере **{guild.name}** сейчас действует антирейд-защита. "
@@ -113,6 +113,11 @@ class SecurityCog(commands.Cog):
                     pass
                 await guild.kick(member, reason=f"Антирейд: {reason}"[:512])
                 applied = "кик"
+            else:
+                # quarantine / lockdown: мутим и ограничиваем доступ, но ОСТАВЛЯЕМ на
+                # сервере. Владелец потом сам снимет ограничения (lift_restrictions)
+                # или режим рейда (deactivate_raid_mode), если сочтёт аккаунт нормальным.
+                applied = await quarantine_member(member, reason)
         except discord.Forbidden:
             applied = "нет прав на действие"
         except Exception as e:

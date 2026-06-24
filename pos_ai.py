@@ -52,6 +52,7 @@ _OWNER_ONLY_TOOLS = frozenset({
     "create_channel", "delete_channel", "edit_channel", "set_channel_permission",
     "create_invite", "list_servers", "delete_messages",
     "setup_logging", "send_message", "update_settings",
+    "ping_user", "dm_user", "lift_restrictions", "deactivate_raid_mode",
     "leave_server", "shutdown_bot",
     "mute_ai_for_user", "unmute_ai_for_user",
 })
@@ -195,6 +196,10 @@ _TOOL_ACTION_LABELS = {
     "setup_logging": "разворачивание системы логов",
     "untimeout_user": "снятие тайм-аута",
     "send_message": "отправку сообщения от имени P.OS",
+    "ping_user": "пинг пользователя",
+    "dm_user": "отправку ЛС пользователю",
+    "lift_restrictions": "снятие ограничений с пользователя",
+    "deactivate_raid_mode": "снятие режима рейда",
     "get_settings": "просмотр настроек",
     "update_settings": "изменение настроек модерации",
     "leave_server": "выход с сервера",
@@ -296,6 +301,28 @@ async def _perform_tool_action(
     # Инструменты, которым НЕ нужен сервер-контекст, обрабатываются раньше.
     if name == "shutdown_bot":
         return await _perform_shutdown(bot, args)
+
+    if name == "dm_user":
+        if not user_id:
+            return "Ошибка: не указан user_id"
+        text = str(args.get("text", "")).strip()
+        if not text:
+            return "Ошибка: не указан текст ЛС (text)."
+        target = bot.get_user(user_id)
+        if target is None:
+            try:
+                target = await bot.fetch_user(user_id)
+            except Exception:
+                target = None
+        if target is None:
+            return f"Ошибка: пользователь {user_id} не найден."
+        try:
+            await target.send(text[:2000])
+            return f"Личное сообщение пользователю {user_id} отправлено."
+        except discord.Forbidden:
+            return f"Не удалось написать в ЛС пользователю {user_id} (закрыты личные сообщения)."
+        except Exception as e:
+            return f"Ошибка при отправке ЛС: {e}"
 
     if guild is None:
         return "Ошибка: инструмент можно использовать только на сервере."
@@ -716,6 +743,55 @@ async def _perform_tool_action(
             return f"Ошибка: нет прав писать в канал '{channel.name}'."
         except Exception as e:
             return f"Ошибка при отправке сообщения: {e}"
+
+    elif name == "ping_user":
+        if not user_id:
+            return "Ошибка: не указан user_id"
+        member = await _resolve_member(guild, user_id)
+        if not member:
+            return f"Ошибка: пользователь {user_id} не найден на сервере '{guild.name}'."
+        ch_ident = str(args.get("channel_id_or_name", "")).strip()
+        channel = resolve_channel_smart(guild, ch_ident) if ch_ident else message.channel
+        if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
+            return f"Ошибка: канал для пинга не найден на сервере '{guild.name}'."
+        extra = str(args.get("text", "")).strip()
+        content = f"{member.mention}" + (f" {extra}" if extra else "")
+        try:
+            await channel.send(
+                content[:2000],
+                allowed_mentions=discord.AllowedMentions(users=[member]),
+            )
+            return f"Пользователь {user_id} упомянут (с пингом) в #{channel.name}."
+        except discord.Forbidden:
+            return f"Ошибка: нет прав писать в канал '{channel.name}'."
+        except Exception as e:
+            return f"Ошибка при пинге: {e}"
+
+    elif name == "lift_restrictions":
+        if not user_id:
+            return "Ошибка: не указан user_id"
+        member = await _resolve_member(guild, user_id)
+        if not member:
+            return f"Ошибка: пользователь {user_id} не найден на сервере '{guild.name}'."
+        reason = str(args.get("reason", "")).strip() or "решение владельца"
+        try:
+            from moderation import lift_member_restrictions
+            result = await lift_member_restrictions(member, reason)
+            return f"С пользователя {user_id} сняты ограничения на '{guild.name}': {result}."
+        except discord.Forbidden:
+            return "Ошибка: недостаточно прав, чтобы снять ограничения (проверь иерархию ролей)."
+        except Exception as e:
+            return f"Ошибка при снятии ограничений: {e}"
+
+    elif name == "deactivate_raid_mode":
+        try:
+            import antiraid
+            was_active = antiraid.deactivate_raid_mode(guild.id)
+        except Exception as e:
+            return f"Ошибка при снятии режима рейда: {e}"
+        if was_active:
+            return f"Режим рейда на сервере '{guild.name}' снят."
+        return f"На сервере '{guild.name}' режим рейда не был активен (сбросил счётчик на всякий случай)."
 
     elif name == "get_settings":
         try:

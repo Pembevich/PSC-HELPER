@@ -49,6 +49,8 @@ from config import (
     VIRUSTOTAL_KEY,
     VIOLATION_ATTACHMENT_LIMIT,
     VOICE_TIMEOUT_HOURS,
+    MUTE_ROLE_ID,
+    QUARANTINE_TIMEOUT_DAYS,
     WHITELIST_DOMAINS,
     _VT_CACHE_TTL,
 )
@@ -768,6 +770,75 @@ async def apply_max_timeout(member: discord.Member, reason: str):
     except Exception as exc:
         logger.error(f"Не удалось выдать ограничение голоса: {exc}")
         return False
+
+
+async def quarantine_member(member: discord.Member, reason: str = "Антирейд") -> str:
+    """Карантин: мут (тайм-аут) + роль-мут (если настроена) + ЛС. Участник ОСТАЁТСЯ
+    на сервере — снятие ограничений выполняет владелец вручную через P.OS.
+
+    Возвращает человекочитаемую строку с применёнными мерами."""
+    actions: list[str] = []
+    days = max(1, min(int(QUARANTINE_TIMEOUT_DAYS or 28), 28))  # лимит Discord — 28 суток
+    until = discord.utils.utcnow() + timedelta(days=days)
+    try:
+        await member.timeout(until, reason=f"Карантин (антирейд): {reason}"[:512])
+        actions.append("тайм-аут")
+    except Exception as exc:
+        logger.warning(f"Карантин: не удалось выдать тайм-аут {member.id}: {exc}")
+
+    if MUTE_ROLE_ID:
+        role = member.guild.get_role(MUTE_ROLE_ID) if member.guild else None
+        if role:
+            try:
+                await member.add_roles(role, reason=f"Карантин (антирейд): {reason}"[:512])
+                actions.append("роль-мут")
+            except Exception as exc:
+                logger.warning(f"Карантин: не удалось выдать роль-мут {member.id}: {exc}")
+
+    try:
+        await member.send(
+            f"На сервере **{member.guild.name}** сработала антирейд-защита. "
+            f"Твой доступ временно ограничен — но ты остаёшься на сервере. "
+            f"Дождись проверки администрацией: если всё в порядке, ограничения снимут."
+        )
+    except Exception:
+        pass
+
+    return ("карантин: " + ", ".join(actions)) if actions else "карантин (не хватило прав на ограничение)"
+
+
+async def lift_member_restrictions(member: discord.Member, reason: str = "") -> str:
+    """Снять ограничения карантина/мута: тайм-аут + роль-мут + ЛС-уведомление.
+
+    Возвращает строку с тем, что было снято."""
+    actions: list[str] = []
+    try:
+        if getattr(member, "is_timed_out", None) and member.is_timed_out():
+            await member.timeout(None, reason=f"Снятие ограничений: {reason}"[:512])
+            actions.append("тайм-аут снят")
+        else:
+            # На всякий случай снимаем тайм-аут, даже если флаг недоступен.
+            await member.timeout(None, reason=f"Снятие ограничений: {reason}"[:512])
+    except Exception as exc:
+        logger.warning(f"Снятие ограничений: тайм-аут {member.id}: {exc}")
+
+    if MUTE_ROLE_ID:
+        role = member.guild.get_role(MUTE_ROLE_ID) if member.guild else None
+        if role and role in getattr(member, "roles", []):
+            try:
+                await member.remove_roles(role, reason=f"Снятие ограничений: {reason}"[:512])
+                actions.append("роль-мут снята")
+            except Exception as exc:
+                logger.warning(f"Снятие ограничений: роль-мут {member.id}: {exc}")
+
+    try:
+        await member.send(
+            f"С тебя сняли ограничения на сервере **{member.guild.name}**. Добро пожаловать."
+        )
+    except Exception:
+        pass
+
+    return ", ".join(actions) if actions else "активных ограничений не найдено"
 
 
 async def log_violation_with_evidence(message: discord.Message, title: str, reasons: list[str]):

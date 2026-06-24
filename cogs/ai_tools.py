@@ -403,6 +403,68 @@ POS_AI_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "ping_user",
+            "description": "Пингует (упоминает) пользователя в канале так, чтобы пинг реально прошёл (пришло уведомление). ТОЛЬКО для владельца.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "Discord ID пользователя, которого пингнуть."},
+                    "text": {"type": "string", "description": "Необязательно. Текст сообщения рядом с пингом."},
+                    "channel_id_or_name": {"type": "string", "description": "Необязательно. Канал для пинга. Если не указан — текущий канал."},
+                    "server_id_or_name": {"type": "string", "description": "Необязательно. Сервер (ID или имя). Если не указан — текущий."}
+                },
+                "required": ["user_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dm_user",
+            "description": "Отправляет личное сообщение (ЛС) пользователю от имени P.OS. ТОЛЬКО для владельца.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "Discord ID пользователя, которому написать в ЛС."},
+                    "text": {"type": "string", "description": "Текст личного сообщения."}
+                },
+                "required": ["user_id", "text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lift_restrictions",
+            "description": "Снимает ограничения с пользователя (тайм-аут/карантин/роль-мут) и уведомляет его в ЛС. Используй, когда владелец решил, что аккаунт нормальный. ТОЛЬКО для владельца.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "Discord ID пользователя, с которого снять ограничения."},
+                    "reason": {"type": "string", "description": "Необязательно. Причина снятия."},
+                    "server_id_or_name": {"type": "string", "description": "Необязательно. Сервер (ID или имя). Если не указан — текущий."}
+                },
+                "required": ["user_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "deactivate_raid_mode",
+            "description": "Снимает (деактивирует) режим рейда на сервере по команде владельца. ТОЛЬКО для владельца.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "server_id_or_name": {"type": "string", "description": "Необязательно. Сервер (ID или имя). Если не указан — текущий."}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "leave_server",
             "description": "P.OS покидает (выходит с) указанный сервер. Необратимо. ТОЛЬКО для владельца, требует подтверждения.",
             "parameters": {
@@ -474,6 +536,7 @@ _CROSS_SERVER_TOOLS = {
     "add_role", "remove_role", "create_role", "delete_role", "edit_role",
     "create_channel", "delete_channel", "edit_channel", "set_channel_permission",
     "delete_messages", "setup_logging",
+    "ping_user", "lift_restrictions", "deactivate_raid_mode",
 }
 
 def _inject_cross_server_param(tools: list) -> None:

@@ -129,6 +129,25 @@ class EvaluateJoinTests(unittest.TestCase):
         self.assertEqual(res["action"], "none")
         self.assertFalse(res["raid"])
 
+    def test_quarantine_is_default_action_for_fresh(self):
+        s = self._settings(raid_action="quarantine")
+        last = None
+        for i in range(4):
+            m = _member(400 + i, age_hours=1, avatar=False, guild_id=21, name=f"u{i}")
+            last = antiraid.evaluate_join(m, s, now=7000 + i)
+        self.assertTrue(last["raid"])
+        self.assertEqual(last["action"], "quarantine")
+
+    def test_deactivate_raid_mode(self):
+        s = self._settings(raid_action="quarantine")
+        for i in range(4):
+            antiraid.evaluate_join(_member(500 + i, age_hours=1, avatar=False, guild_id=22), s, now=8000 + i)
+        self.assertTrue(antiraid.is_raid_mode(22, now=8003))
+        self.assertTrue(antiraid.deactivate_raid_mode(22, now=8003))
+        self.assertFalse(antiraid.is_raid_mode(22, now=8003))
+        # повторно — уже не активен
+        self.assertFalse(antiraid.deactivate_raid_mode(22, now=8003))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -37,7 +37,7 @@ _INT_KEYS = {
 }
 # Строковые ключи-перечисления.
 _ENUM_KEYS = {
-    "raid_action": {"alert", "kick", "ban", "lockdown"},
+    "raid_action": {"alert", "quarantine", "kick", "ban", "lockdown"},
 }
 SETTING_KEYS = _BOOL_KEYS | _INT_KEYS | set(_ENUM_KEYS)
 

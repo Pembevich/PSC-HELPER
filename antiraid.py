@@ -115,6 +115,16 @@ def clear(guild_id: int | None = None) -> None:
         _raid_until.pop(guild_id, None)
 
 
+def deactivate_raid_mode(guild_id: int, *, now: float | None = None) -> bool:
+    """Принудительно снять режим рейда на сервере (по команде владельца).
+
+    Возвращает True, если режим был активен и снят, иначе False."""
+    was_active = is_raid_mode(guild_id, now=now)
+    _raid_until.pop(guild_id, None)
+    _joins.pop(guild_id, None)
+    return was_active
+
+
 def evaluate_join(member: discord.Member, settings: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
     """Главная точка: обновить трекер и решить, что делать с этим заходом.
 
@@ -153,7 +163,7 @@ def evaluate_join(member: discord.Member, settings: dict[str, Any], *, now: floa
         # В режиме рейда: свежие/подозрительные аккаунты — под действие, остальные —
         # только алерт (не наказываем легитимных участников, зашедших в тот же момент).
         if fresh or signals:
-            action = raid_action if raid_action in {"kick", "ban", "lockdown"} else "alert"
+            action = raid_action if raid_action in {"quarantine", "kick", "ban", "lockdown"} else "alert"
             reason = f"Режим рейда (заходов за {window}с: {count}). Аккаунт: " + (", ".join(signals) or "свежий")
         else:
             action = "alert"
