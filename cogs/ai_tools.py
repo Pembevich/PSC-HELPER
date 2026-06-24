@@ -334,6 +334,103 @@ POS_AI_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "untimeout_user",
+            "description": "Снимает тайм-аут (мут) с пользователя досрочно.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "Discord ID пользователя."},
+                    "reason": {"type": "string", "description": "Необязательно. Причина снятия мута."}
+                },
+                "required": ["user_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": "Отправляет сообщение от имени P.OS в указанный канал (можно на другом сервере, где есть P.OS). ТОЛЬКО для владельца.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id_or_name": {"type": "string", "description": "ID или имя канала, куда отправить сообщение."},
+                    "text": {"type": "string", "description": "Текст сообщения."},
+                    "server_id_or_name": {"type": "string", "description": "Необязательно. Сервер назначения (ID или имя). Если не указан — текущий сервер."}
+                },
+                "required": ["channel_id_or_name", "text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_settings",
+            "description": "Показывает текущие настройки модерации и поведения P.OS на сервере. ТОЛЬКО для владельца.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "server_id_or_name": {"type": "string", "description": "Необязательно. Сервер (ID или имя). Если не указан — текущий."}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_settings",
+            "description": (
+                "Изменяет настройки модерации/безопасности P.OS на сервере. ТОЛЬКО для владельца. "
+                "Передавай только те поля, которые нужно изменить. Булевы ключи (true/false): "
+                "enabled, filter_ads, filter_spam, filter_flood, filter_scam, filter_nsfw, filter_raid, "
+                "filter_mention_spam, filter_crosschannel, ai_moderation, allow_profanity. "
+                "Числовые ключи: spam_window_seconds, spam_duplicates_threshold, flood_window_seconds, "
+                "flood_messages_threshold, mention_limit, raid_join_window_seconds, raid_join_threshold, "
+                "min_account_age_hours, timeout_hours. Строковый ключ raid_action: alert|kick|ban|lockdown. "
+                "Маты и оскорбления разрешены по умолчанию (allow_profanity=true) и не модерируются."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "settings_json": {"type": "string", "description": "JSON-объект с изменяемыми настройками, например {\"filter_flood\": false, \"spam_duplicates_threshold\": 6}."},
+                    "server_id_or_name": {"type": "string", "description": "Необязательно. Сервер (ID или имя). Если не указан — текущий."}
+                },
+                "required": ["settings_json"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "leave_server",
+            "description": "P.OS покидает (выходит с) указанный сервер. Необратимо. ТОЛЬКО для владельца, требует подтверждения.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "server_id_or_name": {"type": "string", "description": "ID или имя сервера, который нужно покинуть."}
+                },
+                "required": ["server_id_or_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "shutdown_bot",
+            "description": "Полностью останавливает P.OS (завершает работу процесса бота). ТОЛЬКО для владельца, требует подтверждения.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "Необязательно. Причина остановки."}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "mute_ai_for_user",
             "description": "Запрещает P.OS отвечать на сообщения этого пользователя (добавляет в черный список общения).",
             "parameters": {
@@ -366,3 +463,32 @@ POS_AI_TOOLS = [
         }
     }
 ]
+
+
+# 0.8: кросс-серверность. Владелец может выполнять управляющие действия на любом
+# сервере, где есть P.OS, не находясь на нём. Добавляем необязательный параметр
+# server_id_or_name ко всем гильдийным инструментам (если его там ещё нет), чтобы
+# модель знала о такой возможности. Резолвинг сервера выполняется в pos_ai.
+_CROSS_SERVER_TOOLS = {
+    "ban_user", "unban_user", "timeout_user", "untimeout_user", "kick_user", "set_nickname",
+    "add_role", "remove_role", "create_role", "delete_role", "edit_role",
+    "create_channel", "delete_channel", "edit_channel", "set_channel_permission",
+    "delete_messages", "setup_logging",
+}
+
+def _inject_cross_server_param(tools: list) -> None:
+    for tool in tools:
+        fn = tool.get("function", {})
+        if fn.get("name") in _CROSS_SERVER_TOOLS:
+            params = fn.setdefault("parameters", {})
+            props = params.setdefault("properties", {})
+            props.setdefault(
+                "server_id_or_name",
+                {
+                    "type": "string",
+                    "description": "Необязательно. Сервер (ID или имя), на котором выполнить действие. Если не указан — текущий сервер. Только владелец может указывать другой сервер.",
+                },
+            )
+
+
+_inject_cross_server_param(POS_AI_TOOLS)

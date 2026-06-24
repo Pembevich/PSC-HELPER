@@ -23,6 +23,7 @@ COGS = [
     "cogs.logging_events",
     "cogs.general",
     "cogs.forms",
+    "cogs.security",
     "cogs.mod",
     "cogs.ai_chat",
 ]

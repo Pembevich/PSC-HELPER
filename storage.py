@@ -85,6 +85,15 @@ async def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
             PRIMARY KEY (user_id, guild_id)
         )
     """)
+    # 0.8: настройки модерации/поведения на сервер. Хранятся как JSON-строка,
+    # чтобы схему можно было расширять без миграций. guild_id=0 — глобальный слот
+    # значений по умолчанию для всех серверов.
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS guild_settings (
+            guild_id INTEGER PRIMARY KEY,
+            settings TEXT
+        )
+    """)
     # Чистим устаревшие таблицы со старых версий (plaintext-пароли и т.п.).
     await conn.execute("DROP TABLE IF EXISTS private_chats")
     await conn.execute("DROP TABLE IF EXISTS chat_messages")
@@ -171,6 +180,33 @@ async def set_ai_muted_user(user_id: int, guild_id: int, muted: bool, db_path: s
         "INSERT INTO ai_muted (user_id, guild_id, muted) VALUES (?, ?, ?) "
         "ON CONFLICT(user_id, guild_id) DO UPDATE SET muted = excluded.muted",
         (user_id, guild_id, int(muted)),
+    )
+    await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Guild settings helpers (0.8) — per-guild JSON blob of moderation/behaviour
+# toggles. guild_id=0 is the global default slot.
+# ---------------------------------------------------------------------------
+
+async def get_guild_settings_raw(guild_id: int, db_path: str = DEFAULT_DB_PATH) -> str | None:
+    """Return the stored settings JSON string for guild_id, or None."""
+    conn = await _get_conn(db_path)
+    cursor = await conn.execute(
+        "SELECT settings FROM guild_settings WHERE guild_id = ?",
+        (guild_id,),
+    )
+    row = await cursor.fetchone()
+    return str(row[0]) if row and row[0] is not None else None
+
+
+async def set_guild_settings_raw(guild_id: int, settings_json: str, db_path: str = DEFAULT_DB_PATH) -> None:
+    """Upsert the settings JSON string for guild_id."""
+    conn = await _get_conn(db_path)
+    await conn.execute(
+        "INSERT INTO guild_settings (guild_id, settings) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET settings = excluded.settings",
+        (guild_id, settings_json),
     )
     await conn.commit()
 

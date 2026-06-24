@@ -34,6 +34,8 @@ from config import (
     AD_FILENAME_KEYWORDS,
     AD_TEXT_KEYWORDS,
     ALLOWED_DISCORD_INVITE_PATTERNS,
+    FLOOD_MESSAGES_THRESHOLD,
+    FLOOD_WINDOW_SECONDS,
     GOOGLE_SAFEBROWSING_KEY,
     NSFW_FILENAME_KEYWORDS,
     POS_AI_API_KEY,
@@ -50,6 +52,7 @@ from config import (
     WHITELIST_DOMAINS,
     _VT_CACHE_TTL,
 )
+from guild_config import get_settings as get_guild_settings
 from logging_utils import get_log_channel
 
 try:
@@ -87,6 +90,8 @@ _AI_MEDIA_USER_LAST_CHECK: dict[int, float] = {}
 AI_MEDIA_USER_COOLDOWN_SECONDS = 15
 
 recent_messages = defaultdict(lambda: deque())
+# Флуд (0.8): любые сообщения пользователя (не обязательно дубликаты) за окно.
+_flood_messages: dict[int, deque] = defaultdict(lambda: deque())
 _last_spam_prune = 0.0
 _SPAM_PRUNE_INTERVAL = 60.0
 
@@ -817,6 +822,142 @@ def detect_advertising_or_scam_text(text: str):
     return reasons
 
 
+# ---------------------------------------------------------------------------
+# Антиспам упоминаний (масс-пинг) — 0.8
+# ---------------------------------------------------------------------------
+def detect_mention_spam(message: discord.Message, mention_limit: int) -> list[str]:
+    """Слишком много упоминаний в одном сообщении или массовый @everyone/@here
+    от обычного участника — типичный рейдовый/спам-пинг."""
+    reasons: list[str] = []
+    user_mentions = len(getattr(message, "mentions", []) or [])
+    role_mentions = len(getattr(message, "role_mentions", []) or [])
+    total = user_mentions + role_mentions
+    if total >= max(3, mention_limit):
+        reasons.append(f"масс-пинг: {total} упоминаний в одном сообщении")
+    # @everyone/@here без права mention_everyone — спам-пинг.
+    if getattr(message, "mention_everyone", False):
+        author = message.author
+        perms = getattr(author, "guild_permissions", None)
+        if not (perms and perms.mention_everyone):
+            reasons.append("использование @everyone/@here без прав")
+    return reasons
+
+
+# ---------------------------------------------------------------------------
+# Кросс-канальный спам: одно и то же сообщение веером по разным каналам — 0.8
+# ---------------------------------------------------------------------------
+def detect_crosschannel_spam(message: discord.Message, window: int, channels_threshold: int) -> list[str]:
+    """Использует общий трекер recent_messages (заполняется в handle_spam_if_needed):
+    если одинаковый текст за окно появился в >= N разных каналах — это рассылка."""
+    if not (message.content or "").strip():
+        return []
+    key = message_key_for_spam(message)
+    now = time.time()
+    queue = recent_messages[message.author.id]
+    channels = {
+        ch_id
+        for entry_key, ts, _mid, ch_id in queue
+        if entry_key == key and now - ts <= window
+    }
+    channels.add(message.channel.id)
+    if len(channels) >= max(2, channels_threshold):
+        return [f"кросс-канальный спам: одно сообщение в {len(channels)} каналах за {window}с"]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# ИИ-классификатор текста (второе мнение, Gemini) — 0.8
+# ---------------------------------------------------------------------------
+_ai_text_cache: dict[str, tuple[str, str, float]] = {}
+_AI_TEXT_CACHE_TTL = 60 * 60
+_MAX_AI_TEXT_CACHE_SIZE = 2000
+_AI_TEXT_USER_LAST_CHECK: dict[int, float] = {}
+AI_TEXT_USER_COOLDOWN_SECONDS = 12
+
+_AI_TEXT_TRIGGER = re.compile(
+    r"(https?://|discord\.gg|t\.me/|@everyone|@here|nitro|robux|казино|casino|"
+    r"бесплатн|free\s|промокод|раздач|giveaway|airdrop|ставк|sex|porn|\bcp\b)",
+    re.IGNORECASE,
+)
+
+
+def _text_warrants_ai_review(text: str, *, in_raid: bool = False) -> bool:
+    t = (text or "").strip()
+    if len(t) < 6:
+        return False
+    if in_raid:
+        return True
+    if _AI_TEXT_TRIGGER.search(t):
+        return True
+    # очень длинное сообщение со ссылкой/повторами — потенциальная рассылка
+    return len(t) > 350 and ("http" in t.lower())
+
+
+async def classify_text_with_ai(text: str, user_id: int = 0, *, in_raid: bool = False) -> list[str]:
+    """Вернуть причины блокировки по версии ИИ (Gemini) или [] если всё чисто.
+
+    Только пограничные/подозрительные сообщения (см. _text_warrants_ai_review),
+    с кэшем и per-user rate limit. Маты/оскорбления НЕ блокируются — только
+    реклама/скам/фишинг/спам/рейд-контент."""
+    t = (text or "").strip()
+    if not POS_AI_API_KEY or ai_is_temporarily_unavailable():
+        return []
+    if not _text_warrants_ai_review(t, in_raid=in_raid):
+        return []
+
+    now = time.time()
+    cache_key = t[:400]
+    cached = _ai_text_cache.get(cache_key)
+    if cached and now - cached[2] < _AI_TEXT_CACHE_TTL:
+        return [cached[1]] if cached[0] == "block" else []
+
+    if user_id:
+        last = _AI_TEXT_USER_LAST_CHECK.get(user_id, 0.0)
+        if now - last < AI_TEXT_USER_COOLDOWN_SECONDS:
+            return []
+        _AI_TEXT_USER_LAST_CHECK[user_id] = now
+
+    if len(_ai_text_cache) > _MAX_AI_TEXT_CACHE_SIZE:
+        oldest = sorted(_ai_text_cache, key=lambda k: _ai_text_cache[k][2])[: _MAX_AI_TEXT_CACHE_SIZE // 2]
+        for k in oldest:
+            _ai_text_cache.pop(k, None)
+
+    system_prompt = (
+        "Ты — классификатор автомодерации текста в Discord. Реши, нарушает ли сообщение ПРАВИЛА.\n"
+        "БЛОКИРУЙ только: рекламу сторонних серверов/услуг, скам/фишинг, раздачи nitro/robux/крипты, "
+        "ставки/казино, продажу аккаунтов/читов, массовую рассылку/спам, явный рейд-флуд, порнографию/CSAM.\n"
+        "НЕ БЛОКИРУЙ: маты, оскорбления, грубость, сарказм, споры, обычное общение, шутки, критику — это РАЗРЕШЕНО.\n"
+        "Если сомневаешься — 'allow'. Отвечай строго JSON: "
+        "{\"label\":\"allow|block\",\"reason\":\"кратко\",\"confidence\":0.0}"
+    )
+    response = await pos_chat_completion(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": t[:1500]},
+        ],
+        max_tokens=120,
+        temperature=0.0,
+        top_p=0.9,
+        timeout=30,
+        provider_type="gemini",
+    )
+    parsed = extract_json_block((response or {}).get("content", "")) if response else None
+    if not parsed:
+        return []
+    label = str(parsed.get("label") or "allow").strip().lower()
+    reason = str(parsed.get("reason") or "").strip()
+    try:
+        confidence = float(parsed.get("confidence") or 0)
+    except (ValueError, TypeError):
+        confidence = 0.0
+    if label == "block" and confidence >= 0.7:
+        final = reason or "ИИ: нарушение правил"
+        _ai_text_cache[cache_key] = ("block", final, now)
+        return [f"ИИ-модерация: {final}"]
+    _ai_text_cache[cache_key] = ("allow", reason, now)
+    return []
+
+
 async def detect_attachment_violations(attachments, text: str = "", user_id: int = 0):
     attachment_list = list(attachments)
     metadata_flags = _detect_attachment_metadata_flags(attachment_list)
@@ -863,46 +1004,93 @@ def message_key_for_spam(message: discord.Message):
 
 async def handle_spam_if_needed(message: discord.Message):
     user_id = message.author.id
-    key = message_key_for_spam(message)
     now = time.time()
+
+    # 0.8: настройки на сервер (с дефолтами). Маты/оскорбления разрешены —
+    # здесь ловим только спам (дубли) и флуд (темп). Любой из фильтров можно
+    # выключить через P.OS (update_settings).
+    guild_id = message.guild.id if message.guild else 0
+    try:
+        settings = await get_guild_settings(guild_id)
+    except Exception:
+        settings = {}
+    if not settings.get("enabled", True):
+        return False
+
+    spam_window = int(settings.get("spam_window_seconds", SPAM_WINDOW_SECONDS) or SPAM_WINDOW_SECONDS)
+    spam_threshold = int(settings.get("spam_duplicates_threshold", SPAM_DUPLICATES_THRESHOLD) or SPAM_DUPLICATES_THRESHOLD)
+    flood_window = int(settings.get("flood_window_seconds", FLOOD_WINDOW_SECONDS) or FLOOD_WINDOW_SECONDS)
+    flood_threshold = int(settings.get("flood_messages_threshold", FLOOD_MESSAGES_THRESHOLD) or FLOOD_MESSAGES_THRESHOLD)
+
+    key = message_key_for_spam(message)
     queue = recent_messages[user_id]
     queue.append((key, now, message.id, message.channel.id))
 
-    while queue and now - queue[0][1] > SPAM_WINDOW_SECONDS:
+    horizon = max(spam_window, flood_window)
+    while queue and now - queue[0][1] > horizon:
         queue.popleft()
 
     # #8: периодически выметаем пустые/протухшие очереди ушедших пользователей,
     # иначе recent_messages растёт по числу всех когда-либо писавших юзеров.
     _prune_spam_tracker(now)
 
-    count = sum(1 for entry_key, _, _, _ in queue if entry_key == key)
-    if count < SPAM_DUPLICATES_THRESHOLD:
-        return False
+    # --- Спам: одинаковые сообщения за окно ---
+    count = sum(1 for entry_key, ts, _, _ in queue if entry_key == key and now - ts <= spam_window)
+    if settings.get("filter_spam", True) and count >= spam_threshold:
+        to_delete = [
+            message_id
+            for entry_key, ts, message_id, channel_id in queue
+            if entry_key == key and channel_id == message.channel.id and now - ts <= spam_window
+        ]
+        for message_id in to_delete:
+            try:
+                duplicate = await message.channel.fetch_message(message_id)
+                if duplicate:
+                    await duplicate.delete()
+            except Exception:
+                pass
 
-    to_delete = [message_id for entry_key, _, message_id, channel_id in queue if entry_key == key and channel_id == message.channel.id]
-    for message_id in to_delete:
+        reasons = [f"Спам одинаковыми сообщениями: {count} шт. за {spam_window} сек."]
+        await apply_max_timeout(message.author, "Автомодерация: спам")
+        await log_violation_with_evidence(message, "🚨 STOPREID: спам", reasons)
+
         try:
-            duplicate = await message.channel.fetch_message(message_id)
-            if duplicate:
-                await duplicate.delete()
+            dm = Embed(
+                title="🚫 Обнаружен спам",
+                description="Вы слишком бодро заспамили одинаковыми сообщениями. Выдано ограничение голоса.",
+                color=Color.orange(),
+            )
+            dm.add_field(name="Детали", value=reasons[0], inline=False)
+            await message.author.send(embed=dm)
         except Exception:
             pass
 
-    reasons = [f"Спам одинаковыми сообщениями: {count} шт. за {SPAM_WINDOW_SECONDS} сек."]
-    await apply_max_timeout(message.author, "Автомодерация: спам")
-    await log_violation_with_evidence(message, "🚨 STOPREID: спам", reasons)
+        recent_messages[user_id].clear()
+        _flood_messages.pop(user_id, None)
+        return True
 
-    try:
-        dm = Embed(
-            title="🚫 Обнаружен спам",
-            description="Вы слишком бодро заспамили одинаковыми сообщениями. Выдано ограничение голоса на 24 часа.",
-            color=Color.orange(),
-        )
-        dm.add_field(name="Детали", value=reasons[0], inline=False)
-        await message.author.send(embed=dm)
-    except Exception:
-        pass
+    # --- Флуд: слишком много любых сообщений за окно (темп), без дублей ---
+    if settings.get("filter_flood", True):
+        fq = _flood_messages[user_id]
+        fq.append(now)
+        while fq and now - fq[0] > flood_window:
+            fq.popleft()
+        if len(fq) >= flood_threshold:
+            reasons = [f"Флуд: {len(fq)} сообщений за {flood_window} сек."]
+            await apply_max_timeout(message.author, "Автомодерация: флуд")
+            await log_violation_with_evidence(message, "🚨 STOPREID: флуд", reasons)
+            try:
+                dm = Embed(
+                    title="🚫 Обнаружен флуд",
+                    description="Слишком высокий темп сообщений. Выдано ограничение голоса.",
+                    color=Color.orange(),
+                )
+                dm.add_field(name="Детали", value=reasons[0], inline=False)
+                await message.author.send(embed=dm)
+            except Exception:
+                pass
+            fq.clear()
+            return True
 
-    recent_messages[user_id].clear()
-    return True
+    return False
 

@@ -95,26 +95,42 @@ def _provider_cooldown_remaining(index: int) -> float:
     return remaining if remaining > 0 else 0.0
 
 
+# 0.8: Gemini — приоритетный провайдер для ВСЕХ запросов (и чат P.OS, и
+# модерация). Остальные провайдеры из пула задействуются ТОЛЬКО когда все
+# Gemini-провайдеры на cooldown. Если явно запрошен provider_type — он имеет
+# наивысший приоритет; иначе предпочитаем "gemini".
+PRIMARY_PROVIDER = "gemini"
+
+
 def _pick_provider_index(provider_type: str | None = None) -> int | None:
     if not _AI_PROVIDER_POOL:
         return None
     total = len(_AI_PROVIDER_POOL)
     start = _provider_cursor % total
-    
-    # 1. Try to find a working provider matching the requested provider_type
-    for offset in range(total):
-        idx = (start + offset) % total
-        if _provider_cooldown_remaining(idx) <= 0:
-            p = _AI_PROVIDER_POOL[idx]
-            if provider_type is None or p["provider"] == provider_type:
+
+    # Порядок предпочтений по типу провайдера:
+    # 1) явно запрошенный provider_type (если задан),
+    # 2) Gemini как первичный провайдер,
+    # 3) любой доступный — как запасной.
+    preferred: list[str] = []
+    if provider_type:
+        preferred.append(provider_type)
+    if PRIMARY_PROVIDER not in preferred:
+        preferred.append(PRIMARY_PROVIDER)
+
+    # Проходим тиры предпочтений: внутри каждого тира — round-robin от курсора.
+    for wanted in preferred:
+        for offset in range(total):
+            idx = (start + offset) % total
+            if _provider_cooldown_remaining(idx) <= 0 and _AI_PROVIDER_POOL[idx]["provider"] == wanted:
                 return idx
-                
-    # 2. If no matched provider is available/uncool, fallback to any available provider in the pool
+
+    # Запасной тир: любой доступный (uncool) провайдер.
     for offset in range(total):
         idx = (start + offset) % total
         if _provider_cooldown_remaining(idx) <= 0:
             return idx
-            
+
     return None
 
 
