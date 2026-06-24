@@ -9,8 +9,6 @@ from discord.ext import commands, tasks
 
 from config import (
     allowed_guild_ids,
-    UPDATE_LOG_CHANNEL_ID,
-    UPDATE_LOG_MARKER,
 )
 from logging_utils import send_log_embed, ensure_log_category_and_channels
 from utils import collect_runtime_health
@@ -22,42 +20,6 @@ from commands import (
 )
 
 logger = logging.getLogger(__name__)
-
-async def _send_update_log_if_needed(bot: commands.Bot):
-    if not UPDATE_LOG_CHANNEL_ID:
-        return
-
-    channel = bot.get_channel(UPDATE_LOG_CHANNEL_ID)
-    if not isinstance(channel, discord.TextChannel):
-        return
-
-    try:
-        async for existing in channel.history(limit=20):
-            if existing.author.id == bot.user.id and UPDATE_LOG_MARKER in (existing.content or ""):
-                return
-    except Exception:
-        return
-
-    release_message = (
-        f"[{UPDATE_LOG_MARKER}]\n"
-        "Лог обновления P.S.C Helper — версия 0.8 «ECOSYSTEM REACTIVATION»:\n"
-        "- Пумба закреплён как создатель и абсолютный владелец P.OS с полным доступом;\n"
-        "- P.OS управляет сервером через ИИ полностью: роли, каналы, права, наказания, рассылка, настройки;\n"
-        "- кросс-серверность: владелец управляет любым сервером P.OS, не находясь на нём;\n"
-        "- владелец может попросить P.OS покинуть сервер или полностью остановиться (с подтверждением в ЛС);\n"
-        "- приоритет API на Gemini; остальные провайдеры — только при его недоступности;\n"
-        "- усилена защита от джейлбрейков и от раскрытия API-ключей/системного промпта;\n"
-        "- улучшено распознавание контекста: кто что написал, упоминания, ответы — без галлюцинаций;\n"
-        "- БЕЗОПАСНОСТЬ: новый антирейд (массовый заход аккаунтов → kick/ban/alert/lockdown);\n"
-        "- многослойная модерация: масс-пинг, кросс-канальный спам, флуд + ИИ-второе мнение (Gemini);\n"
-        "- скрининг заходов (возраст аккаунта, аватар, подозрительный ник) и оповещение владельца;\n"
-        "- маты и оскорбления по-прежнему разрешены; все пороги настраиваются через ИИ по серверам."
-    )
-
-    try:
-        await channel.send(release_message, allowed_mentions=discord.AllowedMentions.none())
-    except Exception as e:
-        logger.error(f"Failed to send update log: {e}", exc_info=True)
 
 
 class GeneralCog(commands.Cog):

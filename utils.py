@@ -34,6 +34,19 @@ def extract_clean_keyword(text: str):
     return re.sub(r"[^a-zа-яё]", "", (text or "").lower())
 
 
+# Ведущий номер пункта: "1." / "2)" / "3 -" / "1:" и т.п. — отрезаем, чтобы в
+# проверку ника шёл только сам ник, а не номер строки из шаблона формы.
+_LEADING_ENUM = re.compile(r"^\s*\d{1,2}\s*[.)\-:]+\s*")
+
+
+def strip_leading_enumeration(text: str) -> str:
+    """Убрать ведущий номер пункта формы ("1.", "2)", "3 -") из строки-ответа.
+
+    Срезается ТОЛЬКО номер с разделителем (.)-:), чтобы не задеть ники, которые
+    сами начинаются с цифр (например '123gamer' остаётся как есть)."""
+    return _LEADING_ENUM.sub("", (text or "").strip()).strip()
+
+
 def sanitize_discord_token(raw_token: str | None) -> str | None:
     if raw_token is None:
         return None

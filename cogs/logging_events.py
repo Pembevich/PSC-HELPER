@@ -30,8 +30,6 @@ from config import (
     TARGET_CHANNELS,
     TARGET_OUTPUT_CHANNEL,
     NEW_MEMBER_ROLE_IDS,
-    UPDATE_LOG_CHANNEL_ID,
-    UPDATE_LOG_MARKER,
 )
 from logging_utils import ensure_log_category_and_channels, send_log_embed, is_log_channel
 from moderation import (
@@ -145,38 +143,6 @@ def _should_log_message(message: discord.Message) -> bool:
     if is_log_channel(message.channel):
         return False
     return True
-
-
-async def _send_update_log_if_needed(bot: commands.Bot):
-    if not UPDATE_LOG_CHANNEL_ID:
-        return
-
-    channel = bot.get_channel(UPDATE_LOG_CHANNEL_ID)
-    if not isinstance(channel, discord.TextChannel):
-        return
-
-    try:
-        async for existing in channel.history(limit=20):
-            if existing.author.id == bot.user.id and UPDATE_LOG_MARKER in (existing.content or ""):
-                return
-    except Exception:
-        return
-
-    release_message = (
-        f"[{UPDATE_LOG_MARKER}]\n"
-        "Лог обновления P.S.C Helper — версия 0.7:\n"
-        "- P.OS закрепил идентичность: Provision Operating System (P-O.S), без ложных расшифровок;\n"
-        "- улучшено распознавание ответов — P.OS больше не пишет служебные префиксы с ником и ID в тексте;\n"
-        "- P.OS умеет по команде разворачивать систему логов на сервере (категория и каналы, видимые только админам);\n"
-        "- новые красивые приветствия и прощания участников в нескольких каналах;\n"
-        "- укреплена защита tool-вызовов и обработка ошибок AI;\n"
-        "- расширено покрытие тестами."
-    )
-
-    try:
-        await channel.send(release_message, allowed_mentions=discord.AllowedMentions.none())
-    except Exception:
-        pass
 
 
 def _format_identity(entity) -> str:

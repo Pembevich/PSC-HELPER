@@ -23,6 +23,7 @@ from config import (
 from forms import ConfirmView, ComplaintView
 from utils import (
     extract_clean_keyword,
+    strip_leading_enumeration,
     assess_applicant_risk,
     assess_roblox_account,
     classify_applicant_danger,
@@ -216,6 +217,10 @@ class FormsCog(commands.Cog):
                 return
 
             user_line, discord_nick_line, why_line, choice_line = lines
+            # Срезаем ведущий номер пункта ("1.", "2)") — в проверку Roblox/DS
+            # должен идти только сам ник, а не номер строки из шаблона.
+            user_line = strip_leading_enumeration(user_line)
+            discord_nick_line = strip_leading_enumeration(discord_nick_line)
             keyword = extract_clean_keyword(choice_line)
 
             # Принимаем разные написания отряда: arbaiter / arbeiter (нем.) и
