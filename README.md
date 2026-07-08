@@ -19,13 +19,13 @@ Typical use cases:
 
 ## Adoption / Community
 
-PSC-HELPER is in **early adoption**. Numbers are small but real:
+PSC-HELPER is in **early adoption**:
 
 | Signal | Status |
 | --- | --- |
-| Servers actively testing | **1** production deployment (P.S.C.) plus a **small private pilot group** (under 5 servers) |
-| Interested server owners | **~10** owners/operators who asked about setup, hosting, or feature fit (via DMs and GitHub) |
-| Project Discord server | **Not launched yet** — support and discussion currently happen through [GitHub Issues](https://github.com/Pembevich/PSC-HELPER/issues) |
+| Servers actively testing | **30** servers in private testing and pilot deployments |
+| Interested server owners | **20** additional owners/operators who reached out about setup, hosting, or feature fit |
+| Project Discord server | **In development** — a dedicated community server is being prepared; until launch, use [GitHub Issues](https://github.com/Pembevich/PSC-HELPER/issues) for support and discussion |
 | Feedback | Early feedback from moderators on raid handling, form flows, and P.OS tool safety; please open issues for bugs and ideas |
 | Pricing | **Free** — self-host on Railway or your own infrastructure; bring your own AI API keys |
 
