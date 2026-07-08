@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Roadmap & feature requests
+    url: https://github.com/Pembevich/PSC-HELPER/issues/new?template=feature_request.md
+    about: Suggest an improvement or vote on planned work
+  - name: Security concern
+    url: https://github.com/Pembevich/PSC-HELPER/security/advisories/new
+    about: Report a vulnerability privately when possible
