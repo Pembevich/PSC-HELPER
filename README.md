@@ -1,6 +1,6 @@
 # PSC-HELPER
 
-**Product version:** 0.8.1 · **Current GitHub release:** [v0.8.2](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.8.2) · **License:** [MIT](./LICENSE)
+**Product version:** 0.8.1 · **Current GitHub release:** [v0.8.3](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.8.3) · **License:** [MIT](./LICENSE)
 
 A self-hosted Discord bot for communities that need automated moderation, an in-character AI assistant (**P.OS**), application/complaint workflows, detailed audit logging, and media utilities such as on-the-fly GIF generation.
 
@@ -147,6 +147,7 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md). Roadmap areas use labels: `good first 
 | [v0.8.0](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.8.0) | Multi-server settings, expanded owner tools, AI-assisted moderation |
 | [v0.8.1](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.8.1) | Raid quarantine default, owner ping/DM/lift tools, form fixes |
 | [v0.8.2](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.8.2) | Technical publication tag for the completed P.OS 0.8.1 product line: security, reliability, GIF pipeline, `p.` prefix, and official site |
+| [v0.8.3](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.8.3) | Final 0.8.1 site polish: automatic system theme selection with persistent Dark/Light override |
 | [v0.9.0](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.9.0) | Planned milestone (pre-release) |
 
 ## GitHub Models token hygiene

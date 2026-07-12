@@ -21,7 +21,6 @@ const translations = {
     navSecurity: "Безопасность",
     navControl: "Управление",
     navToolkit: "Возможности",
-    themeAuto: "Auto",
     themeDark: "Dark",
     themeLight: "Light",
     systemName: "Provision Operating System",
@@ -146,7 +145,6 @@ const translations = {
     navSecurity: "Security",
     navControl: "Control",
     navToolkit: "Capabilities",
-    themeAuto: "Auto",
     themeDark: "Dark",
     themeLight: "Light",
     systemName: "Provision Operating System",
@@ -402,13 +400,17 @@ const getInitialLanguage = () => {
   return browserLanguage.startsWith("ru") ? "ru" : "en";
 };
 
-const resolveTheme = (preference) => {
-  if (preference === "light" || preference === "dark") return preference;
-  return systemTheme.matches ? "light" : "dark";
+const getStoredTheme = () => {
+  const stored = localStorage.getItem(STORAGE_KEYS.theme);
+  if (stored === "light" || stored === "dark") return stored;
+  if (stored !== null) localStorage.removeItem(STORAGE_KEYS.theme);
+  return null;
 };
 
+const resolveTheme = (preference) => preference || (systemTheme.matches ? "light" : "dark");
+
 let currentLanguage = getInitialLanguage();
-let currentThemePreference = localStorage.getItem(STORAGE_KEYS.theme) || "auto";
+let currentThemePreference = getStoredTheme();
 let activeConsoleMode = "overview";
 let activeDialogueExample = "audit";
 let activeScope = "members";
@@ -487,14 +489,14 @@ const renderOperator = () => {
 };
 
 const applyTheme = (preference = currentThemePreference) => {
-  currentThemePreference = preference;
-  const resolved = resolveTheme(preference);
+  currentThemePreference = preference === "light" || preference === "dark" ? preference : null;
+  const resolved = resolveTheme(currentThemePreference);
   document.documentElement.dataset.theme = resolved;
-  document.documentElement.dataset.themePreference = preference;
+  document.documentElement.dataset.themeSource = currentThemePreference ? "user" : "system";
   themeMeta?.setAttribute("content", resolved === "light" ? "#e8ecf1" : "#07080a");
 
   document.querySelectorAll("[data-theme-choice]").forEach((button) => {
-    button.setAttribute("aria-pressed", String(button.dataset.themeChoice === preference));
+    button.setAttribute("aria-pressed", String(button.dataset.themeChoice === resolved));
   });
 };
 
@@ -696,7 +698,8 @@ document.querySelectorAll("[data-lang-choice]").forEach((button) => {
 
 document.querySelectorAll("[data-theme-choice]").forEach((button) => {
   button.addEventListener("click", () => {
-    const preference = button.dataset.themeChoice || "auto";
+    const preference = button.dataset.themeChoice;
+    if (preference !== "dark" && preference !== "light") return;
     localStorage.setItem(STORAGE_KEYS.theme, preference);
     applyTheme(preference);
   });
@@ -730,7 +733,7 @@ document.querySelector("[data-evidence-toggle]")?.addEventListener("click", (eve
 });
 
 systemTheme.addEventListener("change", () => {
-  if (currentThemePreference === "auto") applyTheme("auto");
+  if (currentThemePreference === null) applyTheme();
 });
 
 window.addEventListener("scroll", updateHeader, { passive: true });

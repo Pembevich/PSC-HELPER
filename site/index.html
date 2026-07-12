@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ru" data-theme="dark" data-theme-preference="auto">
+<html lang="ru" data-theme="dark" data-theme-source="system">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -19,15 +19,17 @@
     <link rel="apple-touch-icon" href="./assets/pos-logo-mark.png" />
     <script>
       (() => {
-        const preference = localStorage.getItem("pos-theme") || "auto";
+        const storedTheme = localStorage.getItem("pos-theme");
+        const preference = storedTheme === "dark" || storedTheme === "light" ? storedTheme : null;
+        if (storedTheme !== null && preference === null) localStorage.removeItem("pos-theme");
         const systemLight = window.matchMedia("(prefers-color-scheme: light)").matches;
-        const theme = preference === "auto" ? (systemLight ? "light" : "dark") : preference;
+        const theme = preference || (systemLight ? "light" : "dark");
         const savedLanguage = localStorage.getItem("pos-language");
         const browserLanguage = (navigator.languages?.[0] || navigator.language || "en").toLowerCase();
         const language = savedLanguage || (browserLanguage.startsWith("ru") ? "ru" : "en");
 
         document.documentElement.dataset.theme = theme;
-        document.documentElement.dataset.themePreference = preference;
+        document.documentElement.dataset.themeSource = preference ? "user" : "system";
         document.documentElement.dataset.lang = language;
         document.documentElement.lang = language;
       })();
@@ -76,7 +78,6 @@
           <button type="button" data-lang-choice="en" aria-pressed="false">EN</button>
         </div>
         <div class="segmented theme-control" data-i18n-aria="themeAria">
-          <button type="button" data-theme-choice="auto" data-i18n="themeAuto" aria-pressed="true">Auto</button>
           <button type="button" data-theme-choice="dark" data-i18n="themeDark" aria-pressed="false">Dark</button>
           <button type="button" data-theme-choice="light" data-i18n="themeLight" aria-pressed="false">Light</button>
         </div>
@@ -377,6 +378,6 @@
       <a href="#top" data-i18n="backTop">Наверх ↑</a>
     </footer>
 
-    <script src="./app.js?v=20260712-3"></script>
+    <script src="./app.js?v=20260712-4"></script>
   </body>
 </html>

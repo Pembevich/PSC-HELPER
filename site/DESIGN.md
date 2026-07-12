@@ -145,7 +145,9 @@ not competing call-to-action colors.
 ## Components
 
 - Header: compact wordmark, four section links, language segmented control,
-  theme segmented control, and mobile menu button.
+  Dark/Light segmented control, and mobile menu button. The system preference
+  selects the active theme automatically until the visitor chooses an override;
+  there is no visible Auto option.
 - Buttons: red primary or structural ghost. Minimum 44px hit target; one-line
   labels; 0.98 active scale; clear focus outline.
 - Console: real selectable modes with accessible tab semantics. It is labelled
