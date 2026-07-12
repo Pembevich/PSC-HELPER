@@ -3,6 +3,7 @@ from discord.ext import commands
 import logging
 
 from pos_ai import handle_pos_ai
+from message_gate import wait_for_moderation
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,11 @@ class AIChatCog(commands.Cog):
             return
 
         try:
+            moderation_result = await wait_for_moderation(message.id)
+            if moderation_result is not False:
+                if moderation_result is None:
+                    logger.error("Moderation gate timed out for message %s; AI reply suppressed.", message.id)
+                return
             if await handle_pos_ai(message, self.bot):
                 return
         except Exception as e:

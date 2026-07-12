@@ -32,6 +32,13 @@ class RegisterJoinTests(unittest.TestCase):
             _, triggered_last = antiraid.register_join(1, now=100 + i, window=60, threshold=5)
         self.assertTrue(triggered_last)
 
+    def test_threshold_alerts_once_per_wave(self):
+        results = [
+            antiraid.register_join(1, now=100 + i, window=60, threshold=3)[1]
+            for i in range(5)
+        ]
+        self.assertEqual(results, [False, False, True, False, False])
+
     def test_below_threshold_no_trigger(self):
         _, triggered = antiraid.register_join(1, now=100, window=60, threshold=5)
         self.assertFalse(triggered)
@@ -53,6 +60,12 @@ class RaidModeTests(unittest.TestCase):
         antiraid.set_raid_mode(7, now=100, cooldown=60)
         self.assertTrue(antiraid.is_raid_mode(7, now=120))
         self.assertFalse(antiraid.is_raid_mode(7, now=200))
+
+    def test_restore_keeps_only_active_states(self):
+        restored = antiraid.restore_raid_modes({7: 200, 8: 99}, now=100)
+        self.assertEqual(restored, 1)
+        self.assertEqual(antiraid.get_raid_until(7, now=100), 200)
+        self.assertFalse(antiraid.is_raid_mode(8, now=100))
 
 
 class AccountScoringTests(unittest.TestCase):
@@ -116,6 +129,68 @@ class EvaluateJoinTests(unittest.TestCase):
         res = antiraid.evaluate_join(clean, s, now=2003)
         self.assertTrue(res["raid_mode"])
         self.assertEqual(res["action"], "alert")  # легитимного не наказываем
+
+    def test_default_avatar_alone_never_causes_destructive_action(self):
+        s = self._settings(raid_action="ban")
+        for i in range(3):
+            antiraid.evaluate_join(
+                _member(600 + i, age_hours=1, avatar=False, guild_id=31),
+                s,
+                now=9000 + i,
+            )
+        established = _member(699, age_hours=9000, avatar=False, name="NormalUser", guild_id=31)
+        result = antiraid.evaluate_join(established, s, now=9003)
+        self.assertEqual(result["risk_score"], 1)
+        self.assertEqual(result["action"], "alert")
+
+    def test_medium_risk_is_quarantined_instead_of_banned(self):
+        s = self._settings(raid_action="ban")
+        for i in range(3):
+            antiraid.evaluate_join(
+                _member(700 + i, age_hours=1, avatar=False, guild_id=32),
+                s,
+                now=10000 + i,
+            )
+        medium_risk = _member(799, age_hours=24, avatar=True, name="NormalUser", guild_id=32)
+        result = antiraid.evaluate_join(medium_risk, s, now=10003)
+        self.assertEqual(result["risk_score"], 2)
+        self.assertEqual(result["action"], "quarantine")
+
+    def test_active_wave_extends_raid_mode(self):
+        s = self._settings(raid_join_threshold=3, raid_mode_cooldown_seconds=60)
+        for i in range(3):
+            antiraid.evaluate_join(
+                _member(800 + i, age_hours=1, avatar=False, guild_id=33),
+                s,
+                now=11000 + i,
+            )
+        self.assertEqual(antiraid.get_raid_until(33, now=11002), 11062)
+        antiraid.evaluate_join(
+            _member(899, age_hours=1, avatar=False, guild_id=33),
+            s,
+            now=11030,
+        )
+        self.assertEqual(antiraid.get_raid_until(33, now=11030), 11090)
+
+    def test_wave_retriggers_if_cooldown_expires_before_join_window(self):
+        s = self._settings(
+            raid_join_threshold=3,
+            raid_join_window_seconds=600,
+            raid_mode_cooldown_seconds=60,
+        )
+        for i in range(3):
+            antiraid.evaluate_join(
+                _member(900 + i, age_hours=1, avatar=False, guild_id=34),
+                s,
+                now=12000 + i,
+            )
+        result = antiraid.evaluate_join(
+            _member(999, age_hours=1, avatar=False, guild_id=34),
+            s,
+            now=12070,
+        )
+        self.assertTrue(result["raid"])
+        self.assertTrue(result["raid_mode"])
 
     def test_no_raid_clean_account_no_action(self):
         s = self._settings()

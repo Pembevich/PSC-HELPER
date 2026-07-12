@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
+from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -26,6 +29,9 @@ from config import (
     POS_AI_TEMPERATURE,
 )
 
+
+logger = logging.getLogger(__name__)
+
 _AI_REQUEST_SEMAPHORE = asyncio.Semaphore(max(1, POS_AI_MAX_CONCURRENT_REQUESTS))
 # #14: защищаем read-modify-write общих _provider_cursor/_provider_backoff_until,
 # чтобы при POS_AI_MAX_CONCURRENT_REQUESTS > 1 два запроса не выбрали один индекс
@@ -38,12 +44,45 @@ _provider_cursor = 0
 _provider_backoff_until: dict[int, float] = {}
 
 
+class _AIQueueTimeout(Exception):
+    pass
+
+
+@asynccontextmanager
+async def _request_slot(total_timeout: int):
+    acquired = False
+    queue_timeout = max(3.0, min(float(total_timeout) * 0.25, 15.0))
+    try:
+        try:
+            await asyncio.wait_for(_AI_REQUEST_SEMAPHORE.acquire(), timeout=queue_timeout)
+        except asyncio.TimeoutError as exc:
+            raise _AIQueueTimeout from exc
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            _AI_REQUEST_SEMAPHORE.release()
+
+
 def _build_provider_pool() -> list[dict[str, str]]:
     if POS_AI_PROVIDER_KEYS:
+        if POS_AI_PROVIDER_URLS and len(POS_AI_PROVIDER_URLS) != len(POS_AI_PROVIDER_KEYS):
+            logger.error(
+                "POS_AI_PROVIDER_URLS must contain exactly one URL per POS_AI_PROVIDER_KEYS entry; AI pool disabled."
+            )
+            return []
+        if POS_AI_PROVIDER_MODELS and len(POS_AI_PROVIDER_MODELS) != len(POS_AI_PROVIDER_KEYS):
+            logger.error(
+                "POS_AI_PROVIDER_MODELS must contain exactly one model per POS_AI_PROVIDER_KEYS entry; AI pool disabled."
+            )
+            return []
         pool: list[dict[str, str]] = []
         for index, key in enumerate(POS_AI_PROVIDER_KEYS):
             url = POS_AI_PROVIDER_URLS[index] if index < len(POS_AI_PROVIDER_URLS) else POS_AI_API_URL
             model = POS_AI_PROVIDER_MODELS[index] if index < len(POS_AI_PROVIDER_MODELS) else POS_AI_MODEL
+            if not url.lower().startswith("https://"):
+                logger.error("AI provider %s has a non-HTTPS URL and was skipped.", index + 1)
+                continue
             if "models.github" in url:
                 provider = "github_models"
             elif "googleapis.com" in url:
@@ -74,6 +113,11 @@ def _build_provider_pool() -> list[dict[str, str]]:
 
 
 _AI_PROVIDER_POOL = _build_provider_pool()
+
+
+def ai_has_configured_provider() -> bool:
+    """True, если есть хотя бы один реально настроенный AI-провайдер."""
+    return bool(_AI_PROVIDER_POOL and any(provider.get("api_key") for provider in _AI_PROVIDER_POOL))
 
 
 def ai_cooldown_remaining() -> float:
@@ -159,7 +203,7 @@ def _set_ai_backoff(seconds: float, reason: str) -> None:
     _ai_backoff_reason = reason
 
 
-def _parse_retry_after(headers: aiohttp.typedefs.LooseHeaders) -> float | None:
+def _parse_retry_after(headers: Mapping[str, str]) -> float | None:
     if not headers:
         return None
 
@@ -184,7 +228,7 @@ def _parse_retry_after(headers: aiohttp.typedefs.LooseHeaders) -> float | None:
     return None
 
 
-def _looks_like_rate_limit(status: int, body_text: str, headers: aiohttp.typedefs.LooseHeaders) -> bool:
+def _looks_like_rate_limit(status: int, body_text: str, headers: Mapping[str, str]) -> bool:
     if status == 429:
         return True
     if status != 403:
@@ -251,7 +295,7 @@ async def pos_chat_completion(
     timeout: int = POS_AI_TIMEOUT_SECONDS,
     provider_type: str | None = None,
 ) -> dict[str, Any] | None:
-    if not _AI_PROVIDER_POOL or not any(provider.get("api_key") for provider in _AI_PROVIDER_POOL):
+    if not ai_has_configured_provider():
         return None
 
     global _provider_cursor
@@ -259,8 +303,10 @@ async def pos_chat_completion(
 
     for attempt in range(max_attempts):
         response_text = ""
+        provider_index: int | None = None
+        provider: dict[str, str] | None = None
         try:
-            async with _AI_REQUEST_SEMAPHORE:
+            async with _request_slot(timeout):
                 if ai_is_temporarily_unavailable():
                     _log_ai_backoff_once(
                         f"P.OS AI cooldown active: {ai_unavailable_reason()} ({ai_cooldown_remaining():.0f}s remaining)."
@@ -302,7 +348,7 @@ async def pos_chat_completion(
 
                 timeout_config = aiohttp.ClientTimeout(total=timeout)
                 async with aiohttp.ClientSession(timeout=timeout_config) as session:
-                    async with session.post(provider["api_url"], headers=headers, json=payload, timeout=timeout) as resp:
+                    async with session.post(provider["api_url"], headers=headers, json=payload) as resp:
                         response_text = await resp.text()
                         if _looks_like_rate_limit(resp.status, response_text, resp.headers):
                             retry_after = _parse_retry_after(resp.headers) or POS_AI_RATE_LIMIT_FALLBACK_SECONDS
@@ -310,8 +356,10 @@ async def pos_chat_completion(
                             _log_ai_backoff_once(
                                 f"P.OS API rate limited ({provider['name']}): pause for {retry_after:.0f}s."
                             )
-                            next_idx = await _reserve_provider_index()
-                            if next_idx is not None and next_idx != provider_index:
+                            # Только проверяем наличие свободного провайдера — резерв
+                            # выполнит следующая итерация цикла (иначе курсор
+                            # сдвигался дважды и провайдеры пропускались).
+                            if _pick_provider_index(provider_type) is not None:
                                 continue  # retry next provider
                             _set_ai_backoff(min(retry_after, 30.0), "rate_limited")
                             return None
@@ -328,23 +376,38 @@ async def pos_chat_completion(
                             if provider["provider"] == "github_models" and resp.status in {401, 403}:
                                 print("P.OS GitHub Models auth error.")
                             print(f"P.OS API error {resp.status} ({provider['name']}): {response_text[:500]}")
-                            # Cool down this provider for 1 hour to prevent hitting bad credentials/models repeatedly
-                            await _mark_provider_backoff(provider_index, 3600.0)
+                            # 400/413/422 are request-specific and must not take a
+                            # healthy provider out of rotation. Auth and endpoint
+                            # failures are provider-specific and do get cooldowns.
+                            if resp.status in {401, 403}:
+                                await _mark_provider_backoff(provider_index, 3600.0)
+                            elif resp.status == 404:
+                                await _mark_provider_backoff(provider_index, 300.0)
+                            elif resp.status in {408, 409, 425}:
+                                await _mark_provider_backoff(provider_index, 10.0)
                             if attempt < max_attempts - 1:
                                 continue
                             return None
+        except _AIQueueTimeout:
+            _log_ai_backoff_once("P.OS AI queue is full; request rejected before provider call.")
+            return None
         except asyncio.TimeoutError:
-            print(f"P.OS API timeout for {provider['name']}. Attempting fallback.")
+            name = provider["name"] if provider else "unknown"
+            print(f"P.OS API timeout for {name}. Attempting fallback.")
             if attempt < max_attempts - 1:
                 continue
             return None
         except Exception as exc:
-            exc_str = str(exc).lower()
-            if "rate" in exc_str or "limit" in exc_str or "quota" in exc_str:
-                await _mark_provider_backoff(provider_index, 20.0)
-            else:
-                await _mark_provider_backoff(provider_index, 60.0)
-            print(f"P.OS API request failed ({provider['name']}): {exc}")
+            # provider_index может быть не присвоен, если исключение случилось до
+            # выбора провайдера — иначе тут вылетал NameError вместо возврата None.
+            if provider_index is not None:
+                exc_str = str(exc).lower()
+                if "rate" in exc_str or "limit" in exc_str or "quota" in exc_str:
+                    await _mark_provider_backoff(provider_index, 20.0)
+                else:
+                    await _mark_provider_backoff(provider_index, 60.0)
+            name = provider["name"] if provider else "unknown"
+            print(f"P.OS API request failed ({name}): {exc}")
             if attempt < max_attempts - 1:
                 continue
             return None

@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+      - name: Verify dependency graph
+        run: python -m pip check
+      - name: Audit dependencies
+        run: python -m pip_audit -r requirements.txt
+      - name: Compile production modules
+        run: python -m compileall -q main.py ai_client.py antiraid.py commands.py config.py forms.py guild_config.py join_gate.py logging_utils.py message_gate.py moderation.py pos_ai.py storage.py utils.py cogs
+      - name: Lint
+        run: python -m ruff check main.py ai_client.py antiraid.py commands.py config.py forms.py guild_config.py join_gate.py logging_utils.py message_gate.py moderation.py pos_ai.py storage.py utils.py cogs tests
+      - name: Type check
+        run: python -m mypy .
+      - name: Security scan
+        run: python -m bandit -q -ll -r main.py ai_client.py antiraid.py commands.py config.py forms.py guild_config.py join_gate.py logging_utils.py message_gate.py moderation.py pos_ai.py storage.py utils.py cogs
+      - name: Run tests
+        run: python -m pytest -q

@@ -11,3 +11,8 @@ bot_data.db.backup
 temp/
 .DS_Store
 .claude/
+AGENTS.md
+.agents/
+.codex/
+plugins/
+skills-lock.json

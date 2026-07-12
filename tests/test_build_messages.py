@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 import discord
 
 # We will mock modules that pos_ai.py imports to avoid side effects or database connection attempts

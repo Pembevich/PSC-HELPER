@@ -59,6 +59,13 @@ class ResolveRoleSmartTests(unittest.TestCase):
     def test_empty_returns_none(self):
         self.assertIsNone(resolve_role_smart(self.guild, ""))
 
+    def test_ambiguous_substring_does_not_guess(self):
+        guild = FakeGuild([
+            FakeRole(1, "Офицер PSC"),
+            FakeRole(2, "Офицер CESU"),
+        ])
+        self.assertIsNone(resolve_role_smart(guild, "Офицер"))
+
     def test_normalize_strips_decoration(self):
         self.assertEqual(_normalize_role_name("🎮 Игрок!"), "игрок")
         self.assertEqual(_normalize_role_name("Офицер PSC"), "офицерpsc")

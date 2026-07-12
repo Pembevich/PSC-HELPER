@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import discord
 from discord import Embed, Color
-from typing import Dict, List, Optional, TypedDict
+from typing import Dict, List, TypedDict
 
 from config import LOG_CATEGORY_ID, LOG_CATEGORY_NAME, PRIMARY_LOG_CHANNEL_ID
 
@@ -20,58 +20,63 @@ LOG_CHANNEL_CONFIGS: List[LogChannelConfig] = [
         "topic": "Логи модерации и автомодерации"
     },
     {
+        "key": "security",
+        "names": ["логи-безопасности", "security-logs"],
+        "topic": "Антирейд, AI-инструменты управления, security presets и аудит защиты"
+    },
+    {
         "key": "messages",
-        "names": ["логи-сообщений", "message-logs", "messages"],
+        "names": ["логи-сообщений", "message-logs"],
         "topic": "Логи всех сообщений"
     },
     {
         "key": "message_edits",
-        "names": ["логи-правок", "message-edits", "edits"],
+        "names": ["логи-правок", "message-edits"],
         "topic": "Логи редактирования сообщений"
     },
     {
         "key": "message_deletes",
-        "names": ["логи-удалений", "message-deletes", "deletes"],
+        "names": ["логи-удалений", "message-deletes"],
         "topic": "Логи удалённых сообщений"
     },
     {
         "key": "members",
-        "names": ["логи-участников", "member-logs", "members"],
+        "names": ["логи-участников", "member-logs"],
         "topic": "Вход/выход, никнеймы, роли"
     },
     {
         "key": "voice",
-        "names": ["логи-голоса", "voice-logs", "voice"],
+        "names": ["логи-голоса", "voice-logs"],
         "topic": "События голосовых каналов"
     },
     {
         "key": "roles",
-        "names": ["логи-ролей", "role-logs", "roles"],
+        "names": ["логи-ролей", "role-logs"],
         "topic": "Создание/изменение/удаление ролей"
     },
     {
         "key": "channels",
-        "names": ["логи-каналов", "channel-logs", "channels"],
+        "names": ["логи-каналов", "channel-logs"],
         "topic": "Создание/изменение/удаление каналов"
     },
     {
         "key": "server",
-        "names": ["логи-сервера", "server-logs", "server"],
+        "names": ["логи-сервера", "server-logs"],
         "topic": "Прочие серверные события"
     },
     {
         "key": "commands",
-        "names": ["логи-команд", "command-logs", "commands"],
+        "names": ["логи-команд", "command-logs"],
         "topic": "Использование команд"
     },
     {
         "key": "forms",
-        "names": ["логи-форм", "form-logs", "forms"],
+        "names": ["логи-форм", "form-logs"],
         "topic": "Жалобы/формы/заявки"
     },
     {
         "key": "errors",
-        "names": ["логи-ошибок", "error-logs", "errors"],
+        "names": ["логи-ошибок", "error-logs"],
         "topic": "Ошибки и исключения"
     }
 ]
@@ -80,6 +85,7 @@ _LOG_CHANNEL_CACHE: Dict[int, Dict[str, int]] = {}
 _LOG_INIT_DONE: set[int] = set()
 LOG_TYPE_LABELS = {
     "moderation": "Модерация",
+    "security": "Безопасность",
     "messages": "Сообщения",
     "message_edits": "Правки",
     "message_deletes": "Удаления",
@@ -105,9 +111,9 @@ def is_log_category(category: discord.CategoryChannel | None) -> bool:
         return True
     name_l = _safe_lower(category.name)
     target = _safe_lower(LOG_CATEGORY_NAME)
-    if target and target in name_l:
+    if target and target == name_l:
         return True
-    return "лог" in name_l or "log" in name_l
+    return name_l in {"логи", "logs", "p.os logs", "p.os логи"}
 
 
 def _find_category(guild: discord.Guild | None) -> discord.CategoryChannel | None:
@@ -119,6 +125,22 @@ def _find_category(guild: discord.Guild | None) -> discord.CategoryChannel | Non
             return cat
     for cat in guild.categories:
         if is_log_category(cat):
+            return cat
+    # Support a custom name created by setup_guild_logging without trusting the
+    # name itself: require a private category containing several exact log names.
+    known_names = {
+        name.lower()
+        for cfg in LOG_CHANNEL_CONFIGS
+        for name in cfg["names"]
+    }
+    for cat in guild.categories:
+        exact_log_channels = sum(
+            1
+            for channel in cat.channels
+            if isinstance(channel, discord.TextChannel) and channel.name.lower() in known_names
+        )
+        default_overwrite = cat.overwrites_for(guild.default_role)
+        if exact_log_channels >= 3 and default_overwrite.view_channel is False:
             return cat
     return None
 
@@ -135,52 +157,25 @@ def _find_channel_by_names(
         for ch in cat_channels:
             if ch.name.lower() in names_l:
                 return ch
-        for ch in cat_channels:
-            cname = ch.name.lower()
-            for name in names_l:
-                if name and name in cname:
-                    return ch
-
-    for ch in guild.text_channels:
-        if ch.name.lower() in names_l:
-            return ch
-    for ch in guild.text_channels:
-        cname = ch.name.lower()
-        for name in names_l:
-            if name and name in cname:
-                return ch
     return None
 
 
 async def ensure_log_category_and_channels(guild: discord.Guild) -> dict[str, discord.TextChannel]:
+    """Discover an explicitly configured private log area without mutating Discord."""
+    _LOG_CHANNEL_CACHE.pop(guild.id, None)
     if PRIMARY_LOG_CHANNEL_ID:
         explicit_channel = guild.get_channel(PRIMARY_LOG_CHANNEL_ID)
         if isinstance(explicit_channel, discord.TextChannel):
-            resolved = {cfg["key"]: explicit_channel for cfg in LOG_CHANNEL_CONFIGS}
-            _LOG_CHANNEL_CACHE[guild.id] = {key: channel.id for key, channel in resolved.items()}
+            explicit_channels = {cfg["key"]: explicit_channel for cfg in LOG_CHANNEL_CONFIGS}
+            _LOG_CHANNEL_CACHE[guild.id] = {key: channel.id for key, channel in explicit_channels.items()}
             _LOG_INIT_DONE.add(guild.id)
-            return resolved
-
-    can_manage = bool(guild.me and guild.me.guild_permissions.manage_channels)
+            return explicit_channels
 
     category = _find_category(guild)
-    if not category and can_manage:
-        try:
-            category = await await_create_category(guild, LOG_CATEGORY_NAME or "логи")
-        except Exception:
-            category = None
 
     resolved: dict[str, discord.TextChannel] = {}
     for cfg in LOG_CHANNEL_CONFIGS:
         ch = _find_channel_by_names(guild, cfg["names"], category)
-        if not ch and can_manage:
-            try:
-                if category:
-                    ch = await await_create_text_channel(guild, cfg["names"][0], category, cfg.get("topic"))
-                else:
-                    ch = await await_create_text_channel(guild, cfg["names"][0], None, cfg.get("topic"))
-            except Exception:
-                ch = None
         if ch:
             resolved[cfg["key"]] = ch
 
@@ -188,28 +183,6 @@ async def ensure_log_category_and_channels(guild: discord.Guild) -> dict[str, di
         _LOG_CHANNEL_CACHE[guild.id] = {k: v.id for k, v in resolved.items()}
     _LOG_INIT_DONE.add(guild.id)
     return resolved
-
-
-async def await_create_category(guild: discord.Guild, name: str):
-    return await guild.create_category(name=name, reason="Автосоздание категории логов")
-
-
-async def await_create_text_channel(
-    guild: discord.Guild,
-    name: str,
-    category: discord.CategoryChannel | None,
-    topic: str | None
-):
-    return await guild.create_text_channel(
-        name=name,
-        category=category,
-        topic=topic,
-        reason="Автосоздание канала логов"
-    )
-
-
-async def await_move_channel(channel: discord.TextChannel, category: discord.CategoryChannel):
-    await channel.edit(category=category, reason="Перенос в категорию логов")
 
 
 def _admin_only_overwrites(guild: discord.Guild) -> dict:
@@ -280,8 +253,8 @@ async def setup_guild_logging(
     else:
         try:
             await category.edit(overwrites=overwrites, reason="P.OS: обновление прав категории логов")
-        except Exception:
-            pass
+        except Exception as exc:
+            return False, f"Не смог закрыть существующую категорию логов от обычных участников: {exc}"
 
     created_channels: list[str] = []
     existing_channels = 0
@@ -294,7 +267,7 @@ async def setup_guild_logging(
             try:
                 await ch.edit(sync_permissions=True, reason="P.OS: синхронизация прав лог-канала")
             except Exception:
-                pass
+                failed += 1
             continue
         try:
             ch = await guild.create_text_channel(
@@ -323,7 +296,7 @@ async def setup_guild_logging(
     ]
     if failed:
         report_parts.append(f"Не удалось создать: `{failed}` (проверь права и лимит каналов).")
-    report_parts.append("Доступ к логам открыт только ролям администраторов.")
+    report_parts.append("Доступ к логам открыт только администраторам и ролям с доступом к журналу аудита.")
     return True, " ".join(report_parts)
 
 
@@ -343,12 +316,7 @@ def get_log_channel(guild: discord.Guild | None, log_type: str = "server") -> di
         if isinstance(ch, discord.TextChannel):
             return ch
 
-    if guild.id not in _LOG_INIT_DONE:
-        # Полная инициализация выполняется асинхронно в on_ready
-        # (ensure_log_category_and_channels). Здесь — только поиск по имени ниже.
-        pass
-
-    # fallback: поиск по имени
+    # Strict discovery inside the exact log category only.
     category = _find_category(guild)
     for cfg in LOG_CHANNEL_CONFIGS:
         if cfg["key"] == log_type:
@@ -363,7 +331,7 @@ def get_log_channel(guild: discord.Guild | None, log_type: str = "server") -> di
     return None
 
 
-def is_log_channel(channel: discord.abc.GuildChannel | None) -> bool:
+def is_log_channel(channel: object) -> bool:
     if not channel or not isinstance(channel, discord.TextChannel):
         return False
     if PRIMARY_LOG_CHANNEL_ID and channel.id == PRIMARY_LOG_CHANNEL_ID:
@@ -385,6 +353,25 @@ async def send_log_embed(
     files: list[discord.File] | None = None,
     footer: str | None = None
 ) -> bool:
+    if guild:
+        try:
+            from storage import add_ai_event
+            await add_ai_event(
+                guild_id=guild.id,
+                event_type=f"log:{log_type}",
+                summary=f"{title}: {(description or '')[:900]}",
+                details={
+                    "title": title,
+                    "description": description or "",
+                    "fields": [
+                        {"name": name, "value": value, "inline": inline}
+                        for name, value, inline in (fields or [])
+                    ],
+                },
+            )
+        except Exception:
+            pass
+
     channel = get_log_channel(guild, log_type)
     if not channel:
         return False

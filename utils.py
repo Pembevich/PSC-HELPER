@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import aiohttp
 import discord
@@ -11,6 +11,7 @@ from config import (
     GOOGLE_SAFEBROWSING_KEY,
     DEEPSEEK_API_KEY,
     POS_AI_API_KEY,
+    POS_AI_PROVIDER_KEYS,
     GITHUB_MODELS_TOKEN,
     POS_OWNER_USER_IDS,
 )
@@ -24,6 +25,8 @@ def collect_runtime_health() -> dict:
         "DEEPSEEK_API_KEY": bool(DEEPSEEK_API_KEY),
         "GITHUB_MODELS_TOKEN": bool(GITHUB_MODELS_TOKEN),
         "POS_AI_API_KEY": bool(POS_AI_API_KEY),
+        "POS_AI_PROVIDER_KEYS": bool(POS_AI_PROVIDER_KEYS),
+        "AI_PROVIDER_CONFIGURED": bool(POS_AI_API_KEY or POS_AI_PROVIDER_KEYS),
         "POS_OWNER_USER_IDS": bool(POS_OWNER_USER_IDS),
     }
 
@@ -57,14 +60,19 @@ def sanitize_discord_token(raw_token: str | None) -> str | None:
     return token or None
 
 
-async def safe_send_dm(user: discord.User, embed: Embed, file: discord.File = None):
+async def safe_send_dm(
+    user: discord.User | discord.Member,
+    embed: Embed,
+    file: discord.File | None = None,
+) -> bool:
     try:
         if file:
             await user.send(embed=embed, file=file)
         else:
             await user.send(embed=embed)
+        return True
     except Exception:
-        pass
+        return False
 
 
 def assess_applicant_risk(roblox_nick: str, discord_nick: str, member: discord.Member):

@@ -1,6 +1,6 @@
 # PSC-HELPER
 
-**Current release:** [v0.8.1](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.8.1) · **License:** [MIT](./LICENSE)
+**Product version:** 0.8.1 · **Current GitHub release:** [v0.8.2](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.8.2) · **License:** [MIT](./LICENSE)
 
 A self-hosted Discord bot for communities that need automated moderation, an in-character AI assistant (**P.OS**), application/complaint workflows, detailed audit logging, and media utilities such as on-the-fly GIF generation.
 
@@ -33,18 +33,20 @@ If you try PSC-HELPER, an issue describing your server size and setup helps the 
 
 ## Core features
 
-- **Automated moderation** — link/attachment screening, spam and flood detection, scam/NSFW signals, mass-mention protection
+- **Automated moderation** — deterministic link and executable-attachment screening, normalized spam detection, AI-assisted review, mass-mention protection, and persistent anti-raid state
 - **P.OS AI assistant** — responds to mentions and replies, keeps conversational context, supports vision inputs
-- **Owner-gated tools** — bans, timeouts, roles, channels, cross-server actions; enforced in code, not prompt-only
+- **Owner-gated tools** — factual server inspection plus confirmed bans, timeouts, roles, channels, settings, and cross-server actions; enforced in code, not prompt-only
 - **Application workflows** — interactive forms for applications, reports, and staff review
-- **Audit logging** — structured server event journals with per-type log channels
-- **Media utilities** — `!gif` conversion from images or short video clips
+- **Audit logging** — structured server event journals and a persistent, redacted history of P.OS tool activity
+- **Media utilities** — adaptive `p.gif` conversion that preserves animation timing and searches for the best quality that fits the server upload limit
 
 ## Security model (important)
 
-High-privilege operations are **never delegated directly to the LLM**. The model may request actions through tool calls; `pos_ai.py` enforces owner checks, protected targets, and confirmation flows before execution.
+High-privilege operations are **never delegated directly to the LLM**. The model may request actions through tool calls; `pos_ai.py` resolves targets to canonical Discord IDs, checks permissions and role hierarchy, protects the owner and bot, and requires an out-of-band confirmation before execution.
 
-Administrative commands are restricted to Discord IDs listed in `POS_OWNER_USER_IDS` (owner ID `968698192411652176` is included by default).
+The only privileged operator is Pumba, identified by the immutable Discord user ID `968698192411652176`. This trust boundary cannot be expanded through an environment variable. Read-only factual tools may run immediately for Pumba; every state-changing action is sent to Pumba's DM for explicit button confirmation and expires after 10 minutes.
+
+AI moderation findings are advisory unless a deterministic signal or independently confirmed visual signal reaches the required confidence threshold. This prevents a model response or prompt-injected message from becoming an automatic punishment by itself.
 
 ## Quick start (local)
 
@@ -104,9 +106,8 @@ POS_AI_PROVIDER_MODELS=openai/gpt-4.1,openai/gpt-4.1
 
 ### Other useful settings
 
-- `POS_OWNER_USER_IDS` — comma-separated admin Discord IDs
 - `POS_AI_SYSTEM_PROMPT` — override P.OS persona prompt
-- `POS_AI_MAX_TOKENS`, `POS_AI_TEMPERATURE`, `POS_AI_TOP_P`, `POS_AI_TIMEOUT_SECONDS`
+- `POS_AI_MAX_TOKENS`, `POS_AI_TEMPERATURE`, `POS_AI_TOP_P`, `POS_AI_TIMEOUT_SECONDS`, `POS_AI_MAX_CONCURRENT_REQUESTS`
 - `PRIMARY_LOG_CHANNEL_ID`, `UPDATE_LOG_CHANNEL_ID`, `LOG_CATEGORY_ID`, `LOG_CATEGORY_NAME`
 - `DB_BACKUP_CHANNEL_ID` — Discord channel for SQLite backup uploads (recommended on Railway)
 
@@ -126,7 +127,7 @@ OpenRouter, Groq, Hugging Face Inference, Together AI, and Cloudflare Workers AI
 | `antiraid.py` | Join-rate raid detection and reactions |
 | `pos_ai.py` | P.OS orchestration, context, tool execution policy |
 | `ai_client.py` | OpenAI-compatible client with provider pooling |
-| `commands.py` | Classic and slash commands (`!gif`, `/sbor`, health) |
+| `commands.py` | Генерация GIF для единственной пользовательской команды `p.gif` |
 | `forms.py` | Application/report UI (views, modals) |
 | `storage.py` | Async SQLite persistence and Discord backup |
 | `guild_config.py` | Per-guild settings merged with defaults |
@@ -145,6 +146,7 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md). Roadmap areas use labels: `good first 
 | --- | --- |
 | [v0.8.0](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.8.0) | Multi-server settings, expanded owner tools, AI-assisted moderation |
 | [v0.8.1](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.8.1) | Raid quarantine default, owner ping/DM/lift tools, form fixes |
+| [v0.8.2](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.8.2) | Technical publication tag for the completed P.OS 0.8.1 product line: security, reliability, GIF pipeline, `p.` prefix, and official site |
 | [v0.9.0](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.9.0) | Planned milestone (pre-release) |
 
 ## GitHub Models token hygiene

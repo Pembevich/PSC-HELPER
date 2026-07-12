@@ -1,5 +1,9 @@
+import asyncio
 import os
+import re
+import time
 import uuid
+from typing import cast
 import discord
 from discord import Embed, Color
 from discord.ext import commands
@@ -19,6 +23,7 @@ from config import (
     squad_roles,
     TARGET_CHANNELS,
     TARGET_OUTPUT_CHANNEL,
+    allowed_role_ids,
 )
 from forms import ConfirmView, ComplaintView
 from utils import (
@@ -33,24 +38,70 @@ from logging_utils import send_log_embed
 
 logger = logging.getLogger(__name__)
 
+FORM_MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
+FORM_MAX_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024
+FORM_MAX_ATTACHMENTS = 5
+COMPLAINT_COOLDOWN_SECONDS = 10 * 60
+_COMPLAINT_TOPIC_PREFIX = "p.os-complaint-owner:"
+
+
+def _is_authorized_staff(member: discord.Member) -> bool:
+    permissions = member.guild_permissions
+    if permissions.administrator or permissions.manage_guild or permissions.manage_roles or permissions.manage_messages:
+        return True
+    trusted_role_ids = set(allowed_role_ids) | set(TAC_REVIEWER_ROLE_IDS)
+    return any(role.id in trusted_role_ids for role in member.roles)
+
+
+def _validate_form_attachments(attachments: list[discord.Attachment]) -> str | None:
+    if len(attachments) > FORM_MAX_ATTACHMENTS:
+        return f"Можно приложить не больше {FORM_MAX_ATTACHMENTS} файлов."
+    total = 0
+    for attachment in attachments:
+        size = int(attachment.size or 0)
+        if size > FORM_MAX_ATTACHMENT_BYTES:
+            return f"Файл `{attachment.filename}` больше {FORM_MAX_ATTACHMENT_BYTES // (1024 * 1024)} МБ."
+        total += size
+    if total > FORM_MAX_TOTAL_ATTACHMENT_BYTES:
+        return f"Суммарный размер файлов больше {FORM_MAX_TOTAL_ATTACHMENT_BYTES // (1024 * 1024)} МБ."
+    return None
+
 class FormsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._complaint_last_submit: dict[tuple[int, int], float] = {}
+        self._complaint_locks: dict[int, asyncio.Lock] = {}
+
+    def _complaint_lock(self, guild_id: int) -> asyncio.Lock:
+        lock = self._complaint_locks.get(guild_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._complaint_locks[guild_id] = lock
+        return lock
+
+    @staticmethod
+    def _find_open_complaint(guild: discord.Guild, user_id: int) -> discord.TextChannel | None:
+        topic = f"{_COMPLAINT_TOPIC_PREFIX}{user_id}"
+        return next((channel for channel in guild.text_channels if (channel.topic or "") == topic), None)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if not message.guild or message.author.bot:
+        author = message.author
+        if not message.guild or author.bot or not isinstance(author, discord.Member):
             return
+        author_member = cast(discord.Member, author)
 
         # Авто-отписки
         try:
             if message.channel.id in TARGET_CHANNELS and "ОТПИСКИ" in (message.content or "").upper():
+                if not _is_authorized_staff(author_member):
+                    return
                 today = discord.utils.utcnow().strftime("%d.%m.%Y")
                 group = TARGET_CHANNELS[message.channel.id]
                 title = f"Общее мероприятие [P.S.C] ({today}) - Отписки." if group == "P.S.C" else f"Мероприятие [{group}] ({today}) - Отписки."
                 embed = Embed(title=title, color=Color.from_rgb(255, 255, 255))
                 target_channel = self.bot.get_channel(TARGET_OUTPUT_CHANNEL)
-                if target_channel:
+                if isinstance(target_channel, (discord.TextChannel, discord.Thread)):
                     try:
                         sent = await target_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
                         try:
@@ -66,15 +117,25 @@ class FormsCog(commands.Cog):
         if message.channel.id == PSC_CHANNEL_ID:
             content_strip = (message.content or "").strip()
             if content_strip.upper().startswith("С ВЕБХУКОМ"):
-                try:
-                    await message.delete()
-                except Exception:
-                    pass
+                if not _is_authorized_staff(author_member):
+                    await message.reply("❌ У вас нет прав для служебной публикации.", mention_author=False)
+                    return
+
+                if len(message.attachments) > 1:
+                    await message.reply("❌ Для служебной публикации можно приложить один файл.", mention_author=False)
+                    return
+                attachment_error = _validate_form_attachments(list(message.attachments[:1]))
+                if attachment_error:
+                    await message.reply(f"❌ {attachment_error}", mention_author=False)
+                    return
 
                 role_ping = message.guild.get_role(PING_ROLE_ID)
                 if role_ping:
                     try:
-                        await message.channel.send(role_ping.mention)
+                        await message.channel.send(
+                            role_ping.mention,
+                            allowed_mentions=discord.AllowedMentions(roles=[role_ping]),
+                        )
                     except Exception:
                         pass
 
@@ -85,11 +146,10 @@ class FormsCog(commands.Cog):
                 if message.attachments:
                     att = message.attachments[0]
                     try:
-                        os.makedirs("temp", exist_ok=True)
-                        fname = f"temp/{uuid.uuid4().hex}-{att.filename}"
-                        await att.save(fname)
-                        file_to_send = discord.File(fname, filename=att.filename)
-                        embed.set_image(url=f"attachment://{att.filename}")
+                        safe_filename = os.path.basename(att.filename or f"attachment-{uuid.uuid4().hex}")
+                        file_to_send = await att.to_file(filename=safe_filename)
+                        if (att.content_type or "").lower().startswith("image/"):
+                            embed.set_image(url=f"attachment://{safe_filename}")
                     except Exception as e:
                         logger.error(f"Failed to save attachment for PSC embed: {e}", exc_info=True)
                         file_to_send = None
@@ -97,14 +157,15 @@ class FormsCog(commands.Cog):
                 try:
                     if file_to_send:
                         await message.channel.send(embed=embed, file=file_to_send)
-                        try:
-                            os.remove(file_to_send.fp.name)
-                        except Exception:
-                            pass
                     else:
                         await message.channel.send(embed=embed)
                 except Exception as e:
                     logger.error(f"Failed to send PSC embed: {e}", exc_info=True)
+                    return
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
                 return
 
         # Жалобы
@@ -121,21 +182,55 @@ class FormsCog(commands.Cog):
                 await safe_send_dm(message.author, em)
                 return
 
-            try:
-                await message.delete()
-            except Exception:
-                pass
+            attachment_error = _validate_form_attachments(list(message.attachments))
+            if attachment_error:
+                await message.reply(f"❌ {attachment_error}", mention_author=False)
+                return
 
             guild = message.guild
-            category = message.channel.category
-            existing = [ch for ch in (category.channels if category else guild.channels) if ch.name.startswith("жалоба-")]
-            index = len(existing) + 1
-            channel_name = f"жалоба-{index}"
+            category = message.channel.category if isinstance(message.channel, discord.TextChannel) else None
+            cooldown_key = (guild.id, message.author.id)
+            now = time.monotonic()
+            last_submit = self._complaint_last_submit.get(cooldown_key, 0.0)
+            remaining = COMPLAINT_COOLDOWN_SECONDS - (now - last_submit)
+            if remaining > 0:
+                await message.reply(
+                    f"⏳ Новую жалобу можно отправить через {max(1, int(remaining // 60) + 1)} мин.",
+                    mention_author=False,
+                )
+                return
 
-            overwrites = {
+            open_complaint = self._find_open_complaint(guild, message.author.id)
+            if open_complaint:
+                await message.reply(
+                    f"У вас уже есть открытая жалоба: {open_complaint.mention}.",
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+
+            notify_role = guild.get_role(COMPLAINT_NOTIFY_ROLE)
+
+            overwrites: dict[
+                discord.Role | discord.Member | discord.Object,
+                discord.PermissionOverwrite,
+            ] = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=False, send_messages=False),
-                message.author: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+                author_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
             }
+            if guild.me:
+                overwrites[guild.me] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_channels=True,
+                )
+            if notify_role:
+                overwrites[notify_role] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                )
             for role in guild.roles:
                 try:
                     if role.permissions.administrator or role.permissions.manage_guild:
@@ -143,14 +238,85 @@ class FormsCog(commands.Cog):
                 except Exception:
                     pass
 
-            try:
-                complaint_chan = await guild.create_text_channel(channel_name, overwrites=overwrites, category=category, reason=f"Новая жалоба от {message.author}")
-            except Exception:
+            complaint_chan: discord.TextChannel | None = None
+            async with self._complaint_lock(guild.id):
+                open_complaint = self._find_open_complaint(guild, message.author.id)
+                if open_complaint:
+                    await message.reply(
+                        f"У вас уже есть открытая жалоба: {open_complaint.mention}.",
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
+
+                existing_numbers = []
+                for channel in (category.channels if category else guild.channels):
+                    match = re.match(r"жалоба-(\d+)$", channel.name)
+                    if match:
+                        existing_numbers.append(int(match.group(1)))
+                index = (max(existing_numbers) + 1) if existing_numbers else 1
+                channel_name = f"жалоба-{index}"
                 try:
-                    complaint_chan = await guild.create_text_channel(channel_name, overwrites=overwrites, reason=f"Новая жалоба от {message.author}")
-                except Exception as e:
-                    logger.error(f"Failed to create complaint channel: {e}", exc_info=True)
-                    complaint_chan = None
+                    complaint_chan = await guild.create_text_channel(
+                        channel_name,
+                        overwrites=overwrites,
+                        category=category,
+                        topic=f"{_COMPLAINT_TOPIC_PREFIX}{message.author.id}",
+                        reason=f"Новая жалоба от {message.author}",
+                    )
+                except Exception as exc:
+                    logger.error("Failed to create complaint channel: %s", exc, exc_info=True)
+
+            if not complaint_chan:
+                await message.reply(
+                    "⚠️ Не удалось создать приватный канал жалобы. Исходное сообщение сохранено; сообщите администрации.",
+                    mention_author=False,
+                )
+                return
+
+            embed = Embed(title="📢 Новая жалоба", color=Color.blue())
+            embed.add_field(name="Отправитель", value=f"{message.author.mention} (ID: {message.author.id})", inline=False)
+            full_text = "\n".join(lines)
+            embed.add_field(name="Жалоба", value=f"```{full_text[:1900]}```", inline=False)
+            embed.set_footer(text=f"ID жалобы: {index} | {discord.utils.utcnow().strftime('%d.%m.%Y %H:%M:%S')}")
+
+            try:
+                if notify_role:
+                    await complaint_chan.send(
+                        notify_role.mention,
+                        allowed_mentions=discord.AllowedMentions(roles=[notify_role]),
+                    )
+                complaint_view = ComplaintView(submitter=message.author, complaint_channel_id=complaint_chan.id)
+                await complaint_chan.send(
+                    embed=embed,
+                    view=complaint_view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
+                if message.attachments:
+                    files = [await attachment.to_file() for attachment in message.attachments]
+                    await complaint_chan.send(
+                        content="📎 Приложенные доказательства от автора жалобы:",
+                        files=files,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+            except Exception as exc:
+                logger.error("Failed to hand off complaint: %s", exc, exc_info=True)
+                try:
+                    await complaint_chan.delete(reason="Откат неполной жалобы P.OS")
+                except Exception:
+                    pass
+                await message.reply(
+                    "⚠️ Не удалось надежно перенести жалобу и доказательства. Исходное сообщение сохранено.",
+                    mention_author=False,
+                )
+                return
+
+            self._complaint_last_submit[cooldown_key] = time.monotonic()
+            try:
+                await message.delete()
+            except Exception:
+                pass
 
             try:
                 await send_log_embed(
@@ -160,38 +326,12 @@ class FormsCog(commands.Cog):
                     f"Создан канал жалобы для {message.author.mention}.",
                     color=Color.blue(),
                     fields=[
-                        ("Канал", complaint_chan.mention if complaint_chan else "не создан", False),
-                        ("Категория", category.name if category else "—", False)
-                    ]
+                        ("Канал", complaint_chan.mention, False),
+                        ("Категория", category.name if category else "—", False),
+                    ],
                 )
             except Exception:
                 pass
-
-            embed = Embed(title="📢 Новая жалоба", color=Color.blue())
-            embed.add_field(name="Отправитель", value=f"{message.author.mention} (ID: {message.author.id})", inline=False)
-            full_text = "\n".join(lines)
-            embed.add_field(name="Жалоба", value=f"```{full_text[:1900]}```", inline=False)
-            embed.set_footer(text=f"ID жалобы: {index} | {discord.utils.utcnow().strftime('%d.%m.%Y %H:%M:%S')}")
-            notify_role = guild.get_role(COMPLAINT_NOTIFY_ROLE)
-            
-            if complaint_chan:
-                try:
-                    if notify_role:
-                        await complaint_chan.send(notify_role.mention)
-                    view = ComplaintView(submitter=message.author, complaint_channel_id=complaint_chan.id)
-                    await complaint_chan.send(embed=embed, view=view)
-
-                    if message.attachments:
-                        files = []
-                        for att in message.attachments[:5]:
-                            try:
-                                files.append(await att.to_file())
-                            except Exception:
-                                pass
-                        if files:
-                            await complaint_chan.send(content="📎 Приложенные доказательства от автора жалобы:", files=files)
-                except Exception as e:
-                    logger.error(f"Failed to send complaint embed/files: {e}", exc_info=True)
             return
 
         # Форма Arbaiter
@@ -262,7 +402,7 @@ class FormsCog(commands.Cog):
             # Любая ошибка проверки НЕ должна ронять заявку — она всё равно уйдёт
             # проверяющим, просто без авто-вердикта.
             try:
-                discord_flags = assess_applicant_risk(user_line, discord_nick_line, message.author)
+                discord_flags = assess_applicant_risk(user_line, discord_nick_line, author_member)
             except Exception as e:
                 logger.error(f"Arbaiter: ошибка assess_applicant_risk: {e}", exc_info=True)
                 discord_flags = []
@@ -327,10 +467,8 @@ class FormsCog(commands.Cog):
                 f"{discord.utils.utcnow().strftime('%d.%m.%Y %H:%M:%S')}"
             )
 
-            # Пустой список разрешённых ролей — кнопки может нажимать любой, у кого
-            # есть доступ к каналу заявок (проверяющих по-прежнему пингуем ниже).
-            view = ConfirmView(
-                [],
+            confirm_view = ConfirmView(
+                TAC_REVIEWER_ROLE_IDS,
                 target_message=message,
                 squad_name="Arbaiter",
                 role_ids=TAC_ROLE_REWARDS,
@@ -339,29 +477,53 @@ class FormsCog(commands.Cog):
 
             mentions = []
             for rid in TAC_REVIEWER_ROLE_IDS:
-                role = message.guild.get_role(rid)
-                if role:
-                    mentions.append(role.mention)
+                reviewer_role = message.guild.get_role(rid)
+                if reviewer_role:
+                    mentions.append(reviewer_role.mention)
+
+            try:
+                if mentions:
+                    allowed_roles = [
+                        allowed_role
+                        for role_id in TAC_REVIEWER_ROLE_IDS
+                        if (allowed_role := message.guild.get_role(role_id)) is not None
+                    ]
+                    await target_channel.send(
+                        content=" ".join(mentions),
+                        embed=embed,
+                        view=confirm_view,
+                        allowed_mentions=discord.AllowedMentions(roles=allowed_roles),
+                    )
+                else:
+                    await target_channel.send(
+                        embed=embed,
+                        view=confirm_view,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+            except Exception as e:
+                logger.error(f"Failed to send Arbaiter form embed: {e}", exc_info=True)
+                await message.reply(
+                    "⚠️ Не удалось передать заявку проверяющим. Исходное сообщение сохранено; сообщите администрации.",
+                    mention_author=False,
+                )
+                return
 
             try:
                 await message.reply(
                     "✅ **Ваша заявка на стадии рассмотрения**\n\n"
-                    "Это займёт некоторое время так как заявку принимает настоящий человек ."
+                    "Заявку проверит человек; это может занять некоторое время.",
+                    mention_author=False,
                 )
             except Exception:
                 pass
-
-            try:
-                if mentions:
-                    await target_channel.send(content=" ".join(mentions), embed=embed, view=view)
-                else:
-                    await target_channel.send(embed=embed, view=view)
-            except Exception as e:
-                logger.error(f"Failed to send Arbaiter form embed: {e}", exc_info=True)
             return
 
         # Форма наказаний
         if message.channel.id == form_channel_id:
+            if not _is_authorized_staff(author_member):
+                await message.reply("❌ У вас нет прав для применения наказаний.", mention_author=False)
+                return
+
             template = (
                 "Никнейм: Robloxer228\n"
                 "Дискорд айди: 1234567890\n"
@@ -390,6 +552,17 @@ class FormsCog(commands.Cog):
                     pass
                 return
 
+            valid_punishments = {"1 выговор", "2 выговора", "1 страйк", "2 страйка"}
+            if punishment not in valid_punishments:
+                await message.reply(
+                    "❌ Неизвестное наказание. Допустимо: 1 выговор, 2 выговора, 1 страйк, 2 страйка.",
+                    mention_author=False,
+                )
+                return
+            if not reason:
+                await message.reply("❌ Причина наказания не может быть пустой.", mention_author=False)
+                return
+
             member = message.guild.get_member(user_id)
             if not member:
                 try:
@@ -403,35 +576,95 @@ class FormsCog(commands.Cog):
                     pass
                 return
 
+            bot_member = message.guild.me
+            if bot_member and member != message.guild.owner and member.top_role >= bot_member.top_role:
+                await message.reply(
+                    "❌ Роль цели находится не ниже роли P.OS; Discord не разрешит изменить наказания.",
+                    mention_author=False,
+                )
+                return
+
             roles = member.roles
+            role_errors: list[str] = []
 
             async def log_action(text, color=Color.orange()):
+                details = (
+                    f"{text}\nПричина: {reason[:500]}\n"
+                    f"Оформил: {message.author.mention} (`{message.author.id}`)\n"
+                    f"Указанный ник: `{nickname[:100]}`"
+                )
+                if role_errors:
+                    details += "\n❌ Ошибки ролей: " + "; ".join(role_errors)
+                    color = Color.red()
                 await send_log_embed(
                     message.guild,
                     "moderation",
-                    "📋 Лог наказаний",
-                    text,
+                    "📋 Лог наказаний" if not role_errors else "❌ Наказание применено не полностью",
+                    details,
                     color=color
                 )
+                if role_errors:
+                    await message.reply(
+                        "⚠️ Наказание применено не полностью: " + "; ".join(role_errors),
+                        mention_author=False,
+                    )
 
             async def apply_roles(to_add, to_remove):
-                for r in to_remove:
-                    if r in roles:
-                        try:
-                            await member.remove_roles(r)
-                        except Exception as e:
-                            logger.error(f"Failed to remove role: {e}")
-                for r in to_add:
-                    if r not in roles:
-                        try:
-                            await member.add_roles(r)
-                        except Exception as e:
-                            logger.error(f"Failed to add role: {e}")
+                roles_to_add = [role for role in to_add if role and role not in roles]
+                roles_to_remove = [role for role in to_remove if role and role in roles]
+                if roles_to_add:
+                    try:
+                        await member.add_roles(*roles_to_add, reason=f"P.OS punishment by {message.author}")
+                    except Exception as exc:
+                        names = ", ".join(role.name for role in roles_to_add)
+                        role_errors.append(f"не удалось выдать {names}: {exc}")
+                        logger.error("Failed to add punishment roles: %s", exc)
+                        return False
+                if roles_to_remove:
+                    try:
+                        await member.remove_roles(*roles_to_remove, reason=f"P.OS punishment by {message.author}")
+                    except Exception as exc:
+                        names = ", ".join(role.name for role in roles_to_remove)
+                        role_errors.append(f"не удалось снять {names}: {exc}")
+                        logger.error("Failed to remove punishment roles: %s", exc)
+                        return False
+                return True
 
             punish_1 = message.guild.get_role(punishment_roles["1 выговор"])
             punish_2 = message.guild.get_role(punishment_roles["2 выговора"])
             strike_1 = message.guild.get_role(punishment_roles["1 страйк"])
             strike_2 = message.guild.get_role(punishment_roles["2 страйка"])
+
+            configured_roles = {
+                "1 выговор": punish_1,
+                "2 выговора": punish_2,
+                "1 страйк": strike_1,
+                "2 страйка": strike_2,
+            }
+            missing_roles = [name for name, role in configured_roles.items() if role is None]
+            if missing_roles:
+                await message.reply(
+                    "❌ На сервере отсутствуют настроенные роли наказаний: " + ", ".join(missing_roles),
+                    mention_author=False,
+                )
+                return
+            punish_1 = cast(discord.Role, punish_1)
+            punish_2 = cast(discord.Role, punish_2)
+            strike_1 = cast(discord.Role, strike_1)
+            strike_2 = cast(discord.Role, strike_2)
+            configured_role_values = (punish_1, punish_2, strike_1, strike_2)
+            if bot_member:
+                unmanageable = [
+                    role.name
+                    for role in configured_role_values
+                    if role.managed or role >= bot_member.top_role
+                ]
+                if unmanageable:
+                    await message.reply(
+                        "❌ P.OS не может управлять ролями из-за иерархии: " + ", ".join(unmanageable),
+                        mention_author=False,
+                    )
+                    return
 
             if all(r in roles for r in [punish_1, punish_2, strike_1, strike_2]):
                 notify = None
@@ -494,3 +727,8 @@ class FormsCog(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(FormsCog(bot))
+    # Persistent views: без регистрации кнопки заявок/жалоб умирали после каждого
+    # рестарта бота («Взаимодействие не удалось»). Контекст восстанавливается
+    # из embed сообщения внутри самих view.
+    bot.add_view(ConfirmView(TAC_REVIEWER_ROLE_IDS))
+    bot.add_view(ComplaintView())

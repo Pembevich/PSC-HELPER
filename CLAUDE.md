@@ -35,14 +35,14 @@ Runtime is pinned to Python 3.11 (`runtime.txt`). `ffmpeg` is a system dependenc
 ## Architecture
 
 ### Startup flow (`main.py`)
-`run_bot()` loads env → `await init_db()` (async SQLite) → creates a `commands.Bot` with `Intents.all()` and `!` prefix → loads cogs in a fixed order (see `COGS` list) → registers SIGTERM/SIGINT handlers that back up the DB to Discord before closing → `bot.start(token)`. The Discord token is run through `sanitize_discord_token()` before use.
+`run_bot()` loads env → `await init_db()` (async SQLite) → creates a `commands.Bot` with the `p.` prefix → loads cogs in a fixed order (see `COGS` list) → restores persistent state before connecting the gateway → registers SIGTERM/SIGINT handlers that back up the DB to Discord before closing. The Discord token is run through `sanitize_discord_token()` before use.
 
 ### Cogs vs. top-level modules
 Behavior lives in `cogs/` (each exposes `async def setup(bot)`), but the heavy logic is in **top-level modules** that the cogs delegate to. Cogs are thin listeners/command wrappers:
 
 - `cogs/ai_chat.py` → `pos_ai.handle_pos_ai` / `pos_ai.ask_pos`
 - `cogs/mod.py` → `moderation.py` functions (URL checks, spam, ad/NSFW detection, timeouts)
-- `cogs/general.py` → `commands.py` (GIF generation, `!gif`, `!health`, `/sbor`); also owns the 10-minute DB backup loop and `on_ready` setup (DB restore, log-channel creation, slash-command sync)
+- `cogs/general.py` → `commands.py` (GIF generation and the only user command, `p.gif`); also owns the 10-minute DB backup loop and `on_ready` setup
 - `cogs/forms.py` → `forms.py` (UI views/modals) + `utils.py`
 - `cogs/logging_events.py` → large self-contained server event logger
 - `cogs/ai_tools.py` → `POS_AI_TOOLS` schema (the tool definitions P.OS may call)
@@ -61,7 +61,7 @@ All env parsing and hardcoded Discord IDs (channels, roles, guilds) live here. R
 `pos_chat_completion()` is the single entry point for all model calls (both P.OS chat and Gemini-based moderation, selected via `provider_type=`). It implements an OpenAI-compatible client with a **provider pool** (`POS_AI_PROVIDER_KEYS/URLS/MODELS`, CSV, index-aligned) for rate-limit spreading. Features: round-robin provider cursor, per-provider and global backoff/cooldown with `Retry-After` parsing, automatic failover to the next provider on 429/5xx, and tolerant response parsing (`_extract_message_from_payload`, `extract_json_block`). Returns `None` on failure rather than raising — callers must handle `None`.
 
 ### P.OS logic (`pos_ai.py`)
-The largest module. `handle_pos_ai(message, bot)` decides whether P.OS should respond (mention, reply, name-mention, ongoing context), builds the message payload via `_build_messages` (system prompt + chronological channel history with per-author identity headers + guild/author/server-memory snapshots), and calls `request_pos_reply`. Supports image/video vision inputs and a `!gif`-style request path.
+The largest module. `handle_pos_ai(message, bot)` decides whether P.OS should respond (mention, reply, name-mention, ongoing context), builds the message payload via `_build_messages` (system prompt + chronological channel history with per-author identity headers + guild/author/server-memory snapshots), and calls `request_pos_reply`. Supports image/video vision inputs and a `p.gif`-style request path.
 
 **Tool-call security model (critical):** the model can emit tool calls (`ban_user`, `unban_user`, `timeout_user`, `add_role`, `remove_role`, `mute_ai_for_user`, `unmute_ai_for_user`), but `execute_pos_tool` enforces the policy in code, not in the prompt:
 - Tools in `_OWNER_ONLY_TOOLS` are refused unless `message.author.id` is in `POS_OWNER_USER_IDS`; instead a confirmation request is DM'd to the owner.

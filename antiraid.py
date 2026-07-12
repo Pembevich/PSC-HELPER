@@ -3,7 +3,7 @@ antiraid.py — детектор рейдов и скрининг подозри
 
 Чистая логика без побочных эффектов Discord: считает заходы по окну, держит
 состояние «режима рейда» на сервер, оценивает аккаунты (возраст, аватар, ник) и
-возвращает решение. Реальные действия (kick/ban/lockdown/лог) выполняет ког
+возвращает решение. Реальные действия (quarantine/kick/ban/лог) выполняет ког
 cogs/security.py — так логику легко тестировать.
 """
 from __future__ import annotations
@@ -81,20 +81,44 @@ def suspicious_join_signals(member: discord.abc.User, min_account_age_hours: int
     return signals
 
 
+def join_risk_score(member: discord.abc.User, min_account_age_hours: int) -> int:
+    """Conservative score: weak cosmetic signals cannot cause a kick by themselves."""
+    score = 0
+    age = account_age_hours(member)
+    if age is not None:
+        if age < 1:
+            score += 4
+        elif age < float(min_account_age_hours):
+            score += 2
+    if _has_default_avatar(member):
+        score += 1
+    name = (getattr(member, "name", "") or "")
+    if _INVITE_IN_NAME.search(name):
+        score += 4
+    if _TRAILING_DIGITS.search(name):
+        score += 1
+    if _NON_PRONOUNCEABLE.match(name):
+        score += 2
+    return score
+
+
 def register_join(guild_id: int, *, now: float, window: int, threshold: int) -> tuple[int, bool]:
     """Зарегистрировать заход и вернуть (кол-во_за_окно, сработал_ли_порог_рейда)."""
     _prune(now)
     dq = _joins[guild_id]
-    dq.append(now)
     while dq and now - dq[0] > window:
         dq.popleft()
+    previous_count = len(dq)
+    dq.append(now)
     count = len(dq)
-    triggered = count >= threshold
+    triggered = previous_count < threshold <= count
     return count, triggered
 
 
-def set_raid_mode(guild_id: int, *, now: float, cooldown: int) -> None:
-    _raid_until[guild_id] = max(_raid_until.get(guild_id, 0.0), now + cooldown)
+def set_raid_mode(guild_id: int, *, now: float, cooldown: int) -> float:
+    until = max(_raid_until.get(guild_id, 0.0), now + cooldown)
+    _raid_until[guild_id] = until
+    return until
 
 
 def is_raid_mode(guild_id: int, *, now: float | None = None) -> bool:
@@ -104,6 +128,23 @@ def is_raid_mode(guild_id: int, *, now: float | None = None) -> bool:
         _raid_until.pop(guild_id, None)
         return False
     return True
+
+
+def get_raid_until(guild_id: int, *, now: float | None = None) -> float | None:
+    now = time.time() if now is None else now
+    if not is_raid_mode(guild_id, now=now):
+        return None
+    return _raid_until[guild_id]
+
+
+def restore_raid_modes(states: dict[int, float], *, now: float | None = None) -> int:
+    """Replace in-memory raid state with non-expired database state."""
+    current_time = time.time() if now is None else now
+    _raid_until.clear()
+    for guild_id, until in states.items():
+        if int(guild_id) > 0 and float(until) > current_time:
+            _raid_until[int(guild_id)] = float(until)
+    return len(_raid_until)
 
 
 def clear(guild_id: int | None = None) -> None:
@@ -134,7 +175,7 @@ def evaluate_join(member: discord.Member, settings: dict[str, Any], *, now: floa
       join_count (int)   — заходов за окно,
       signals (list)     — красные флаги аккаунта,
       fresh (bool)       — свежий ли аккаунт,
-      action (str)       — none | alert | kick | ban | lockdown,
+      action (str)       — none | alert | quarantine | kick | ban,
       reason (str)       — человекочитаемая причина для лога/DM.
     """
     now = time.time() if now is None else now
@@ -146,29 +187,38 @@ def evaluate_join(member: discord.Member, settings: dict[str, Any], *, now: floa
     threshold = int(settings.get("raid_join_threshold", 8) or 8)
     cooldown = int(settings.get("raid_mode_cooldown_seconds", 600) or 600)
     min_age = int(settings.get("min_account_age_hours", 72) or 72)
-    raid_action = str(settings.get("raid_action", "kick") or "kick").lower()
+    raid_action = str(settings.get("raid_action", "quarantine") or "quarantine").lower()
+    # lockdown никогда не был реализован отдельно — старые настройки с ним
+    # трактуем как quarantine.
+    if raid_action == "lockdown":
+        raid_action = "quarantine"
 
     gid = member.guild.id
-    count, triggered = register_join(gid, now=now, window=window, threshold=threshold)
-    if triggered:
+    was_raid_mode = is_raid_mode(gid, now=now)
+    count, crossed_threshold = register_join(gid, now=now, window=window, threshold=threshold)
+    triggered = crossed_threshold or (count >= threshold and not was_raid_mode)
+    if triggered or (was_raid_mode and count >= threshold):
         set_raid_mode(gid, now=now, cooldown=cooldown)
     raid_mode = is_raid_mode(gid, now=now)
 
     signals = suspicious_join_signals(member, min_age)
     fresh = is_fresh_account(member, min_age)
+    risk_score = join_risk_score(member, min_age)
 
     action = "none"
     reason = ""
     if raid_mode:
-        # В режиме рейда: свежие/подозрительные аккаунты — под действие, остальные —
-        # только алерт (не наказываем легитимных участников, зашедших в тот же момент).
-        if fresh or signals:
-            action = raid_action if raid_action in {"quarantine", "kick", "ban", "lockdown"} else "alert"
-            reason = f"Режим рейда (заходов за {window}с: {count}). Аккаунт: " + (", ".join(signals) or "свежий")
-        else:
+        if raid_action == "alert" or risk_score < 2:
             action = "alert"
-            reason = f"Режим рейда (заходов за {window}с: {count}). Аккаунт без явных флагов — наблюдение."
-    elif len(signals) >= 2:
+        elif risk_score < 3 and raid_action in {"kick", "ban"}:
+            action = "quarantine"
+        else:
+            action = raid_action if raid_action in {"quarantine", "kick", "ban"} else "alert"
+        reason = (
+            f"Режим рейда (заходов за {window}с: {count}, риск: {risk_score}). "
+            + ("Аккаунт: " + ", ".join(signals) if signals else "Аккаунт без явных флагов — наблюдение.")
+        )
+    elif risk_score >= 2:
         # Вне рейда: явно подозрительный аккаунт — только алерт, без наказания.
         action = "alert"
         reason = "Подозрительный заход: " + ", ".join(signals)
@@ -179,6 +229,8 @@ def evaluate_join(member: discord.Member, settings: dict[str, Any], *, now: floa
         "join_count": count,
         "signals": signals,
         "fresh": fresh,
+        "risk_score": risk_score,
         "action": action,
         "reason": reason,
+        "raid_until": get_raid_until(gid, now=now),
     }

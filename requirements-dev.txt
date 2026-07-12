@@ -1,3 +1,6 @@
 -r requirements.txt
 pytest==9.0.3
 mypy==1.20.1
+ruff==0.15.21
+bandit==1.9.4
+pip-audit==2.10.1

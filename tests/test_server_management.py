@@ -1,5 +1,6 @@
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 with patch("storage.add_entry"), \
      patch("storage.get_ai_context"), \
@@ -7,7 +8,10 @@ with patch("storage.add_entry"), \
     import pos_ai
     from pos_ai import (
         _parse_bool, _summarize_tool_call,
-        _OWNER_ONLY_TOOLS, _OWNER_INFO_TOOLS, _TOOL_ACTION_LABELS,
+        _CONFIRM_EVEN_OWNER_TOOLS, _OWNER_ONLY_TOOLS, _OWNER_INFO_TOOLS, _READ_ONLY_TOOLS,
+        _TOOL_ACTION_LABELS,
+        _perform_shutdown, _prepare_mutating_tool_action, _resolve_member_smart,
+        _split_user_identifiers,
     )
 
 from cogs.ai_tools import POS_AI_TOOLS
@@ -19,14 +23,26 @@ class ToolSchemaTests(unittest.TestCase):
         for expected in [
             "edit_role", "create_channel", "delete_channel", "edit_channel",
             "set_channel_permission", "kick_user", "set_nickname", "create_invite",
+            "edit_server", "lock_channel", "unlock_channel", "create_thread",
+            "archive_thread", "voice_action", "security_scan", "set_security_preset",
+            "list_members", "user_info", "read_messages", "search_logs", "search_pings",
+            "bulk_user_action", "list_channels", "list_roles", "read_audit_log",
         ]:
             self.assertIn(expected, names, f"tool {expected} отсутствует в схеме")
 
     def test_management_tools_are_owner_only(self):
         # Все новые управляющие инструменты должны требовать прав владельца.
         for name in ["edit_role", "create_channel", "delete_channel", "edit_channel",
-                     "set_channel_permission", "kick_user", "set_nickname", "create_invite"]:
+                     "set_channel_permission", "kick_user", "set_nickname", "create_invite",
+                     "edit_server", "lock_channel", "unlock_channel", "create_thread",
+                     "archive_thread", "voice_action", "security_scan", "set_security_preset",
+                     "list_members", "user_info", "read_messages", "search_logs", "search_pings",
+                     "bulk_user_action"]:
             self.assertIn(name, _OWNER_ONLY_TOOLS)
+
+    def test_every_ai_tool_is_owner_only_in_current_beta(self):
+        names = {tool["function"]["name"] for tool in POS_AI_TOOLS}
+        self.assertEqual(names, _OWNER_ONLY_TOOLS)
 
     def test_every_owner_tool_has_label(self):
         for name in _OWNER_ONLY_TOOLS:
@@ -52,6 +68,203 @@ class ToolSchemaTests(unittest.TestCase):
         ci = next(t for t in POS_AI_TOOLS if t["function"]["name"] == "create_invite")
         props = ci["function"]["parameters"]["properties"]
         self.assertIn("server_id_or_name", props)
+
+    def test_messages_and_settings_support_cross_server(self):
+        for name in [
+            "send_message",
+            "dm_user",
+            "get_settings",
+            "update_settings",
+            "mute_ai_for_user",
+            "unmute_ai_for_user",
+        ]:
+            tool = next(t for t in POS_AI_TOOLS if t["function"]["name"] == name)
+            self.assertIn("server_id_or_name", tool["function"]["parameters"]["properties"])
+
+    def test_user_target_tools_accept_username_identifier(self):
+        for name in ["ban_user", "add_role", "timeout_user", "ping_user", "voice_action"]:
+            tool = next(t for t in POS_AI_TOOLS if t["function"]["name"] == name)
+            props = tool["function"]["parameters"]["properties"]
+            self.assertIn("user_identifier", props)
+            self.assertNotIn("user_id", tool["function"]["parameters"].get("required", []))
+
+    def test_new_info_tools_are_owner_info(self):
+        for name in [
+            "list_members",
+            "user_info",
+            "read_messages",
+            "search_logs",
+            "search_pings",
+            "list_channels",
+            "list_roles",
+            "read_audit_log",
+        ]:
+            self.assertIn(name, _OWNER_INFO_TOOLS)
+
+    def test_privilege_and_security_changes_require_out_of_band_confirmation(self):
+        expected = {
+            "add_role",
+            "remove_role",
+            "edit_role",
+            "unban_user",
+            "untimeout_user",
+            "lift_restrictions",
+            "deactivate_raid_mode",
+        }
+        self.assertTrue(expected.issubset(_CONFIRM_EVEN_OWNER_TOOLS))
+
+    def test_every_mutating_owner_tool_requires_confirmation(self):
+        self.assertEqual(_OWNER_ONLY_TOOLS - _READ_ONLY_TOOLS, _CONFIRM_EVEN_OWNER_TOOLS)
+
+
+class UserResolverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resolves_exact_username_before_display_name(self):
+        target = SimpleNamespace(id=1, name="real_login", display_name="Other", global_name=None)
+        decoy = SimpleNamespace(id=2, name="other_login", display_name="real_login", global_name=None)
+        guild = SimpleNamespace(
+            id=10,
+            name="Test",
+            members=[decoy, target],
+            get_member=lambda uid: target if uid == 1 else decoy if uid == 2 else None,
+        )
+
+        member, error = await _resolve_member_smart(guild, "real_login")
+        self.assertIs(member, target)
+        self.assertIsNone(error)
+
+    async def test_ambiguous_partial_requires_id(self):
+        first = SimpleNamespace(id=1, name="alpha_one", display_name="First", global_name=None)
+        second = SimpleNamespace(id=2, name="alpha_two", display_name="Second", global_name=None)
+        guild = SimpleNamespace(
+            id=10,
+            name="Test",
+            members=[first, second],
+            get_member=lambda uid: None,
+        )
+
+        member, error = await _resolve_member_smart(guild, "alpha")
+        self.assertIsNone(member)
+        self.assertIn("точный username", error)
+
+    async def test_display_name_is_not_a_mutation_target(self):
+        member = SimpleNamespace(id=1, name="safe_login", display_name="Target", global_name="Target")
+        guild = SimpleNamespace(id=10, name="Test", members=[member], get_member=lambda uid: None)
+
+        resolved, error = await _resolve_member_smart(guild, "Target")
+
+        self.assertIsNone(resolved)
+        self.assertIn("точный username", error)
+
+    async def test_read_only_mode_can_resolve_unique_display_name(self):
+        member = SimpleNamespace(id=1, name="safe_login", display_name="Target", global_name="Target")
+        guild = SimpleNamespace(id=10, name="Test", members=[member], get_member=lambda uid: None)
+
+        resolved, error = await _resolve_member_smart(
+            guild,
+            "Target",
+            allow_display_names=True,
+            allow_partial=True,
+        )
+
+        self.assertIs(resolved, member)
+        self.assertIsNone(error)
+
+    def test_splits_user_identifier_lists(self):
+        self.assertEqual(_split_user_identifiers("one, two\nthree"), ["one", "two", "three"])
+
+
+class MutatingToolPreflightTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _guild(guild_id: int, name: str, *, can_kick: bool = True):
+        bot_role = SimpleNamespace(position=10)
+        bot_member = SimpleNamespace(
+            id=9999,
+            top_role=bot_role,
+            guild_permissions=SimpleNamespace(kick_members=can_kick),
+        )
+        target = SimpleNamespace(
+            id=123,
+            name="exact_login",
+            display_name="Display",
+            global_name=None,
+            top_role=SimpleNamespace(position=1),
+        )
+        guild = SimpleNamespace(
+            id=guild_id,
+            name=name,
+            me=bot_member,
+            owner=SimpleNamespace(id=777),
+            members=[target],
+            get_member=lambda user_id: target if user_id == target.id else None,
+        )
+        return guild, target
+
+    async def test_cross_server_target_is_canonicalized_before_confirmation(self):
+        source, _ = self._guild(1, "Source")
+        target_guild, target_member = self._guild(2, "Target")
+        bot = SimpleNamespace(
+            guilds=[source, target_guild],
+            user=SimpleNamespace(id=9999),
+            get_guild=lambda guild_id: target_guild if guild_id == 2 else source if guild_id == 1 else None,
+        )
+        message = SimpleNamespace(guild=source)
+
+        args, user_id, resolved_guild, labels, error = await _prepare_mutating_tool_action(
+            bot,
+            message,
+            "kick_user",
+            {"server_id_or_name": "Target", "user_identifier": "exact_login"},
+            None,
+        )
+
+        self.assertIsNone(error)
+        self.assertIs(resolved_guild, target_guild)
+        self.assertEqual(user_id, target_member.id)
+        self.assertEqual(args["server_id_or_name"], "2")
+        self.assertEqual(args["user_id"], "123")
+        self.assertTrue(any("Target" in label and "`2`" in label for label in labels))
+
+    async def test_preflight_rejects_missing_bot_permission(self):
+        guild, _ = self._guild(1, "Target", can_kick=False)
+        bot = SimpleNamespace(
+            guilds=[guild],
+            user=SimpleNamespace(id=9999),
+            get_guild=lambda guild_id: guild if guild_id == 1 else None,
+        )
+        message = SimpleNamespace(guild=guild)
+
+        _args, _user_id, _guild, _labels, error = await _prepare_mutating_tool_action(
+            bot,
+            message,
+            "kick_user",
+            {"user_identifier": "exact_login"},
+            None,
+        )
+
+        self.assertIn("kick_members", error)
+
+
+class ShutdownPreparationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shutdown_preparation_flushes_memory_without_closing_early(self):
+        bot = SimpleNamespace(close=AsyncMock())
+        flush = AsyncMock()
+
+        with patch.object(pos_ai, "flush_ai_memory", new=flush):
+            result = await _perform_shutdown(bot, {"reason": "обновление"})
+
+        flush.assert_awaited_once_with()
+        bot.close.assert_not_awaited()
+        self.assertIn("подготовлен", result)
+
+    async def test_shutdown_preparation_aborts_when_memory_flush_fails(self):
+        bot = SimpleNamespace(close=AsyncMock())
+        flush = AsyncMock(side_effect=RuntimeError("db unavailable"))
+
+        with patch.object(pos_ai, "flush_ai_memory", new=flush):
+            result = await _perform_shutdown(bot, {})
+
+        bot.close.assert_not_awaited()
+        self.assertIn("Остановка отменена", result)
 
 
 class InviteBugRegressionTests(unittest.TestCase):

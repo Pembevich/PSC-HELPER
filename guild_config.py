@@ -27,17 +27,20 @@ _BOOL_KEYS = {
     "enabled", "filter_ads", "filter_spam", "filter_flood",
     "filter_scam", "filter_nsfw", "allow_profanity",
     "filter_raid", "filter_mention_spam", "filter_crosschannel", "ai_moderation",
+    "log_messages", "log_reactions",
 }
 _INT_KEYS = {
     "spam_window_seconds", "spam_duplicates_threshold",
     "flood_window_seconds", "flood_messages_threshold",
     "timeout_hours",
     "mention_limit", "raid_join_window_seconds", "raid_join_threshold",
-    "min_account_age_hours",
+    "raid_mode_cooldown_seconds", "min_account_age_hours",
+    "crosschannel_window_seconds", "crosschannel_channels_threshold",
 }
-# Строковые ключи-перечисления.
+# Строковые ключи-перечисления. lockdown убран: он никогда не был реализован
+# и работал как обычный quarantine — не вводим владельца в заблуждение.
 _ENUM_KEYS = {
-    "raid_action": {"alert", "quarantine", "kick", "ban", "lockdown"},
+    "raid_action": {"alert", "quarantine", "kick", "ban"},
 }
 SETTING_KEYS = _BOOL_KEYS | _INT_KEYS | set(_ENUM_KEYS)
 
@@ -51,7 +54,10 @@ _INT_BOUNDS = {
     "mention_limit": (3, 50),
     "raid_join_window_seconds": (10, 600),
     "raid_join_threshold": (3, 100),
+    "raid_mode_cooldown_seconds": (60, 86400),  # от минуты до суток
     "min_account_age_hours": (0, 8760),  # до года
+    "crosschannel_window_seconds": (5, 300),
+    "crosschannel_channels_threshold": (2, 20),
 }
 
 
@@ -71,6 +77,7 @@ def defaults() -> dict[str, Any]:
 
 
 def _merge_with_defaults(stored: dict[str, Any] | None) -> dict[str, Any]:
+    """Совместимость для тестов/внутренних вызовов: дефолты + известные ключи."""
     merged = defaults()
     if stored:
         for key, value in stored.items():
@@ -79,27 +86,44 @@ def _merge_with_defaults(stored: dict[str, Any] | None) -> dict[str, Any]:
     return merged
 
 
+async def _load_stored(guild_id: int) -> dict[str, Any] | None:
+    raw = await get_guild_settings_raw(guild_id)
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
 async def get_settings(guild_id: int) -> dict[str, Any]:
-    """Слитые с дефолтами настройки сервера (с кэшированием)."""
+    """Слитые настройки сервера (с кэшированием).
+
+    Порядок наложения: дефолты из config → глобальный слот guild_id=0 →
+    настройки конкретного сервера. Возвращается КОПИЯ — мутации у вызывающего
+    не портят кэш."""
     now = time.time()
     cached = _cache.get(guild_id)
     if cached is not None and now - _cache_ts.get(guild_id, 0.0) < _CACHE_TTL:
-        return cached
+        return dict(cached)
 
-    raw = await get_guild_settings_raw(guild_id)
-    stored: dict[str, Any] | None = None
-    if raw:
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                stored = parsed
-        except Exception:
-            stored = None
+    merged = defaults()
+    if guild_id != 0:
+        global_stored = await _load_stored(0)
+        if global_stored:
+            for key, value in global_stored.items():
+                if key in merged:
+                    merged[key] = value
+    stored = await _load_stored(guild_id)
+    if stored:
+        for key, value in stored.items():
+            if key in merged:
+                merged[key] = value
 
-    merged = _merge_with_defaults(stored)
     _cache[guild_id] = merged
     _cache_ts[guild_id] = now
-    return merged
+    return dict(merged)
 
 
 def coerce_value(key: str, value: Any) -> tuple[bool, Any]:
@@ -133,8 +157,8 @@ async def update_settings(guild_id: int, changes: dict[str, Any]) -> tuple[dict[
     Возвращает (новые_настройки, список_отклонённых_ключей). Неизвестные или
     невалидные ключи игнорируются и попадают в список отклонённых.
     """
-    current = await get_settings(guild_id)
-    updated = copy.deepcopy(current)
+    stored_overrides = await _load_stored(guild_id) or {}
+    updated_overrides = copy.deepcopy(stored_overrides)
     rejected: list[str] = []
 
     for key, value in (changes or {}).items():
@@ -145,11 +169,14 @@ async def update_settings(guild_id: int, changes: dict[str, Any]) -> tuple[dict[
         if not ok:
             rejected.append(key)
             continue
-        updated[key] = coerced
+        updated_overrides[key] = coerced
 
-    await set_guild_settings_raw(guild_id, json.dumps(updated, ensure_ascii=False))
-    _cache[guild_id] = updated
-    _cache_ts[guild_id] = time.time()
+    await set_guild_settings_raw(guild_id, json.dumps(updated_overrides, ensure_ascii=False))
+    if guild_id == 0:
+        invalidate()
+    else:
+        invalidate(guild_id)
+    updated = await get_settings(guild_id)
     return updated, rejected
 
 

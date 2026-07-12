@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="ru" data-theme="dark" data-theme-preference="auto">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="P.OS — AI-менеджер, администратор и система безопасности для Discord-серверов."
+    />
+    <meta name="theme-color" content="#07080a" />
+    <meta property="og:title" content="P.OS | Provision Operating System" />
+    <meta
+      property="og:description"
+      content="AI management, administration, security, memory and media for Discord."
+    />
+    <meta property="og:type" content="website" />
+    <title>P.OS | Provision Operating System</title>
+    <link rel="icon" href="./assets/pos-logo-mark.png" type="image/png" />
+    <link rel="apple-touch-icon" href="./assets/pos-logo-mark.png" />
+    <script>
+      (() => {
+        const preference = localStorage.getItem("pos-theme") || "auto";
+        const systemLight = window.matchMedia("(prefers-color-scheme: light)").matches;
+        const theme = preference === "auto" ? (systemLight ? "light" : "dark") : preference;
+        const savedLanguage = localStorage.getItem("pos-language");
+        const browserLanguage = (navigator.languages?.[0] || navigator.language || "en").toLowerCase();
+        const language = savedLanguage || (browserLanguage.startsWith("ru") ? "ru" : "en");
+
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.dataset.themePreference = preference;
+        document.documentElement.dataset.lang = language;
+        document.documentElement.lang = language;
+      })();
+    </script>
+    <link rel="stylesheet" href="./styles.css?v=20260712-6" />
+  </head>
+  <body>
+    <a class="skip-link" href="#content" data-i18n="skip">Перейти к содержимому</a>
+
+    <div class="cursor-flow" aria-hidden="true">
+      <span class="cursor-ring"></span>
+      <span class="cursor-point"></span>
+    </div>
+    <div class="page-texture" aria-hidden="true"></div>
+
+    <header class="site-header" data-header>
+      <a class="brand" href="#top" aria-label="P.OS">
+        <span class="pos-mark pos-mark-small" aria-hidden="true">
+          <span class="mark-fin"></span>
+          <span class="mark-orb"></span>
+        </span>
+        <span class="brand-word">P.OS</span>
+      </a>
+
+      <button
+        class="menu-toggle"
+        type="button"
+        aria-expanded="false"
+        aria-controls="site-navigation"
+        data-menu-toggle
+        data-i18n-aria="menuAria"
+      >
+        <span></span><span></span>
+      </button>
+
+      <nav class="site-nav" id="site-navigation" data-nav data-i18n-aria="navAria">
+        <a href="#intelligence" data-nav-link data-i18n="navAi">Интеллект</a>
+        <a href="#security" data-nav-link data-i18n="navSecurity">Безопасность</a>
+        <a href="#operator" data-nav-link data-i18n="navControl">Управление</a>
+        <a href="#toolkit" data-nav-link data-i18n="navToolkit">Возможности</a>
+      </nav>
+
+      <div class="header-tools" data-i18n-aria="settingsAria">
+        <div class="segmented language-control" data-i18n-aria="languageAria">
+          <button type="button" data-lang-choice="ru" aria-pressed="true">RU</button>
+          <button type="button" data-lang-choice="en" aria-pressed="false">EN</button>
+        </div>
+        <div class="segmented theme-control" data-i18n-aria="themeAria">
+          <button type="button" data-theme-choice="auto" data-i18n="themeAuto" aria-pressed="true">Auto</button>
+          <button type="button" data-theme-choice="dark" data-i18n="themeDark" aria-pressed="false">Dark</button>
+          <button type="button" data-theme-choice="light" data-i18n="themeLight" aria-pressed="false">Light</button>
+        </div>
+      </div>
+    </header>
+
+    <main id="content">
+      <section class="hero section-anchor" id="top" aria-labelledby="hero-title">
+        <div class="hero-grid">
+          <div class="hero-copy">
+            <h1 id="hero-title" class="hero-title reveal">
+              <span>P</span><i>.</i><span>OS</span>
+            </h1>
+            <p class="hero-system reveal" data-i18n="systemName">Provision Operating System</p>
+            <div class="signal-bar reveal" aria-hidden="true"><span></span></div>
+            <p class="hero-line reveal" data-i18n="heroLine">
+              ИИ-менеджер Discord: понимает, защищает, управляет и помнит.
+            </p>
+            <div class="hero-actions reveal">
+              <a class="button button-primary magnetic" href="#intelligence">
+                <span data-i18n="heroPrimary">Увидеть P.OS в работе</span>
+                <span class="button-arrow" aria-hidden="true">↘</span>
+              </a>
+              <a class="button button-ghost magnetic" href="#operator" data-i18n="heroSecondary">
+                Возможности
+              </a>
+            </div>
+          </div>
+
+          <div class="console-stage reveal" data-tilt-card>
+            <div class="console-shell" data-console aria-label="Интерактивная демонстрация P.OS" data-i18n-aria="consoleAria">
+              <div class="console-top">
+                <span class="window-dot"></span>
+                <span>P.OS // INTERFACE PREVIEW</span>
+                <span class="console-demo">DEMO</span>
+              </div>
+
+              <div class="console-grid">
+                <div class="console-rail" role="tablist" data-i18n-aria="consoleTabsAria">
+                  <button class="rail-button active" type="button" role="tab" aria-selected="true" data-console-mode="overview" data-i18n-aria="modeOverview">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h5v5H5zM14 5h5v5h-5zM5 14h5v5H5zM14 14h5v5h-5z" /></svg>
+                  </button>
+                  <button class="rail-button" type="button" role="tab" aria-selected="false" data-console-mode="security" data-i18n-aria="modeSecurity">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.7 18 6v5.2c0 3.6-2.3 6.2-6 7.4-3.7-1.2-6-3.8-6-7.4V6l6-2.3Z" /><path d="m9.5 12 1.6 1.6 3.6-4" /></svg>
+                  </button>
+                  <button class="rail-button" type="button" role="tab" aria-selected="false" data-console-mode="operator" data-i18n-aria="modeOperator">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.5 7.5 4.5 4.5-4.5 4.5" /><path d="M13 17h5" /></svg>
+                  </button>
+                  <button class="rail-button" type="button" role="tab" aria-selected="false" data-console-mode="memory" data-i18n-aria="modeMemory">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3.5h7l3 3v14H7z" /><path d="M14 3.5v4h4M9.5 12h5M9.5 16h5" /></svg>
+                  </button>
+                </div>
+
+                <div class="console-main" aria-live="polite">
+                  <div class="console-command">&gt; <span data-console-command>system.status</span></div>
+                  <div class="console-core">
+                    <span class="pos-mark pos-mark-large" aria-hidden="true">
+                      <span class="mark-fin"></span>
+                      <span class="mark-orb"></span>
+                    </span>
+                    <strong data-console-title>P.OS ONLINE</strong>
+                    <p data-console-summary data-i18n="consoleSummary">Контекст принят. Система готова к работе.</p>
+                  </div>
+                  <div class="event-feed" data-console-events></div>
+                </div>
+
+                <aside class="console-side">
+                  <div class="side-block">
+                    <h2 data-i18n="activityTitle">Контуры</h2>
+                    <div class="side-line"><span>Security</span><i class="status red"></i></div>
+                    <div class="side-line"><span>Operator</span><i class="status dim"></i></div>
+                    <div class="side-line"><span>Memory</span><i class="status cyan"></i></div>
+                  </div>
+                  <div class="side-block">
+                    <h2 data-i18n="authorityTitle">Полномочия</h2>
+                    <p data-i18n="authorityText">Действия защищены проверкой доступа.</p>
+                    <strong><span data-i18n="ready">Ready</span><i class="status green"></i></strong>
+                  </div>
+                </aside>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="capability-band section-anchor" aria-labelledby="capability-title">
+        <div class="section-inner">
+          <header class="band-heading reveal">
+            <h2 id="capability-title" data-i18n="capabilityTitle">Один P.OS. Весь контур сервера.</h2>
+          </header>
+          <div class="capability-rail">
+            <article class="capability-line reveal"><span>01</span><h3 data-i18n="capAi">ИИ-менеджер</h3><p data-i18n="capAiText">Контекстный диалог и работа с медиа.</p></article>
+            <article class="capability-line reveal"><span>02</span><h3 data-i18n="capMod">Модерация</h3><p data-i18n="capModText">Спам, ссылки, вложения и антирейд.</p></article>
+            <article class="capability-line reveal"><span>03</span><h3 data-i18n="capAdmin">Администрирование</h3><p data-i18n="capAdminText">Участники, роли, каналы и настройки.</p></article>
+            <article class="capability-line reveal"><span>04</span><h3 data-i18n="capForms">Формы</h3><p data-i18n="capFormsText">Заявки, жалобы и работа команды сервера.</p></article>
+            <article class="capability-line reveal"><span>05</span><h3 data-i18n="capMemory">Память</h3><p data-i18n="capMemoryText">Проверяемые события, пинги и действия.</p></article>
+            <article class="capability-line reveal"><span>06</span><h3 data-i18n="capMedia">Медиа</h3><p data-i18n="capMediaText">Изображения, видео и адаптивное создание GIF.</p></article>
+          </div>
+        </div>
+      </section>
+
+      <section class="intelligence section-anchor content-section" id="intelligence" aria-labelledby="intelligence-title">
+        <div class="section-inner intelligence-grid">
+          <div class="section-copy reveal">
+            <p class="section-index">01 / AI</p>
+            <h2 id="intelligence-title" data-i18n="intelligenceTitle">Не команда.<br />Намерение.</h2>
+            <p data-i18n="intelligenceText">
+              P.OS понимает обычную речь, уточняет цель и связывает запрос с реальным состоянием сервера.
+            </p>
+          </div>
+
+          <div class="dialogue-workbench reveal">
+            <div class="workbench-head">
+              <span class="window-dot"></span>
+              <span data-i18n="dialogueLabel">OWNER CHANNEL // DEMO</span>
+            </div>
+            <div class="prompt-list" role="tablist" data-i18n-aria="promptExamplesAria">
+              <button class="prompt-option active" type="button" role="tab" aria-selected="true" data-prompt-example="audit" data-i18n="promptAudit">Кто удалил сообщение?</button>
+              <button class="prompt-option" type="button" role="tab" aria-selected="false" data-prompt-example="role" data-i18n="promptRole">Выдай роль участнику</button>
+              <button class="prompt-option" type="button" role="tab" aria-selected="false" data-prompt-example="raid" data-i18n="promptRaid">Проверь всплеск входов</button>
+            </div>
+            <div class="dialogue-thread" aria-live="polite">
+              <div class="message message-owner">
+                <span data-i18n="creatorLabel">Пумба</span>
+                <p data-dialogue-question></p>
+              </div>
+              <div class="message message-pos">
+                <span>P.OS</span>
+                <p data-dialogue-answer></p>
+                <div class="answer-trace" data-dialogue-trace></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="ecosystem content-section" aria-labelledby="ecosystem-title">
+        <div class="section-inner">
+          <header class="center-heading reveal">
+            <h2 id="ecosystem-title" data-i18n="ecosystemTitle">Сервер как единая система</h2>
+            <p data-i18n="ecosystemText">P.OS связывает разговор, состояние Discord и подтверждённые действия в один понятный процесс.</p>
+          </header>
+
+          <div class="system-map reveal" aria-label="Экосистема P.OS" data-i18n-aria="ecosystemAria">
+            <div class="map-node map-node-users"><span>01</span><strong data-i18n="nodeUsers">Участники</strong></div>
+            <div class="map-node map-node-channels"><span>02</span><strong data-i18n="nodeChannels">Каналы</strong></div>
+            <div class="map-node map-node-roles"><span>03</span><strong data-i18n="nodeRoles">Роли</strong></div>
+            <div class="system-core">
+              <img src="./assets/pos-logo-mark.png" alt="Графический знак P.OS" data-i18n-alt="logoAlt" />
+              <span>P.OS</span>
+            </div>
+            <div class="map-node map-node-settings"><span>04</span><strong data-i18n="nodeSettings">Настройки</strong></div>
+            <div class="map-node map-node-events"><span>05</span><strong data-i18n="nodeEvents">События</strong></div>
+            <div class="map-node map-node-forms"><span>06</span><strong data-i18n="nodeForms">Формы</strong></div>
+          </div>
+
+          <div class="system-flow reveal" aria-label="Цикл работы P.OS" data-i18n-aria="flowAria">
+            <span data-i18n="flowMessage">Сообщение</span><i></i>
+            <span data-i18n="flowContext">Контекст</span><i></i>
+            <span data-i18n="flowCheck">Проверка</span><i></i>
+            <span data-i18n="flowAction">Действие</span><i></i>
+            <span data-i18n="flowLog">Журнал</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="security-section section-anchor content-section" id="security" aria-labelledby="security-title">
+        <div class="section-inner security-grid">
+          <div class="section-copy reveal">
+            <p class="section-index">02 / SECURITY</p>
+            <h2 id="security-title" data-i18n="securityTitle">Защита до действия</h2>
+            <p data-i18n="securityText">ИИ усиливает модерацию, но не получает право обходить проверяемые правила и полномочия Discord.</p>
+          </div>
+
+          <div class="security-stack reveal">
+            <article class="security-layer">
+              <span>01</span>
+              <div><h3 data-i18n="layerRules">Сигналы</h3><p data-i18n="layerRulesText">Ссылки, спам, массовые упоминания, вложения и рейд-паттерны.</p></div>
+              <i class="layer-state" data-i18n="layerAlways">Всегда</i>
+            </article>
+            <article class="security-layer">
+              <span>02</span>
+              <div><h3 data-i18n="layerAi">AI-проверка</h3><p data-i18n="layerAiText">Текст и медиа получают дополнительную оценку без слепого наказания.</p></div>
+              <i class="layer-state" data-i18n="layerContext">По контексту</i>
+            </article>
+            <article class="security-layer">
+              <span>03</span>
+              <div><h3 data-i18n="layerAuthority">Полномочия</h3><p data-i18n="layerAuthorityText">Права, иерархия и подтверждение проверяются вне модели.</p></div>
+              <i class="layer-state verified" data-i18n="layerVerified">Проверено</i>
+            </article>
+          </div>
+
+          <div class="scan-field reveal" aria-hidden="true">
+            <div class="scan-grid"></div>
+            <div class="scan-line"></div>
+            <span class="scan-mark mark-a"></span><span class="scan-mark mark-b"></span><span class="scan-mark mark-c"></span>
+            <div class="scan-caption"><span>INPUT</span><strong>POLICY GATE</strong><span>ACTION</span></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="operator section-anchor content-section" id="operator" aria-labelledby="operator-title">
+        <div class="section-inner operator-grid">
+          <div class="operator-intro reveal">
+            <p class="section-index">03 / OPERATOR</p>
+            <h2 id="operator-title" data-i18n="operatorTitle">Управление словами</h2>
+            <p data-i18n="operatorText">От участника до структуры сервера: P.OS превращает запрос в проверяемый план действий.</p>
+            <div class="scope-control segmented" role="tablist" data-i18n-aria="scopeAria">
+              <button class="active" type="button" role="tab" aria-selected="true" data-scope="members" data-i18n="scopeMembers">Участники</button>
+              <button type="button" role="tab" aria-selected="false" data-scope="structure" data-i18n="scopeStructure">Структура</button>
+            </div>
+          </div>
+
+          <div class="operator-surface reveal">
+            <div class="operator-command">
+              <span>p.os &gt;</span>
+              <p data-operator-command></p>
+            </div>
+            <ol class="operation-steps">
+              <li class="is-complete"><span>01</span><div><strong data-i18n="stepResolve">Определить цель</strong><p data-i18n="stepResolveText">Пользователь, роль или канал сопоставляются с объектом Discord.</p></div></li>
+              <li class="is-complete"><span>02</span><div><strong data-i18n="stepCheck">Проверить возможность</strong><p data-i18n="stepCheckText">P.OS сверяет права, иерархию и защищённые цели.</p></div></li>
+              <li class="is-current"><span>03</span><div><strong data-i18n="stepConfirm">Подтвердить изменение</strong><p data-i18n="stepConfirmText">Критичное действие не выполняется только на слове модели.</p></div></li>
+              <li><span>04</span><div><strong data-i18n="stepRecord">Записать результат</strong><p data-i18n="stepRecordText">Успех или отказ остаются в журнале действий.</p></div></li>
+            </ol>
+          </div>
+        </div>
+      </section>
+
+      <section class="memory content-section" aria-labelledby="memory-title">
+        <div class="section-inner memory-grid">
+          <div class="section-copy reveal">
+            <p class="section-index">04 / MEMORY</p>
+            <h2 id="memory-title" data-i18n="memoryTitle">Факты не исчезают вместе с сообщением</h2>
+            <p data-i18n="memoryText">P.OS хранит проверяемый журнал событий и отделяет найденные данные от предположений.</p>
+          </div>
+
+          <div class="evidence-search reveal">
+            <div class="evidence-query">
+              <span aria-hidden="true">⌕</span>
+              <p data-i18n="memoryQuery">Кто упомянул мою роль, а затем удалил сообщение?</p>
+              <button class="icon-button" type="button" aria-expanded="true" data-evidence-toggle data-i18n-aria="searchAria">↵</button>
+            </div>
+            <div class="evidence-result" data-evidence-result aria-live="polite">
+              <div class="event-row"><time>14:23:11</time><i class="status cyan"></i><div><strong data-i18n="eventMention">Упоминание роли зафиксировано</strong><p data-i18n="eventMentionText">Источник: журнал событий сервера</p></div></div>
+              <div class="event-row"><time>14:24:02</time><i class="status red"></i><div><strong data-i18n="eventDeleted">Исходное сообщение удалено</strong><p data-i18n="eventDeletedText">Событие связано с сохранённой записью упоминания</p></div></div>
+              <div class="evidence-verdict"><span data-i18n="evidenceLabel">Ответ P.OS</span><p data-i18n="evidenceText">Факт найден в журнале. Удаление сообщения не удалило запись события.</p></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="toolkit section-anchor content-section" id="toolkit" aria-labelledby="toolkit-title">
+        <div class="section-inner toolkit-grid">
+          <div class="section-copy reveal">
+            <p class="section-index">05 / TOOLKIT</p>
+            <h2 id="toolkit-title" data-i18n="toolkitTitle">Один интерфейс.<br />Много задач.</h2>
+            <p data-i18n="toolkitText">P.OS объединяет ежедневные инструменты сервера, чтобы запрос не приходилось раскладывать на десяток отдельных команд.</p>
+          </div>
+
+          <div class="toolkit-surface reveal" aria-label="Индекс возможностей P.OS" data-i18n-aria="toolkitAria">
+            <div class="toolkit-head">
+              <span class="window-dot"></span>
+              <span data-i18n="toolkitLabel">P.OS // FUNCTION INDEX</span>
+              <strong><i class="status green"></i><span data-i18n="toolkitReady">Все контуры готовы</span></strong>
+            </div>
+            <div class="toolkit-list">
+              <article class="toolkit-row"><span>01</span><div><h3 data-i18n="toolDialogue">Диалог</h3><p data-i18n="toolDialogueText">Контекст, изображения, видео и естественный язык.</p></div><code>@P.OS</code></article>
+              <article class="toolkit-row"><span>02</span><div><h3 data-i18n="toolModeration">Модерация</h3><p data-i18n="toolModerationText">Проверка риска, антирейд и обоснованные действия.</p></div><code>GUARD</code></article>
+              <article class="toolkit-row"><span>03</span><div><h3 data-i18n="toolControl">Управление</h3><p data-i18n="toolControlText">Участники, роли, каналы, права и настройки.</p></div><code>OWNER</code></article>
+              <article class="toolkit-row"><span>04</span><div><h3 data-i18n="toolMemory">Память</h3><p data-i18n="toolMemoryText">События, пинги, удалённые сообщения и история действий.</p></div><code>FACTS</code></article>
+              <article class="toolkit-row"><span>05</span><div><h3 data-i18n="toolForms">Формы</h3><p data-i18n="toolFormsText">Заявки, жалобы и закрытые процессы команды.</p></div><code>FLOW</code></article>
+              <article class="toolkit-row"><span>06</span><div><h3 data-i18n="toolMedia">Медиа</h3><p data-i18n="toolMediaText">Адаптивная сборка GIF из изображений и видео.</p></div><code>p.gif</code></article>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="closing content-section" aria-labelledby="closing-title">
+        <div class="section-inner closing-grid">
+          <div class="closing-mark reveal" aria-hidden="true"><span>P</span><i>.</i><span>OS</span></div>
+          <div class="closing-copy reveal">
+            <h2 id="closing-title" data-i18n="closingTitle">Не ещё один бот.<br />Операционный слой Discord.</h2>
+            <p data-i18n="closingText">P.OS создан Пумбой и развивается как единая система для разговора, защиты и управления сервером.</p>
+            <a class="button button-primary magnetic" href="#intelligence">
+              <span data-i18n="exploreCta">Посмотреть P.OS в работе</span><span class="button-arrow" aria-hidden="true">↑</span>
+            </a>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <a class="brand" href="#top" aria-label="P.OS">
+        <span class="pos-mark pos-mark-small" aria-hidden="true"><span class="mark-fin"></span><span class="mark-orb"></span></span>
+        <span class="brand-word">P.OS</span>
+      </a>
+      <p data-i18n="footerText">Provision Operating System. Создан Пумбой.</p>
+      <a href="#top" data-i18n="backTop">Наверх ↑</a>
+    </footer>
+
+    <script src="./app.js?v=20260712-3"></script>
+  </body>
+</html>

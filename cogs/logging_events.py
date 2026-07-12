@@ -1,48 +1,31 @@
 from __future__ import annotations
 
-import os
-import re
-import uuid
+import logging
 from datetime import timedelta
 
 import discord
-from discord import Embed, Color
+from discord import Color
 from discord.ext import commands
 from discord.utils import escape_markdown, escape_mentions
 
 from config import (
-    allowed_guild_ids,
-    allowed_role_ids,
-    FORM_CHANNEL_ID,
-    TAC_CHANNEL_ID,
-    TAC_REVIEWER_ROLE_IDS,
-    TAC_ROLE_REWARDS,
-    VOICE_TIMEOUT_HOURS,
-    PSC_CHANNEL_ID,
-    PING_ROLE_ID,
-    COMPLAINT_INPUT_CHANNEL,
-    COMPLAINT_NOTIFY_ROLE,
-    form_channel_id,
-    punishment_roles,
-    squad_roles,
     WELCOME_CHANNEL_IDS,
     GOODBYE_CHANNEL_IDS,
-    TARGET_CHANNELS,
-    TARGET_OUTPUT_CHANNEL,
     NEW_MEMBER_ROLE_IDS,
 )
-from logging_utils import ensure_log_category_and_channels, send_log_embed, is_log_channel
-from moderation import (
-    check_and_handle_urls,
-    handle_spam_if_needed,
-    detect_advertising_or_scam_text,
-    detect_attachment_violations,
-    apply_max_timeout,
-    log_violation_with_evidence,
-)
-from forms import ConfirmView, ComplaintView
-from utils import extract_clean_keyword, assess_applicant_risk, safe_send_dm, collect_runtime_health
-from pos_ai import handle_pos_ai, remember_server_message
+from guild_config import get_settings as get_guild_settings
+from join_gate import wait_for_join_security
+from logging_utils import send_log_embed, is_log_channel
+from pos_ai import remember_server_message
+from storage import add_ai_event, mark_ai_message_deleted, mark_ai_messages_deleted
+
+
+logger = logging.getLogger(__name__)
+
+
+def _chan_label(channel) -> str:
+    """mention канала, а при его отсутствии (DM/группа) — имя или str."""
+    return getattr(channel, "mention", None) or getattr(channel, "name", None) or str(channel)
 
 
 def _clean_text(text: str, limit: int = 1800) -> str:
@@ -72,8 +55,14 @@ def _build_welcome_embed(member: discord.Member) -> discord.Embed:
             f"Статус: пользователь внесён в базу P.S.C\n"
             f"```\n"
             f"Приветствую, {member.mention}.\n"
-            f"Добро пожаловать в связанный центр фракции **P.S.C**.\n\n"
-            f"> **Ознакомься с <#1340596281986383912> — там вся нужная информация.**"
+            f"Добро пожаловать в связанный центр фракции **P.S.C**."
+            # Ссылка на канал правил — только там, где он реально есть; на других
+            # серверах кросс-серверной экосистемы это была мёртвая ссылка.
+            + (
+                "\n\n> **Ознакомься с <#1340596281986383912> — там вся нужная информация.**"
+                if guild.get_channel(1340596281986383912)
+                else ""
+            )
         ),
         color=discord.Color.from_rgb(46, 204, 113),
         timestamp=discord.utils.utcnow(),
@@ -156,6 +145,110 @@ def _format_identity(entity) -> str:
     return label
 
 
+async def _remember_message_mentions(message: discord.Message) -> None:
+    if not message.guild or message.author.bot or is_log_channel(message.channel):
+        return
+    targets: list[tuple[int | None, int | None, str, list[int]]] = []
+    for user in message.mentions:
+        targets.append((user.id, None, f"пользователь @{user} (`{user.id}`)", [user.id]))
+    for role in message.role_mentions:
+        targets.append((None, role.id, f"роль @{role.name} (`{role.id}`)", [member.id for member in role.members]))
+    if message.mention_everyone:
+        targets.append((None, message.guild.default_role.id, "@everyone/@here", []))
+    if not targets:
+        return
+
+    details = {
+        "content": message.content or "",
+        "jump_url": message.jump_url,
+        "channel_name": getattr(message.channel, "name", str(message.channel.id)),
+        "author_username": getattr(message.author, "name", ""),
+        "author_display": getattr(message.author, "display_name", ""),
+    }
+    for target_user_id, target_role_id, target_label, recipient_user_ids in targets[:30]:
+        await add_ai_event(
+            guild_id=message.guild.id,
+            event_type="message_mention",
+            actor_id=message.author.id,
+            actor_name=f"{message.author} / {message.author.display_name}",
+            target_user_id=target_user_id,
+            target_role_id=target_role_id,
+            channel_id=message.channel.id,
+            message_id=message.id,
+            summary=(
+                f"{message.author} упомянул {target_label} в "
+                f"#{getattr(message.channel, 'name', message.channel.id)}"
+            ),
+            details=details,
+            recipient_user_ids=recipient_user_ids,
+            recipient_role_id=target_role_id,
+        )
+
+
+async def _record_message_create(message: discord.Message) -> None:
+    if not _should_log_message(message):
+        return
+    guild = message.guild
+    if guild is None:
+        return
+    await add_ai_event(
+        guild_id=guild.id,
+        event_type="message_create",
+        actor_id=message.author.id,
+        actor_name=f"{message.author} / {message.author.display_name}",
+        channel_id=message.channel.id,
+        message_id=message.id,
+        summary=f"Сообщение от {message.author} в #{getattr(message.channel, 'name', message.channel.id)}",
+        details={
+            "content": message.content or "",
+            "attachments": [attachment.url for attachment in message.attachments[:10]],
+            "user_mentions": [user.id for user in message.mentions],
+            "role_mentions": [role.id for role in message.role_mentions],
+            "mention_everyone": bool(message.mention_everyone),
+            "jump_url": message.jump_url,
+        },
+    )
+
+
+async def _record_message_edit(before: discord.Message, after: discord.Message) -> None:
+    if not _should_log_message(after):
+        return
+    guild = after.guild
+    if guild is None:
+        return
+    if before.content == after.content and before.attachments == after.attachments:
+        return
+    await add_ai_event(
+        guild_id=guild.id,
+        event_type="message_edit",
+        actor_id=after.author.id,
+        actor_name=f"{after.author} / {after.author.display_name}",
+        channel_id=after.channel.id,
+        message_id=after.id,
+        summary=f"Сообщение {after.id} изменено",
+        details={"before": before.content or "", "after": after.content or "", "jump_url": after.jump_url},
+    )
+
+
+async def _record_message_delete(message: discord.Message) -> None:
+    if not message.guild or is_log_channel(message.channel):
+        return
+    await add_ai_event(
+        guild_id=message.guild.id,
+        event_type="message_delete",
+        actor_id=getattr(message.author, "id", None),
+        actor_name=str(message.author) if message.author else "",
+        channel_id=message.channel.id,
+        message_id=message.id,
+        summary=f"Сообщение {message.id} удалено",
+        details={
+            "content": message.content or "",
+            "attachments": [attachment.url for attachment in message.attachments[:10]],
+        },
+        deleted=True,
+    )
+
+
 async def _find_audit_entry(
     guild: discord.Guild,
     action: discord.AuditLogAction,
@@ -201,7 +294,7 @@ async def _log_message_create(message: discord.Message):
     desc = _clean_text(message.content)
     fields = [
         ("Автор", f"{message.author} (`{message.author.id}`)", False),
-        ("Канал", message.channel.mention, False),
+        ("Канал", _chan_label(message.channel), False),
         ("Ссылка", message.jump_url, False),
     ]
     if message.attachments:
@@ -230,7 +323,7 @@ async def _log_message_edit(before: discord.Message, after: discord.Message):
 
     fields = [
         ("Автор", f"{before.author} (`{before.author.id}`)", False),
-        ("Канал", before.channel.mention, False),
+        ("Канал", _chan_label(before.channel), False),
         ("Ссылка", after.jump_url, False),
     ]
     if after.attachments:
@@ -259,7 +352,7 @@ async def _log_message_delete(message: discord.Message):
     desc = _clean_text(message.content)
     fields = [
         ("Автор", f"{author} (`{author_id}`)", False),
-        ("Канал", message.channel.mention, False),
+        ("Канал", _chan_label(message.channel), False),
     ]
     if message.attachments:
         fields.append(("Вложения", _format_attachments(message), False))
@@ -294,7 +387,7 @@ async def _log_member_roles_change(before: discord.Member, after: discord.Member
         after.guild,
         "members",
         "🎭 Роли участника изменены",
-        f"У участника обновился набор ролей.",
+        "У участника обновился набор ролей.",
         color=Color.gold(),
         fields=fields
     )
@@ -346,16 +439,16 @@ async def _log_voice_state_update(member: discord.Member, before: discord.VoiceS
 
     if before.channel is None and after.channel is not None:
         action = "➕ Вошёл в канал"
-        detail = after.channel.mention
+        detail = _chan_label(after.channel)
     elif before.channel is not None and after.channel is None:
         action = "➖ Вышел из канала"
-        detail = before.channel.mention
+        detail = _chan_label(before.channel)
     elif before.channel != after.channel:
         action = "🔁 Перешёл между каналами"
-        detail = f"{before.channel.mention} → {after.channel.mention}"
+        detail = f"{_chan_label(before.channel)} → {_chan_label(after.channel)}"
     else:
         action = "🔊 Изменение голосового статуса"
-        detail = after.channel.mention if after.channel else "—"
+        detail = _chan_label(after.channel) if after.channel else "—"
 
     fields = [("Канал", detail, False)]
     if before.self_mute != after.self_mute:
@@ -407,21 +500,86 @@ class LoggingCog(commands.Cog):
         if not message.guild or message.author.bot:
             return
         try:
-            await _log_message_create(message)
-        except Exception:
-            pass
+            await _record_message_create(message)
+        except Exception as exc:
+            logger.error("Не удалось записать message_create %s: %s", message.id, exc, exc_info=True)
+        try:
+            await _remember_message_mentions(message)
+        except Exception as exc:
+            logger.error("Не удалось записать упоминания message %s: %s", message.id, exc, exc_info=True)
+        try:
+            # Тумблер log_messages: лог каждого сообщения — самый «дорогой»
+            # по rate limit тип логов, владелец может его выключить.
+            settings = await get_guild_settings(message.guild.id)
+            if settings.get("log_messages", False):
+                await _log_message_create(message)
+        except Exception as exc:
+            logger.warning("Не удалось зеркалировать message %s в Discord-лог: %s", message.id, exc)
         try:
             await remember_server_message(message)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error("Не удалось обновить память P.OS для message %s: %s", message.id, exc, exc_info=True)
 
     @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        try:
+            await _record_message_edit(before, after)
+        except Exception as exc:
+            logger.error("Не удалось записать message_edit %s: %s", after.id, exc, exc_info=True)
         await _log_message_edit(before, after)
 
     @commands.Cog.listener()
     async def on_message_delete(self, message: discord.Message):
+        if message.guild:
+            try:
+                await mark_ai_message_deleted(message.guild.id, message.id)
+            except Exception as exc:
+                logger.error("Не удалось отметить message %s удалённым: %s", message.id, exc, exc_info=True)
+            try:
+                await _record_message_delete(message)
+            except Exception as exc:
+                logger.error("Не удалось записать message_delete %s: %s", message.id, exc, exc_info=True)
         await _log_message_delete(message)
+
+    @commands.Cog.listener()
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
+        if payload.guild_id is None:
+            return
+        try:
+            await mark_ai_message_deleted(payload.guild_id, payload.message_id)
+        except Exception as exc:
+            logger.error("Не удалось отметить raw message %s удалённым: %s", payload.message_id, exc, exc_info=True)
+        if payload.cached_message is not None:
+            return
+        try:
+            await add_ai_event(
+                guild_id=payload.guild_id,
+                event_type="message_delete_raw",
+                channel_id=payload.channel_id,
+                message_id=payload.message_id,
+                summary=f"Некэшированное сообщение {payload.message_id} удалено",
+                details={"content_unavailable": True},
+                deleted=True,
+            )
+        except Exception as exc:
+            logger.error("Не удалось записать raw delete %s: %s", payload.message_id, exc, exc_info=True)
+
+    @commands.Cog.listener()
+    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent):
+        if payload.guild_id is None:
+            return
+        try:
+            await mark_ai_messages_deleted(payload.guild_id, payload.message_ids)
+            await add_ai_event(
+                guild_id=payload.guild_id,
+                event_type="message_delete_bulk",
+                channel_id=payload.channel_id,
+                summary=f"Массово удалено сообщений: {len(payload.message_ids)}",
+                details={"message_ids": sorted(payload.message_ids)[:1000]},
+                deleted=True,
+            )
+        except Exception as exc:
+            logger.error("Не удалось записать bulk raw delete: %s", exc, exc_info=True)
 
     @commands.Cog.listener()
     async def on_bulk_message_delete(self, messages):
@@ -430,6 +588,10 @@ class LoggingCog(commands.Cog):
         message = next(iter(messages))
         if not message.guild or is_log_channel(message.channel):
             return
+        try:
+            await mark_ai_messages_deleted(message.guild.id, [item.id for item in messages])
+        except Exception as exc:
+            logger.error("Не удалось отметить bulk delete в журнале: %s", exc, exc_info=True)
         await send_log_embed(
             message.guild,
             "message_deletes",
@@ -441,21 +603,35 @@ class LoggingCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
+        if member.bot:
+            suppress_welcome_and_roles = True
+        else:
+            gate_result = await wait_for_join_security(member.guild.id, member.id)
+            suppress_welcome_and_roles = gate_result is not False
+            if gate_result is None:
+                logger.error(
+                    "Антирейд не завершил проверку участника %s; приветствие и роли подавлены.",
+                    member.id,
+                )
         try:
-            await _broadcast_embed(
-                member.guild,
-                WELCOME_CHANNEL_IDS,
-                _build_welcome_embed(member),
-                error_label="Ошибка приветствия on_member_join",
-            )
+            if not suppress_welcome_and_roles:
+                await _broadcast_embed(
+                    member.guild,
+                    WELCOME_CHANNEL_IDS,
+                    _build_welcome_embed(member),
+                    error_label="Ошибка приветствия on_member_join",
+                )
         except Exception as e:
             print(f"Ошибка приветствия on_member_join: {e}")
 
         try:
-            for rid in NEW_MEMBER_ROLE_IDS:
-                role = member.guild.get_role(rid)
-                if role:
-                    await member.add_roles(role, reason="Выдача ролей новым игрокам")
+            # В режиме рейда стартовые роли не выдаём: карантин (мут) от антирейда
+            # не должен сопровождаться выдачей ролей с доступами.
+            if not suppress_welcome_and_roles:
+                roles = [r for rid in NEW_MEMBER_ROLE_IDS if (r := member.guild.get_role(rid))]
+                if roles:
+                    # Одним вызовом вместо семи — меньше запросов к API на каждого новичка.
+                    await member.add_roles(*roles, reason="Выдача ролей новым игрокам")
         except Exception as e:
             print(f"Ошибка выдачи ролей on_member_join: {e}")
 
@@ -549,8 +725,10 @@ class LoggingCog(commands.Cog):
                 fields.append(("Тема", f"{before.topic or '—'} → {after.topic or '—'}", False))
             if before.nsfw != after.nsfw:
                 fields.append(("NSFW", f"{'вкл' if before.nsfw else 'выкл'} → {'вкл' if after.nsfw else 'выкл'}", True))
-            if before.rate_limit_per_user != after.rate_limit_per_user:
-                fields.append(("Slowmode", f"{before.rate_limit_per_user}s → {after.rate_limit_per_user}s", True))
+            # slowmode_delay — правильный атрибут discord.py; rate_limit_per_user
+            # (сырое имя поля API) кидал AttributeError и терял весь лог изменения.
+            if before.slowmode_delay != after.slowmode_delay:
+                fields.append(("Slowmode", f"{before.slowmode_delay}s → {after.slowmode_delay}s", True))
 
         if isinstance(before, discord.VoiceChannel) and isinstance(after, discord.VoiceChannel):
             if before.bitrate != after.bitrate:
@@ -765,7 +943,7 @@ class LoggingCog(commands.Cog):
             "🎙️ Stage создан",
             stage_instance.topic or "Без темы",
             color=Color.green(),
-            fields=[("Канал", stage_instance.channel.mention, False)]
+            fields=[("Канал", _chan_label(stage_instance.channel), False)]
         )
 
     @commands.Cog.listener()
@@ -780,7 +958,7 @@ class LoggingCog(commands.Cog):
             "✏️ Stage изменён",
             after.topic or "Без темы",
             color=Color.orange(),
-            fields=fields or [("Канал", after.channel.mention, False)]
+            fields=fields or [("Канал", _chan_label(after.channel), False)]
         )
 
     @commands.Cog.listener()
@@ -791,7 +969,7 @@ class LoggingCog(commands.Cog):
             "🗑️ Stage удалён",
             stage_instance.topic or "Без темы",
             color=Color.red(),
-            fields=[("Канал", stage_instance.channel.mention, False)]
+            fields=[("Канал", _chan_label(stage_instance.channel), False)]
         )
 
     @commands.Cog.listener()
@@ -871,6 +1049,8 @@ class LoggingCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_invite_create(self, invite: discord.Invite):
+        if not isinstance(invite.guild, discord.Guild):
+            return
         await send_log_embed(
             invite.guild,
             "server",
@@ -878,20 +1058,22 @@ class LoggingCog(commands.Cog):
             f"{invite.code}",
             color=Color.blue(),
             fields=[
-                ("Канал", invite.channel.mention if invite.channel else "—", False),
+                ("Канал", _chan_label(invite.channel) if invite.channel else "—", False),
                 ("Создатель", invite.inviter.mention if invite.inviter else "—", False)
             ]
         )
 
     @commands.Cog.listener()
     async def on_invite_delete(self, invite: discord.Invite):
+        if not isinstance(invite.guild, discord.Guild):
+            return
         await send_log_embed(
             invite.guild,
             "server",
             "🗑️ Инвайт удалён",
             f"{invite.code}",
             color=Color.red(),
-            fields=[("Канал", invite.channel.mention if invite.channel else "—", False)]
+            fields=[("Канал", _chan_label(invite.channel) if invite.channel else "—", False)]
         )
 
     @commands.Cog.listener()
@@ -908,11 +1090,22 @@ class LoggingCog(commands.Cog):
                 fields=fields
             )
 
+    async def _reactions_logged(self, guild_id: int) -> bool:
+        """Тумблер log_reactions (по умолчанию выключен: реакции — самый шумный
+        тип событий и впустую съедают rate limit бота)."""
+        try:
+            settings = await get_guild_settings(guild_id)
+            return bool(settings.get("log_reactions", False))
+        except Exception:
+            return False
+
     @commands.Cog.listener()
     async def on_reaction_add(self, reaction: discord.Reaction, user: discord.User | discord.Member):
         if not reaction.message.guild or user.bot:
             return
         if is_log_channel(reaction.message.channel):
+            return
+        if not await self._reactions_logged(reaction.message.guild.id):
             return
         await send_log_embed(
             reaction.message.guild,
@@ -920,7 +1113,7 @@ class LoggingCog(commands.Cog):
             "⭐ Реакция добавлена",
             f"{user} поставил {reaction.emoji}",
             color=Color.gold(),
-            fields=[("Канал", reaction.message.channel.mention, False), ("Ссылка", reaction.message.jump_url, False)]
+            fields=[("Канал", _chan_label(reaction.message.channel), False), ("Ссылка", reaction.message.jump_url, False)]
         )
 
     @commands.Cog.listener()
@@ -929,13 +1122,15 @@ class LoggingCog(commands.Cog):
             return
         if is_log_channel(reaction.message.channel):
             return
+        if not await self._reactions_logged(reaction.message.guild.id):
+            return
         await send_log_embed(
             reaction.message.guild,
             "server",
             "❌ Реакция удалена",
             f"{user} убрал {reaction.emoji}",
             color=Color.orange(),
-            fields=[("Канал", reaction.message.channel.mention, False), ("Ссылка", reaction.message.jump_url, False)]
+            fields=[("Канал", _chan_label(reaction.message.channel), False), ("Ссылка", reaction.message.jump_url, False)]
         )
 
     @commands.Cog.listener()
@@ -946,7 +1141,7 @@ class LoggingCog(commands.Cog):
             "⌨️ Команда",
             f"{ctx.author} использовал `{ctx.message.content}`",
             color=Color.blurple(),
-            fields=[("Канал", ctx.channel.mention, False)]
+            fields=[("Канал", _chan_label(ctx.channel), False)]
         )
 
     @commands.Cog.listener()
@@ -965,7 +1160,7 @@ class LoggingCog(commands.Cog):
         if not interaction.guild:
             return
         if interaction.type == discord.InteractionType.application_command:
-            data = interaction.data or {}
+            data: dict = dict(interaction.data or {})
             name = data.get("name", "(неизвестно)")
             await send_log_embed(
                 interaction.guild,
@@ -973,7 +1168,7 @@ class LoggingCog(commands.Cog):
                 "⚡ Slash-команда",
                 f"/{name} — {interaction.user}",
                 color=Color.blurple(),
-                fields=[("Канал", interaction.channel.mention if interaction.channel else "—", False)]
+                fields=[("Канал", _chan_label(interaction.channel) if interaction.channel else "—", False)]
             )
 
 
