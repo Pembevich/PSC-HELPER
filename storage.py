@@ -15,13 +15,18 @@ from __future__ import annotations
 
 import os
 import asyncio
+import gzip
 import hashlib
+import io
 import logging
 import json
 import re
+import shutil
 import sqlite3
 import tempfile
 import time
+from weakref import WeakKeyDictionary
+
 import discord
 import aiosqlite
 
@@ -33,7 +38,22 @@ logger = logging.getLogger(__name__)
 # Единое соединение на путь к БД
 # ---------------------------------------------------------------------------
 _connections: dict[str, aiosqlite.Connection] = {}
-_conn_lock = asyncio.Lock()
+_conn_locks: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = WeakKeyDictionary()
+# A single aiosqlite connection serializes individual statements, but it does
+# not make a multi-statement transaction atomic. Keep every write transaction
+# and VACUUM snapshot behind the same lock.
+_write_locks: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = WeakKeyDictionary()
+
+
+def _loop_lock(
+    registry: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock],
+) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = registry.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        registry[loop] = lock
+    return lock
 
 
 async def _get_conn(db_path: str = DEFAULT_DB_PATH) -> aiosqlite.Connection:
@@ -41,7 +61,7 @@ async def _get_conn(db_path: str = DEFAULT_DB_PATH) -> aiosqlite.Connection:
     conn = _connections.get(db_path)
     if conn is not None:
         return conn
-    async with _conn_lock:
+    async with _loop_lock(_conn_locks):
         conn = _connections.get(db_path)
         if conn is not None:
             return conn
@@ -57,16 +77,22 @@ async def _get_conn(db_path: str = DEFAULT_DB_PATH) -> aiosqlite.Connection:
 
 async def close_all_connections() -> None:
     """Корректно закрыть все соединения (вызывать при остановке бота)."""
-    async with _conn_lock:
-        for path, conn in list(_connections.items()):
-            try:
-                await conn.close()
-            except Exception as exc:
-                logger.warning(f"Не удалось закрыть соединение {path}: {exc}")
-            _connections.pop(path, None)
+    async with _loop_lock(_write_locks):
+        async with _loop_lock(_conn_locks):
+            for path, conn in list(_connections.items()):
+                try:
+                    await conn.close()
+                except Exception:
+                    logger.exception("Не удалось закрыть соединение %s.", path)
+                _connections.pop(path, None)
 
 
 async def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
+    async with _loop_lock(_write_locks):
+        await _init_db_unlocked(db_path)
+
+
+async def _init_db_unlocked(db_path: str) -> None:
     conn = await _get_conn(db_path)
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS entries (
@@ -141,6 +167,20 @@ async def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
             updated_at INTEGER NOT NULL
         )
     """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS security_posture (
+            guild_id INTEGER PRIMARY KEY,
+            snapshot TEXT NOT NULL,
+            snapshot_hash TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS form_decisions (
+            message_id INTEGER PRIMARY KEY,
+            decided_at INTEGER NOT NULL
+        )
+    """)
     # Чистим устаревшие таблицы со старых версий (plaintext-пароли и т.п.).
     await conn.execute("DROP TABLE IF EXISTS private_chats")
     await conn.execute("DROP TABLE IF EXISTS chat_messages")
@@ -152,22 +192,24 @@ async def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
 # ---------------------------------------------------------------------------
 
 async def add_entry(title: str, description: str, db_path: str = DEFAULT_DB_PATH) -> int:
-    conn = await _get_conn(db_path)
-    cursor = await conn.execute(
-        "INSERT INTO entries (title, description) VALUES (?, ?)",
-        ((title or "").strip(), (description or "").strip()),
-    )
-    await conn.commit()
-    if cursor.lastrowid is None:
-        raise RuntimeError("SQLite did not return an ID for the inserted entry")
-    return cursor.lastrowid
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        cursor = await conn.execute(
+            "INSERT INTO entries (title, description) VALUES (?, ?)",
+            ((title or "").strip(), (description or "").strip()),
+        )
+        await conn.commit()
+        if cursor.lastrowid is None:
+            raise RuntimeError("SQLite did not return an ID for the inserted entry")
+        return cursor.lastrowid
 
 
 async def delete_entry(entry_id: int, db_path: str = DEFAULT_DB_PATH) -> bool:
-    conn = await _get_conn(db_path)
-    cursor = await conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
-    await conn.commit()
-    return cursor.rowcount > 0
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        cursor = await conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+        await conn.commit()
+        return cursor.rowcount > 0
 
 
 async def list_entries(limit: int = 10, db_path: str = DEFAULT_DB_PATH) -> list[tuple[int, str, str]]:
@@ -198,13 +240,14 @@ async def get_ai_context(user_id: int, guild_id: int, db_path: str = DEFAULT_DB_
 
 async def update_ai_context(user_id: int, guild_id: int, context: str, db_path: str = DEFAULT_DB_PATH) -> None:
     """Upsert AI context JSON string for (user_id, guild_id)."""
-    conn = await _get_conn(db_path)
-    await conn.execute(
-        "INSERT INTO ai_context (user_id, guild_id, context) VALUES (?, ?, ?) "
-        "ON CONFLICT(user_id, guild_id) DO UPDATE SET context = excluded.context",
-        (user_id, guild_id, context),
-    )
-    await conn.commit()
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        await conn.execute(
+            "INSERT INTO ai_context (user_id, guild_id, context) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id, guild_id) DO UPDATE SET context = excluded.context",
+            (user_id, guild_id, context),
+        )
+        await conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -224,13 +267,14 @@ async def is_ai_muted(user_id: int, guild_id: int, db_path: str = DEFAULT_DB_PAT
 
 async def set_ai_muted_user(user_id: int, guild_id: int, muted: bool, db_path: str = DEFAULT_DB_PATH) -> None:
     """Upsert the muted status of a user for P.OS on a guild."""
-    conn = await _get_conn(db_path)
-    await conn.execute(
-        "INSERT INTO ai_muted (user_id, guild_id, muted) VALUES (?, ?, ?) "
-        "ON CONFLICT(user_id, guild_id) DO UPDATE SET muted = excluded.muted",
-        (user_id, guild_id, int(muted)),
-    )
-    await conn.commit()
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        await conn.execute(
+            "INSERT INTO ai_muted (user_id, guild_id, muted) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id, guild_id) DO UPDATE SET muted = excluded.muted",
+            (user_id, guild_id, int(muted)),
+        )
+        await conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -251,13 +295,31 @@ async def get_guild_settings_raw(guild_id: int, db_path: str = DEFAULT_DB_PATH) 
 
 async def set_guild_settings_raw(guild_id: int, settings_json: str, db_path: str = DEFAULT_DB_PATH) -> None:
     """Upsert the settings JSON string for guild_id."""
-    conn = await _get_conn(db_path)
-    await conn.execute(
-        "INSERT INTO guild_settings (guild_id, settings) VALUES (?, ?) "
-        "ON CONFLICT(guild_id) DO UPDATE SET settings = excluded.settings",
-        (guild_id, settings_json),
-    )
-    await conn.commit()
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        await conn.execute(
+            "INSERT INTO guild_settings (guild_id, settings) VALUES (?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET settings = excluded.settings",
+            (guild_id, settings_json),
+        )
+        await conn.commit()
+
+
+async def claim_form_decision(
+    message_id: int,
+    db_path: str = DEFAULT_DB_PATH,
+) -> bool:
+    """Atomically claim a persistent form decision; False means already handled."""
+    if int(message_id) <= 0:
+        return False
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        cursor = await conn.execute(
+            "INSERT OR IGNORE INTO form_decisions (message_id, decided_at) VALUES (?, ?)",
+            (int(message_id), int(time.time())),
+        )
+        await conn.commit()
+        return cursor.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
@@ -271,20 +333,22 @@ async def set_raid_state(
 ) -> None:
     if guild_id <= 0:
         raise ValueError("guild_id must be positive")
-    conn = await _get_conn(db_path)
-    await conn.execute(
-        "INSERT INTO security_state (guild_id, raid_until, updated_at) VALUES (?, ?, ?) "
-        "ON CONFLICT(guild_id) DO UPDATE SET "
-        "raid_until = excluded.raid_until, updated_at = excluded.updated_at",
-        (guild_id, float(raid_until), int(time.time())),
-    )
-    await conn.commit()
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        await conn.execute(
+            "INSERT INTO security_state (guild_id, raid_until, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET "
+            "raid_until = excluded.raid_until, updated_at = excluded.updated_at",
+            (guild_id, float(raid_until), int(time.time())),
+        )
+        await conn.commit()
 
 
 async def clear_raid_state(guild_id: int, db_path: str = DEFAULT_DB_PATH) -> None:
-    conn = await _get_conn(db_path)
-    await conn.execute("DELETE FROM security_state WHERE guild_id = ?", (guild_id,))
-    await conn.commit()
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        await conn.execute("DELETE FROM security_state WHERE guild_id = ?", (guild_id,))
+        await conn.commit()
 
 
 async def get_active_raid_states(
@@ -293,15 +357,70 @@ async def get_active_raid_states(
     db_path: str = DEFAULT_DB_PATH,
 ) -> dict[int, float]:
     current_time = time.time() if now is None else float(now)
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        await conn.execute("DELETE FROM security_state WHERE raid_until <= ?", (current_time,))
+        cursor = await conn.execute(
+            "SELECT guild_id, raid_until FROM security_state WHERE raid_until > ?",
+            (current_time,),
+        )
+        rows = await cursor.fetchall()
+        await conn.commit()
+        return {int(row[0]): float(row[1]) for row in rows}
+
+
+async def get_security_posture(
+    guild_id: int,
+    db_path: str = DEFAULT_DB_PATH,
+) -> dict | None:
     conn = await _get_conn(db_path)
-    await conn.execute("DELETE FROM security_state WHERE raid_until <= ?", (current_time,))
     cursor = await conn.execute(
-        "SELECT guild_id, raid_until FROM security_state WHERE raid_until > ?",
-        (current_time,),
+        "SELECT snapshot, snapshot_hash FROM security_posture WHERE guild_id = ?",
+        (int(guild_id),),
     )
-    rows = await cursor.fetchall()
-    await conn.commit()
-    return {int(row[0]): float(row[1]) for row in rows}
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    snapshot_text = str(row[0] or "")
+    expected_hash = str(row[1] or "")
+    actual_hash = hashlib.sha256(snapshot_text.encode("utf-8")).hexdigest()
+    if not expected_hash or actual_hash != expected_hash:
+        logger.error("Security posture hash mismatch for guild %s", guild_id)
+        return None
+    try:
+        snapshot = json.loads(snapshot_text)
+    except json.JSONDecodeError:
+        return None
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+async def set_security_posture(
+    guild_id: int,
+    snapshot: dict,
+    db_path: str = DEFAULT_DB_PATH,
+) -> str:
+    if guild_id <= 0:
+        raise ValueError("guild_id must be positive")
+    snapshot_text = json.dumps(
+        snapshot,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(snapshot_text) > 2_000_000:
+        raise ValueError("security posture snapshot is too large")
+    snapshot_hash = hashlib.sha256(snapshot_text.encode("utf-8")).hexdigest()
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        await conn.execute(
+            "INSERT INTO security_posture (guild_id, snapshot, snapshot_hash, updated_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET "
+            "snapshot = excluded.snapshot, snapshot_hash = excluded.snapshot_hash, "
+            "updated_at = excluded.updated_at",
+            (int(guild_id), snapshot_text, snapshot_hash, int(time.time())),
+        )
+        await conn.commit()
+    return snapshot_hash
 
 
 # ---------------------------------------------------------------------------
@@ -326,72 +445,76 @@ async def add_ai_event(
     recipient_role_id: int | None = None,
     db_path: str = DEFAULT_DB_PATH,
 ) -> int:
-    conn = await _get_conn(db_path)
     if details is None:
         details_text = ""
     elif isinstance(details, str):
         details_text = details
     else:
         details_text = json.dumps(details, ensure_ascii=False)
-    cursor = await conn.execute(
-        """
-        INSERT INTO ai_event_log (
-            ts, guild_id, event_type, actor_id, actor_name, target_user_id,
-            target_role_id, channel_id, message_id, summary, details, deleted
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            int(ts or time.time()),
-            int(guild_id),
-            str(event_type or "event")[:80],
-            actor_id,
-            (actor_name or "")[:200],
-            target_user_id,
-            target_role_id,
-            channel_id,
-            message_id,
-            (summary or "")[:1200],
-            details_text[:8000],
-            int(bool(deleted)),
-        ),
-    )
-    if cursor.lastrowid is None:
-        raise RuntimeError("SQLite did not return an ID for the inserted AI event")
-    event_id = cursor.lastrowid
-    if recipient_user_ids:
-        recipient_rows = [
-            (event_id, user_id, recipient_role_id)
-            for user_id in dict.fromkeys(int(value) for value in recipient_user_ids)
-            if user_id > 0
-        ][:50_000]
-        if recipient_rows:
-            await conn.executemany(
-                "INSERT OR IGNORE INTO ai_event_recipients (event_id, user_id, source_role_id) VALUES (?, ?, ?)",
-                recipient_rows,
-            )
-    await conn.commit()
-    return event_id
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        cursor = await conn.execute(
+            """
+            INSERT INTO ai_event_log (
+                ts, guild_id, event_type, actor_id, actor_name, target_user_id,
+                target_role_id, channel_id, message_id, summary, details, deleted
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(ts or time.time()),
+                int(guild_id),
+                str(event_type or "event")[:80],
+                actor_id,
+                (actor_name or "")[:200],
+                target_user_id,
+                target_role_id,
+                channel_id,
+                message_id,
+                (summary or "")[:1200],
+                details_text[:8000],
+                int(bool(deleted)),
+            ),
+        )
+        if cursor.lastrowid is None:
+            raise RuntimeError("SQLite did not return an ID for the inserted AI event")
+        event_id = cursor.lastrowid
+        if recipient_user_ids:
+            recipient_rows = [
+                (event_id, user_id, recipient_role_id)
+                for user_id in dict.fromkeys(int(value) for value in recipient_user_ids)
+                if user_id > 0
+            ][:50_000]
+            if recipient_rows:
+                await conn.executemany(
+                    "INSERT OR IGNORE INTO ai_event_recipients "
+                    "(event_id, user_id, source_role_id) VALUES (?, ?, ?)",
+                    recipient_rows,
+                )
+        await conn.commit()
+        return event_id
 
 
 async def mark_ai_message_deleted(guild_id: int, message_id: int, db_path: str = DEFAULT_DB_PATH) -> None:
-    conn = await _get_conn(db_path)
-    await conn.execute(
-        "UPDATE ai_event_log SET deleted = 1 WHERE guild_id = ? AND message_id = ?",
-        (int(guild_id), int(message_id)),
-    )
-    await conn.commit()
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        await conn.execute(
+            "UPDATE ai_event_log SET deleted = 1 WHERE guild_id = ? AND message_id = ?",
+            (int(guild_id), int(message_id)),
+        )
+        await conn.commit()
 
 
 async def mark_ai_messages_deleted(guild_id: int, message_ids, db_path: str = DEFAULT_DB_PATH) -> None:
     ids = [int(message_id) for message_id in dict.fromkeys(message_ids or [])]
     if not ids:
         return
-    conn = await _get_conn(db_path)
-    await conn.executemany(
-        "UPDATE ai_event_log SET deleted = 1 WHERE guild_id = ? AND message_id = ?",
-        [(int(guild_id), message_id) for message_id in ids[:10_000]],
-    )
-    await conn.commit()
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        await conn.executemany(
+            "UPDATE ai_event_log SET deleted = 1 WHERE guild_id = ? AND message_id = ?",
+            [(int(guild_id), message_id) for message_id in ids[:10_000]],
+        )
+        await conn.commit()
 
 
 async def search_ai_events(
@@ -498,7 +621,7 @@ _MAX_BACKUP_BYTES = 100 * 1024 * 1024
 # Сколько последних бэкапов держать в канале (бэкап каждые 10 минут копится вечно
 # и захламляет канал — старые сообщения подчищаем после успешной загрузки).
 _BACKUP_KEEP_LAST = 50
-_backup_lock = asyncio.Lock()
+_backup_locks: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = WeakKeyDictionary()
 # Если канал бэкапов настроен, upload запрещён до безопасного restore/no-backup
 # результата. Это защищает не только loop, но и shutdown/P.OS shutdown пути.
 _backup_uploads_allowed = not bool(BACKUP_CHANNEL_ID)
@@ -525,11 +648,41 @@ def _sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
-def _write_bytes(path: str, raw: bytes) -> None:
-    with open(path, "wb") as output:
-        output.write(raw)
+def _compress_file(source_path: str, destination_path: str) -> None:
+    with open(source_path, "rb") as source, open(destination_path, "wb") as output:
+        with gzip.GzipFile(
+            filename="bot_data.db",
+            mode="wb",
+            fileobj=output,
+            compresslevel=6,
+            mtime=0,
+        ) as compressed:
+            shutil.copyfileobj(source, compressed, length=1024 * 1024)
         output.flush()
         os.fsync(output.fileno())
+
+
+def _write_restore_payload(path: str, raw: bytes, *, compressed: bool) -> int:
+    total = 0
+    with open(path, "wb") as output:
+        if compressed:
+            with gzip.GzipFile(fileobj=io.BytesIO(raw), mode="rb") as source:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _MAX_BACKUP_BYTES:
+                        raise ValueError("decompressed database exceeds the size limit")
+                    output.write(chunk)
+        else:
+            total = len(raw)
+            if total > _MAX_BACKUP_BYTES:
+                raise ValueError("database exceeds the size limit")
+            output.write(raw)
+        output.flush()
+        os.fsync(output.fileno())
+    return total
 
 
 def _sqlite_quick_check(path: str) -> tuple[bool, str]:
@@ -556,20 +709,21 @@ async def _create_consistent_snapshot(db_path: str = DEFAULT_DB_PATH) -> str | N
     Возвращает путь к временному файлу-снапшоту (его нужно удалить после загрузки).
     """
     snapshot_path = f"{db_path}.backup"
-    try:
-        if os.path.exists(snapshot_path):
-            os.remove(snapshot_path)
-    except OSError:
-        pass
-    try:
-        conn = await _get_conn(db_path)
-        # Параметризовать имя файла в VACUUM INTO нельзя — экранируем кавычки вручную.
-        safe_path = snapshot_path.replace("'", "''")
-        await conn.execute(f"VACUUM INTO '{safe_path}'")
-        return snapshot_path
-    except Exception as exc:
-        logger.error(f"Не удалось создать снапшот БД: {exc}")
-        return None
+    async with _loop_lock(_write_locks):
+        try:
+            if os.path.exists(snapshot_path):
+                os.remove(snapshot_path)
+        except OSError:
+            pass
+        try:
+            conn = await _get_conn(db_path)
+            # Параметризовать имя файла в VACUUM INTO нельзя — экранируем кавычки вручную.
+            safe_path = snapshot_path.replace("'", "''")
+            await conn.execute(f"VACUUM INTO '{safe_path}'")
+            return snapshot_path
+        except Exception:
+            logger.exception("Не удалось создать согласованный снапшот БД.")
+            return None
 
 
 async def _resolve_backup_channel(bot: discord.Client) -> discord.TextChannel | None:
@@ -584,7 +738,7 @@ async def _resolve_backup_channel(bot: discord.Client) -> discord.TextChannel | 
 
 async def backup_db_to_discord(bot: discord.Client, db_path: str = DEFAULT_DB_PATH) -> bool:
     """Upload a consistent snapshot of the DB to the dedicated backup channel."""
-    async with _backup_lock:
+    async with _loop_lock(_backup_locks):
         # #13: Не делаем бэкап, если канал не настроен
         if not BACKUP_CHANNEL_ID:
             _warn_backup_disabled_once()
@@ -606,20 +760,38 @@ async def backup_db_to_discord(bot: discord.Client, db_path: str = DEFAULT_DB_PA
             logger.warning("Database backup failed: snapshot was not created.")
             return False
 
+        compressed_path = f"{snapshot_path}.gz"
         try:
             snapshot_size = os.path.getsize(snapshot_path)
             if snapshot_size <= 0 or snapshot_size > _MAX_BACKUP_BYTES:
                 logger.error("Database backup rejected: invalid snapshot size %s bytes.", snapshot_size)
                 return False
-            snapshot_hash = await asyncio.to_thread(_sha256_file, snapshot_path)
-            file = discord.File(snapshot_path, filename="bot_data.db")
-            await channel.send(
-                content=(
-                    f"{_BACKUP_MARKER} Automatic database backup "
-                    f"sha256={snapshot_hash} size={snapshot_size}"
-                ),
-                file=file,
-            )
+            await asyncio.to_thread(_compress_file, snapshot_path, compressed_path)
+            compressed_size = os.path.getsize(compressed_path)
+            if compressed_size <= 0 or compressed_size > _MAX_BACKUP_BYTES:
+                logger.error("Database backup rejected: invalid compressed size %s bytes.", compressed_size)
+                return False
+            upload_limit = int(getattr(getattr(channel, "guild", None), "filesize_limit", 0) or 0)
+            if upload_limit > 0 and compressed_size > upload_limit:
+                logger.error(
+                    "Database backup is %s bytes after gzip, above Discord limit %s bytes.",
+                    compressed_size,
+                    upload_limit,
+                )
+                return False
+            snapshot_hash = await asyncio.to_thread(_sha256_file, compressed_path)
+            file = discord.File(compressed_path, filename="bot_data.db.gz")
+            try:
+                await channel.send(
+                    content=(
+                        f"{_BACKUP_MARKER} Automatic database backup encoding=gzip "
+                        f"sha256={snapshot_hash} size={compressed_size} "
+                        f"original_size={snapshot_size}"
+                    ),
+                    file=file,
+                )
+            finally:
+                file.close()
             logger.info("Database backup uploaded to Discord successfully.")
             try:
                 await _prune_old_backups(channel, bot)
@@ -630,10 +802,11 @@ async def backup_db_to_discord(bot: discord.Client, db_path: str = DEFAULT_DB_PA
             logger.error(f"Failed to upload database backup to Discord: {e}")
             return False
         finally:
-            try:
-                os.remove(snapshot_path)
-            except OSError:
-                pass
+            for temporary_path in (snapshot_path, compressed_path):
+                try:
+                    os.remove(temporary_path)
+                except OSError:
+                    pass
 
 
 async def _prune_old_backups(channel: discord.TextChannel, bot: discord.Client) -> None:
@@ -666,7 +839,7 @@ async def restore_db_from_discord(bot: discord.Client, db_path: str = DEFAULT_DB
       a fresh backup over the last known good copy yet.
     """
     global _backup_uploads_allowed
-    async with _backup_lock:
+    async with _loop_lock(_backup_locks):
         if not BACKUP_CHANNEL_ID:
             _backup_uploads_allowed = True
             _warn_backup_disabled_once()
@@ -693,7 +866,7 @@ async def restore_db_from_discord(bot: discord.Client, db_path: str = DEFAULT_DB
                 if not content.startswith(_BACKUP_MARKER) or not msg.attachments:
                     continue
                 att = msg.attachments[0]
-                if att.filename != "bot_data.db":
+                if att.filename not in {"bot_data.db", "bot_data.db.gz"}:
                     continue
                 saw_candidate = True
                 candidate_label = f"message={msg.id}"
@@ -704,7 +877,8 @@ async def restore_db_from_discord(bot: discord.Client, db_path: str = DEFAULT_DB
                     raw = await att.read()
                     if not raw or len(raw) > _MAX_BACKUP_BYTES:
                         raise ValueError(f"invalid downloaded size: {len(raw)} bytes")
-                    if not raw.startswith(_SQLITE_MAGIC):
+                    compressed = att.filename == "bot_data.db.gz"
+                    if not compressed and not raw.startswith(_SQLITE_MAGIC):
                         raise ValueError("SQLite magic bytes missing")
 
                     expected_match = _BACKUP_HASH_RE.search(content)
@@ -718,7 +892,17 @@ async def restore_db_from_discord(bot: discord.Client, db_path: str = DEFAULT_DB
                     fd, temp_path = tempfile.mkstemp(prefix=".pos-restore-", suffix=".db", dir=db_dir)
                     os.close(fd)
                     try:
-                        await asyncio.to_thread(_write_bytes, temp_path, raw)
+                        restored_size = await asyncio.to_thread(
+                            _write_restore_payload,
+                            temp_path,
+                            raw,
+                            compressed=compressed,
+                        )
+                        if restored_size <= 0:
+                            raise ValueError("restored database is empty")
+                        with open(temp_path, "rb") as restored_file:
+                            if not restored_file.read(len(_SQLITE_MAGIC)).startswith(_SQLITE_MAGIC):
+                                raise ValueError("SQLite magic bytes missing")
                         valid, check_details = await asyncio.to_thread(_sqlite_quick_check, temp_path)
                         if not valid:
                             raise ValueError(f"SQLite quick_check failed: {check_details}")

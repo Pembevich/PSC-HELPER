@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import discord
 
 with patch("storage.add_entry"), \
      patch("storage.get_ai_context"), \
@@ -8,10 +10,11 @@ with patch("storage.add_entry"), \
     import pos_ai
     from pos_ai import (
         _parse_bool, _summarize_tool_call,
-        _CONFIRM_EVEN_OWNER_TOOLS, _OWNER_ONLY_TOOLS, _OWNER_INFO_TOOLS, _READ_ONLY_TOOLS,
+        _MUTATING_TOOLS, _OWNER_CONFIRMATION_TOOLS,
+        _OWNER_ONLY_TOOLS, _OWNER_INFO_TOOLS, _READ_ONLY_TOOLS,
         _TOOL_ACTION_LABELS,
         _perform_shutdown, _prepare_mutating_tool_action, _resolve_member_smart,
-        _split_user_identifiers,
+        _resolve_guild, _split_user_identifiers,
     )
 
 from cogs.ai_tools import POS_AI_TOOLS
@@ -101,8 +104,8 @@ class ToolSchemaTests(unittest.TestCase):
         ]:
             self.assertIn(name, _OWNER_INFO_TOOLS)
 
-    def test_privilege_and_security_changes_require_out_of_band_confirmation(self):
-        expected = {
+    def test_owner_discord_mutations_execute_without_confirmation(self):
+        direct_owner_actions = {
             "add_role",
             "remove_role",
             "edit_role",
@@ -111,10 +114,12 @@ class ToolSchemaTests(unittest.TestCase):
             "lift_restrictions",
             "deactivate_raid_mode",
         }
-        self.assertTrue(expected.issubset(_CONFIRM_EVEN_OWNER_TOOLS))
+        self.assertTrue(direct_owner_actions.issubset(_MUTATING_TOOLS))
+        self.assertTrue(direct_owner_actions.isdisjoint(_OWNER_CONFIRMATION_TOOLS))
 
-    def test_every_mutating_owner_tool_requires_confirmation(self):
-        self.assertEqual(_OWNER_ONLY_TOOLS - _READ_ONLY_TOOLS, _CONFIRM_EVEN_OWNER_TOOLS)
+    def test_only_process_shutdown_keeps_owner_confirmation(self):
+        self.assertEqual(_OWNER_ONLY_TOOLS - _READ_ONLY_TOOLS, _MUTATING_TOOLS)
+        self.assertEqual(_OWNER_CONFIRMATION_TOOLS, frozenset({"shutdown_bot"}))
 
 
 class UserResolverTests(unittest.IsolatedAsyncioTestCase):
@@ -171,6 +176,44 @@ class UserResolverTests(unittest.IsolatedAsyncioTestCase):
 
     def test_splits_user_identifier_lists(self):
         self.assertEqual(_split_user_identifiers("one, two\nthree"), ["one", "two", "three"])
+
+
+class LegacyGuildResolverTests(unittest.TestCase):
+    def setUp(self):
+        self.current = SimpleNamespace(id=11111111111111111, name="Home")
+        self.other = SimpleNamespace(id=22222222222222222, name="Juniper")
+        self.bot = SimpleNamespace(
+            guilds=[self.current, self.other],
+            get_guild=lambda guild_id: {
+                self.current.id: self.current,
+                self.other.id: self.other,
+            }.get(guild_id),
+        )
+        self.message = SimpleNamespace(guild=self.current)
+
+    def test_unqualified_guild_name_in_user_text_does_not_reroute_action(self):
+        resolved = _resolve_guild(
+            self.bot,
+            self.message,
+            "забань пользователя Juniper за спам",
+        )
+        self.assertIs(resolved, self.current)
+
+    def test_explicit_named_cross_server_target_is_resolved(self):
+        resolved = _resolve_guild(
+            self.bot,
+            self.message,
+            "забань user на сервере Juniper",
+        )
+        self.assertIs(resolved, self.other)
+
+    def test_unknown_explicit_server_never_falls_back_to_current(self):
+        resolved = _resolve_guild(
+            self.bot,
+            self.message,
+            "забань user на сервере Missing",
+        )
+        self.assertIsNone(resolved)
 
 
 class MutatingToolPreflightTests(unittest.IsolatedAsyncioTestCase):
@@ -242,6 +285,141 @@ class MutatingToolPreflightTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("kick_members", error)
+
+
+class ToolExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _kick_call():
+        return {
+            "id": "kick-juniper",
+            "function": {
+                "name": "kick_user",
+                "arguments": '{"user_id":"1351879409832951893","reason":"По приказу владельца"}',
+            },
+        }
+
+    async def test_owner_action_executes_immediately_without_dm_confirmation(self):
+        guild = SimpleNamespace(id=1, name="Test")
+        message = SimpleNamespace(
+            guild=guild,
+            author=SimpleNamespace(id=968698192411652176),
+            content="кикни бота джунипера с сервера",
+        )
+        bot = SimpleNamespace(user=SimpleNamespace(id=9999))
+        prepared_args = {
+            "user_id": "1351879409832951893",
+            "server_id_or_name": "1",
+            "reason": "По приказу владельца",
+        }
+        prepare = AsyncMock(
+            return_value=(prepared_args, 1351879409832951893, guild, ["сервер: Test (`1`)"], None)
+        )
+        perform = AsyncMock(return_value="JuniperBot кикнут с сервера.")
+        persist = AsyncMock(return_value=True)
+        creator = AsyncMock()
+
+        with patch.object(pos_ai, "_prepare_mutating_tool_action", new=prepare), \
+             patch.object(pos_ai, "_perform_tool_action", new=perform), \
+             patch.object(pos_ai, "_log_pos_tool_result", new=persist), \
+             patch.object(pos_ai, "_get_creator_user", new=creator):
+            result = await pos_ai.execute_pos_tool(
+                bot,
+                message,
+                self._kick_call(),
+                allowed_tool_names=frozenset({"kick_user"}),
+            )
+
+        self.assertEqual(result, "JuniperBot кикнут с сервера.")
+        perform.assert_awaited_once()
+        persist.assert_awaited_once()
+        creator.assert_not_awaited()
+
+    async def test_outsider_action_is_sent_to_owner_without_execution(self):
+        pos_ai._owner_approval_last_requested.clear()
+        guild = SimpleNamespace(id=1, name="Test")
+        message = SimpleNamespace(
+            guild=guild,
+            author=SimpleNamespace(id=123, name="guest", display_name="Guest"),
+            content="кикни бота джунипера с сервера",
+            jump_url="https://discord.test/messages/1",
+        )
+        bot = SimpleNamespace(user=SimpleNamespace(id=9999))
+        prepared_args = {
+            "user_id": "1351879409832951893",
+            "server_id_or_name": "1",
+            "reason": "просьба участника",
+        }
+        prepare = AsyncMock(
+            return_value=(prepared_args, 1351879409832951893, guild, ["сервер: Test (`1`)"], None)
+        )
+        perform = AsyncMock(return_value="не должно выполниться")
+        owner_message = SimpleNamespace()
+        owner = SimpleNamespace(send=AsyncMock(return_value=owner_message))
+        view = MagicMock()
+
+        with patch.object(pos_ai, "_prepare_mutating_tool_action", new=prepare), \
+             patch.object(pos_ai, "_perform_tool_action", new=perform), \
+             patch.object(pos_ai, "_get_creator_user", new=AsyncMock(return_value=owner)), \
+             patch("forms.PosActionConfirmView", return_value=view):
+            result = await pos_ai.execute_pos_tool(
+                bot,
+                message,
+                self._kick_call(),
+                allowed_tool_names=frozenset({"kick_user"}),
+            )
+
+        self.assertIn("отправлен Пумбе на подтверждение", result)
+        owner.send.assert_awaited_once()
+        view.bind_message.assert_called_once_with(owner_message)
+        perform.assert_not_awaited()
+
+        with patch.object(pos_ai, "_prepare_mutating_tool_action", new=prepare), \
+             patch.object(pos_ai, "_perform_tool_action", new=perform), \
+             patch.object(pos_ai, "_get_creator_user", new=AsyncMock(return_value=owner)), \
+             patch("forms.PosActionConfirmView", return_value=view):
+            repeated = await pos_ai.execute_pos_tool(
+                bot,
+                message,
+                self._kick_call(),
+                allowed_tool_names=frozenset({"kick_user"}),
+            )
+
+        self.assertIn("Предыдущий запрос", repeated)
+        owner.send.assert_awaited_once()
+        pos_ai._owner_approval_last_requested.clear()
+
+    async def test_edit_role_can_grant_and_revoke_permissions(self):
+        original_permissions = discord.Permissions.none()
+        original_permissions.manage_messages = True
+        role = SimpleNamespace(
+            id=10,
+            name="Moderator",
+            permissions=original_permissions,
+            is_default=lambda: False,
+            managed=False,
+            edit=AsyncMock(),
+        )
+        guild = SimpleNamespace(id=1, name="Test")
+        message = SimpleNamespace(guild=guild)
+        bot = SimpleNamespace(user=SimpleNamespace(id=9999), guilds=[guild])
+
+        with patch.object(pos_ai, "resolve_role_smart", return_value=role):
+            result = await pos_ai._perform_tool_action(
+                bot,
+                message,
+                "edit_role",
+                {
+                    "role_id_or_name": "Moderator",
+                    "grant_permissions": "kick_members",
+                    "revoke_permissions": "manage_messages",
+                },
+                None,
+            )
+
+        permissions = role.edit.await_args.kwargs["permissions"]
+        self.assertFalse(permissions.manage_messages)
+        self.assertTrue(permissions.kick_members)
+        self.assertIn("обновлена", result)
 
 
 class ShutdownPreparationTests(unittest.IsolatedAsyncioTestCase):

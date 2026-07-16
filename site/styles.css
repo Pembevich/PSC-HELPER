@@ -76,7 +76,6 @@
 }
 
 html {
-  min-width: 320px;
   background: var(--canvas);
   scroll-behavior: smooth;
   -webkit-font-smoothing: antialiased;
@@ -89,7 +88,6 @@ html.cursor-enabled * {
 }
 
 body {
-  min-width: 320px;
   min-height: 100vh;
   margin: 0;
   overflow-x: hidden;

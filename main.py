@@ -12,7 +12,7 @@ from discord.ext import commands
 load_dotenv()
 
 from config import BOT_COMMAND_PREFIX, POS_AI_MODEL, POS_AI_PROVIDER  # noqa: E402
-from storage import init_db  # noqa: E402
+from storage import close_all_connections, init_db  # noqa: E402
 from utils import sanitize_discord_token  # noqa: E402
 
 logging.basicConfig(
@@ -49,57 +49,60 @@ def create_bot() -> commands.Bot:
 
 
 async def run_bot() -> None:
-    # init_db теперь async — вызываем через await
-    await init_db()
-
-    bot = create_bot()
-
-    # Загружаем все коги до старта бота
-    for cog in COGS:
-        try:
-            await bot.load_extension(cog)
-            logger.info(f"✅ Cog loaded: {cog}")
-        except Exception as e:
-            logger.error(f"❌ Failed to load cog {cog}: {e}", exc_info=True)
-            await bot.close()
-            raise RuntimeError(f"Required cog failed to load: {cog}") from e
-
     raw_token = os.getenv("DISCORD_TOKEN")
     token = sanitize_discord_token(raw_token)
-
     if not token:
         raise RuntimeError("DISCORD_TOKEN не найден в переменных окружения Railway")
 
-    # Graceful shutdown: ловим SIGTERM (Railway) и SIGINT (Ctrl+C).
-    # Повторный сигнал не должен запускать второй бэкап/close — держим ссылку
-    # на задачу и выполняем shutdown ровно один раз.
+    bot = create_bot()
     loop = asyncio.get_running_loop()
     shutdown_task: asyncio.Task | None = None
+    shutdown_lock = asyncio.Lock()
+    shutdown_complete = False
+    db_initialized = False
+    persistent_state_trusted = False
 
-    async def _shutdown() -> None:
-        print("⚠️ Получен сигнал завершения, закрываем бота...")
-        try:
-            # Сбрасываем накопленную память P.OS в БД до бэкапа.
-            from pos_ai import flush_ai_memory
-            await flush_ai_memory()
-        except Exception as e:
-            print(f"Ошибка сброса памяти P.OS перед остановкой: {e}")
-        try:
-            from storage import backup_db_to_discord
-            await backup_db_to_discord(bot)
-        except Exception as e:
-            print(f"Ошибка сохранения бэкапа перед остановкой: {e}")
-        try:
-            from storage import close_all_connections
-            await close_all_connections()
-        except Exception as e:
-            print(f"Ошибка закрытия соединений с БД: {e}")
-        await bot.close()
+    async def _shutdown(*, persist: bool) -> None:
+        """Stop exactly once and never upload an untrusted startup database."""
+        nonlocal shutdown_complete
+        async with shutdown_lock:
+            if shutdown_complete:
+                return
+            logger.info("Получен запрос завершения работы P.OS.")
+
+            if persist and persistent_state_trusted and db_initialized:
+                try:
+                    from pos_ai import flush_ai_memory
+
+                    await flush_ai_memory()
+                except Exception:
+                    logger.exception("Не удалось сбросить память P.OS перед остановкой.")
+                try:
+                    from storage import backup_db_to_discord
+
+                    await backup_db_to_discord(bot)
+                except Exception:
+                    logger.exception("Не удалось сохранить резервную копию перед остановкой.")
+
+            if not bot.is_closed():
+                try:
+                    await bot.close()
+                except Exception:
+                    logger.exception("Ошибка закрытия Discord-клиента.")
+            if db_initialized:
+                try:
+                    await close_all_connections()
+                except Exception:
+                    logger.exception("Ошибка закрытия соединений с БД.")
+            shutdown_complete = True
 
     def _on_signal() -> None:
         nonlocal shutdown_task
         if shutdown_task is None or shutdown_task.done():
-            shutdown_task = asyncio.create_task(_shutdown())
+            shutdown_task = asyncio.create_task(
+                _shutdown(persist=persistent_state_trusted),
+                name="pos-graceful-shutdown",
+            )
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -109,7 +112,24 @@ async def run_bot() -> None:
             pass
 
     try:
-        print(f"⏳ Запуск бота... AI provider={POS_AI_PROVIDER}, model={POS_AI_MODEL}")
+        await init_db()
+        db_initialized = True
+
+        # Загружаем все коги до старта бота. Любая ошибка является фатальной:
+        # частично загруженный P.OS не должен подключаться к серверам.
+        for cog in COGS:
+            try:
+                await bot.load_extension(cog)
+                logger.info("Cog loaded: %s", cog)
+            except Exception as exc:
+                logger.exception("Failed to load required cog %s.", cog)
+                raise RuntimeError(f"Required cog failed to load: {cog}") from exc
+
+        logger.info(
+            "Запуск P.OS: AI provider=%s, model=%s",
+            POS_AI_PROVIDER,
+            POS_AI_MODEL,
+        )
         # Login authenticates the HTTP client without opening the gateway. This
         # lets us restore persistent state before Discord starts dispatching
         # messages, joins, moderation and AI events to cogs.
@@ -131,6 +151,7 @@ async def run_bot() -> None:
                 "Не удалось безопасно проверить/восстановить БД после трёх попыток; "
                 "gateway не запущен, чтобы не работать поверх неверного состояния"
             )
+        persistent_state_trusted = True
         if restore_result:
             from guild_config import invalidate
             from pos_ai import reset_ai_runtime_caches_after_restore
@@ -155,14 +176,28 @@ async def run_bot() -> None:
         logger.critical("Неверный DISCORD_TOKEN.")
         raise
     except asyncio.CancelledError:
-        print("✅ Бот остановлен корректно.")
+        logger.info("P.OS остановлен корректно.")
         raise
     except Exception as e:
         logger.critical("Критическая ошибка при запуске: %s", e, exc_info=True)
         raise
     finally:
-        if not bot.is_closed():
-            await bot.close()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError):
+                pass
+
+        if shutdown_task is not None:
+            try:
+                await shutdown_task
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Ошибка задачи graceful shutdown.")
+        await _shutdown(
+            persist=persistent_state_trusted and not bot.is_closed(),
+        )
 
 
 if __name__ == "__main__":

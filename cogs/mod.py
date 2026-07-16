@@ -117,7 +117,7 @@ class ModerationCog(commands.Cog):
 
         is_staff = self._is_staff(message)
         functional_channel = message.channel.id in NO_MODERATION_CHANNEL_IDS
-        in_raid = antiraid.is_raid_mode(guild.id)
+        in_raid = bool(settings.get("filter_raid", True)) and antiraid.is_raid_mode(guild.id)
 
         # Malware/phishing checks also apply to staff and structured form channels.
         if settings.get("filter_scam", True) or settings.get("filter_ads", True):
@@ -168,7 +168,10 @@ class ModerationCog(commands.Cog):
         # 1. Mass mentions and behavioral spam apply only to ordinary members.
         if settings.get("filter_mention_spam", True):
             try:
-                mention_reasons = detect_mention_spam(message, int(settings.get("mention_limit", 6) or 6))
+                mention_limit = int(settings.get("mention_limit", 6) or 6)
+                if in_raid:
+                    mention_limit = min(mention_limit, 4)
+                mention_reasons = detect_mention_spam(message, mention_limit)
                 if mention_reasons:
                     await self._punish(
                         message, "масс-пинг / спам упоминаний", mention_reasons,
@@ -183,8 +186,14 @@ class ModerationCog(commands.Cog):
             try:
                 cross_reasons = detect_crosschannel_spam(
                     message,
-                    int(settings.get("crosschannel_window_seconds", 15) or 15),
-                    int(settings.get("crosschannel_channels_threshold", 3) or 3),
+                    max(
+                        int(settings.get("crosschannel_window_seconds", 15) or 15),
+                        30 if in_raid else 0,
+                    ),
+                    min(
+                        int(settings.get("crosschannel_channels_threshold", 3) or 3),
+                        2 if in_raid else 20,
+                    ),
                 )
                 if cross_reasons:
                     await self._punish(
@@ -197,7 +206,7 @@ class ModerationCog(commands.Cog):
 
         # 3. Duplicate spam / flood.
         try:
-            if await handle_spam_if_needed(message):
+            if await handle_spam_if_needed(message, in_raid=in_raid):
                 return True
         except Exception as e:
             logger.error(f"Ошибка проверки на спам: {e}", exc_info=True)

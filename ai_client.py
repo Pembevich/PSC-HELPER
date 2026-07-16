@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import math
 import time
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -17,7 +20,6 @@ from config import (
     POS_AI_API_PROVIDER,
     POS_AI_MAX_CONCURRENT_REQUESTS,
     POS_AI_MAX_TOKENS,
-    POS_AI_PROVIDER,
     POS_AI_PROVIDER_KEYS,
     POS_AI_PROVIDER_MODELS,
     POS_AI_PROVIDER_URLS,
@@ -42,6 +44,8 @@ _ai_backoff_reason = ""
 _ai_last_backoff_log_at = 0.0
 _provider_cursor = 0
 _provider_backoff_until: dict[int, float] = {}
+_MAX_UPSTREAM_RESPONSE_BYTES = 4 * 1024 * 1024
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 class _AIQueueTimeout(Exception):
@@ -64,6 +68,34 @@ async def _request_slot(total_timeout: int):
             _AI_REQUEST_SEMAPHORE.release()
 
 
+def _is_safe_provider_url(url: str) -> bool:
+    """Require HTTPS, except for explicit loopback-only development endpoints."""
+    if not isinstance(url, str) or not url or any(char.isspace() for char in url):
+        return False
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        _ = parsed.port  # Validate a malformed/non-numeric port eagerly.
+    except (TypeError, ValueError):
+        return False
+    if not host or parsed.username is not None or parsed.password is not None:
+        return False
+    if parsed.fragment:
+        return False
+    if parsed.scheme == "https":
+        return True
+    return parsed.scheme == "http" and host in _LOOPBACK_HOSTS
+
+
+def _provider_kind(url: str) -> str:
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    if host == "models.github.ai":
+        return "github_models"
+    if host == "googleapis.com" or host.endswith(".googleapis.com"):
+        return "gemini"
+    return POS_AI_API_PROVIDER
+
+
 def _build_provider_pool() -> list[dict[str, str]]:
     if POS_AI_PROVIDER_KEYS:
         if POS_AI_PROVIDER_URLS and len(POS_AI_PROVIDER_URLS) != len(POS_AI_PROVIDER_KEYS):
@@ -80,34 +112,37 @@ def _build_provider_pool() -> list[dict[str, str]]:
         for index, key in enumerate(POS_AI_PROVIDER_KEYS):
             url = POS_AI_PROVIDER_URLS[index] if index < len(POS_AI_PROVIDER_URLS) else POS_AI_API_URL
             model = POS_AI_PROVIDER_MODELS[index] if index < len(POS_AI_PROVIDER_MODELS) else POS_AI_MODEL
-            if not url.lower().startswith("https://"):
-                logger.error("AI provider %s has a non-HTTPS URL and was skipped.", index + 1)
+            if not _is_safe_provider_url(url):
+                logger.error("AI provider %s has an unsafe or invalid URL and was skipped.", index + 1)
                 continue
-            if "models.github" in url:
-                provider = "github_models"
-            elif "googleapis.com" in url:
-                provider = "gemini"
-            else:
-                provider = POS_AI_API_PROVIDER
+            if not key.strip() or not model.strip():
+                logger.error("AI provider %s is missing a key or model and was skipped.", index + 1)
+                continue
             pool.append(
                 {
                     "name": f"provider_{index + 1}",
-                    "api_key": key,
+                    "api_key": key.strip(),
                     "api_url": url,
-                    "model": model,
-                    "provider": provider,
+                    "model": model.strip(),
+                    "provider": _provider_kind(url),
                 }
             )
         if pool:
             return pool
 
+    if not _is_safe_provider_url(POS_AI_API_URL):
+        logger.error("Default AI provider has an unsafe or invalid URL; AI is disabled.")
+        return []
+    if not (POS_AI_MODEL or "").strip():
+        logger.error("Default AI provider model is empty; AI is disabled.")
+        return []
     return [
         {
             "name": "default",
-            "api_key": POS_AI_API_KEY or "",
+            "api_key": (POS_AI_API_KEY or "").strip(),
             "api_url": POS_AI_API_URL,
-            "model": POS_AI_MODEL,
-            "provider": POS_AI_PROVIDER,
+            "model": POS_AI_MODEL.strip(),
+            "provider": _provider_kind(POS_AI_API_URL),
         }
     ]
 
@@ -198,7 +233,7 @@ async def _mark_provider_backoff(index: int, seconds: float) -> None:
 
 def _set_ai_backoff(seconds: float, reason: str) -> None:
     global _ai_backoff_until, _ai_backoff_reason
-    cooldown = max(float(seconds or 0), 1.0)
+    cooldown = _bounded_float(seconds, 1.0, 1.0, 3600.0)
     _ai_backoff_until = max(_ai_backoff_until, time.monotonic() + cooldown)
     _ai_backoff_reason = reason
 
@@ -210,11 +245,13 @@ def _parse_retry_after(headers: Mapping[str, str]) -> float | None:
     retry_after = headers.get("Retry-After") or headers.get("retry-after")
     if retry_after:
         try:
-            return max(float(retry_after), 1.0)
+            parsed_seconds = float(retry_after)
+            if math.isfinite(parsed_seconds):
+                return max(1.0, min(parsed_seconds, 3600.0))
         except ValueError:
             try:
                 retry_dt = parsedate_to_datetime(retry_after)
-                return max((retry_dt.timestamp() - time.time()), 1.0)
+                return max(1.0, min(retry_dt.timestamp() - time.time(), 3600.0))
             except Exception:
                 pass
 
@@ -222,9 +259,10 @@ def _parse_retry_after(headers: Mapping[str, str]) -> float | None:
     if reset_header:
         try:
             reset_at = float(reset_header)
-            return max(reset_at - time.time(), 1.0)
+            if math.isfinite(reset_at):
+                return max(1.0, min(reset_at - time.time(), 3600.0))
         except ValueError:
-            return None
+            pass
     return None
 
 
@@ -246,7 +284,36 @@ def _log_ai_backoff_once(message: str) -> None:
     if now - _ai_last_backoff_log_at < 15:
         return
     _ai_last_backoff_log_at = now
-    print(message)
+    logger.warning("%s", message)
+
+
+def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _bounded_float(value: Any, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    if not math.isfinite(parsed):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+async def _read_bounded_response(response: aiohttp.ClientResponse) -> str:
+    raw = await response.content.read(_MAX_UPSTREAM_RESPONSE_BYTES + 1)
+    if len(raw) > _MAX_UPSTREAM_RESPONSE_BYTES:
+        raise ValueError("upstream response exceeds the configured size limit")
+    encoding = response.charset or "utf-8"
+    try:
+        return raw.decode(encoding, errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
 
 
 def _extract_message_from_payload(data: dict[str, Any]) -> dict[str, Any] | None:
@@ -285,6 +352,10 @@ def _extract_message_from_payload(data: dict[str, Any]) -> dict[str, Any] | None
     return None
 
 
+def _upstream_body_fingerprint(body: str) -> str:
+    return hashlib.sha256((body or "").encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
 async def pos_chat_completion(
     messages: list[dict[str, Any]],
     *,
@@ -298,7 +369,10 @@ async def pos_chat_completion(
     if not ai_has_configured_provider():
         return None
 
-    global _provider_cursor
+    request_max_tokens = _bounded_int(max_tokens, POS_AI_MAX_TOKENS, 1, 32_768)
+    request_temperature = _bounded_float(temperature, POS_AI_TEMPERATURE, 0.0, 2.0)
+    request_top_p = _bounded_float(top_p, POS_AI_TOP_P, 0.0, 1.0)
+    request_timeout = _bounded_int(timeout, POS_AI_TIMEOUT_SECONDS, 5, 300)
     max_attempts = len(_AI_PROVIDER_POOL)
 
     for attempt in range(max_attempts):
@@ -306,7 +380,7 @@ async def pos_chat_completion(
         provider_index: int | None = None
         provider: dict[str, str] | None = None
         try:
-            async with _request_slot(timeout):
+            async with _request_slot(request_timeout):
                 if ai_is_temporarily_unavailable():
                     _log_ai_backoff_once(
                         f"P.OS AI cooldown active: {ai_unavailable_reason()} ({ai_cooldown_remaining():.0f}s remaining)."
@@ -328,9 +402,9 @@ async def pos_chat_completion(
                 payload = {
                     "messages": messages,
                     "model": provider["model"],
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                    "top_p": top_p,
+                    "max_tokens": request_max_tokens,
+                    "temperature": request_temperature,
+                    "top_p": request_top_p,
                     "stream": False,
                 }
                 if "googleapis.com" not in provider["api_url"] and provider["provider"] != "gemini":
@@ -346,10 +420,15 @@ async def pos_chat_completion(
                 if provider["provider"] == "github_models":
                     headers["X-GitHub-Api-Version"] = GITHUB_MODELS_API_VERSION
 
-                timeout_config = aiohttp.ClientTimeout(total=timeout)
+                timeout_config = aiohttp.ClientTimeout(total=request_timeout)
                 async with aiohttp.ClientSession(timeout=timeout_config) as session:
-                    async with session.post(provider["api_url"], headers=headers, json=payload) as resp:
-                        response_text = await resp.text()
+                    async with session.post(
+                        provider["api_url"],
+                        headers=headers,
+                        json=payload,
+                        allow_redirects=False,
+                    ) as resp:
+                        response_text = await _read_bounded_response(resp)
                         if _looks_like_rate_limit(resp.status, response_text, resp.headers):
                             retry_after = _parse_retry_after(resp.headers) or POS_AI_RATE_LIMIT_FALLBACK_SECONDS
                             await _mark_provider_backoff(provider_index, retry_after)
@@ -366,16 +445,37 @@ async def pos_chat_completion(
 
                         if resp.status >= 500:
                             await _mark_provider_backoff(provider_index, 8.0)
-                            print(f"P.OS upstream error {resp.status} ({provider['name']}): {response_text[:300]}")
+                            logger.warning(
+                                "P.OS upstream error %s (%s), body_sha256=%s",
+                                resp.status,
+                                provider["name"],
+                                _upstream_body_fingerprint(response_text),
+                            )
                             if _pick_provider_index() is not None:
                                 continue  # retry next provider
                             _set_ai_backoff(5.0, "upstream_error")
                             return None
 
+                        if 300 <= resp.status < 400:
+                            await _mark_provider_backoff(provider_index, 300.0)
+                            logger.warning(
+                                "P.OS AI endpoint returned an unexpected redirect (%s, %s).",
+                                resp.status,
+                                provider["name"],
+                            )
+                            if attempt < max_attempts - 1:
+                                continue
+                            return None
+
                         if resp.status >= 400:
                             if provider["provider"] == "github_models" and resp.status in {401, 403}:
-                                print("P.OS GitHub Models auth error.")
-                            print(f"P.OS API error {resp.status} ({provider['name']}): {response_text[:500]}")
+                                logger.error("P.OS GitHub Models authentication failed.")
+                            logger.warning(
+                                "P.OS API error %s (%s), body_sha256=%s",
+                                resp.status,
+                                provider["name"],
+                                _upstream_body_fingerprint(response_text),
+                            )
                             # 400/413/422 are request-specific and must not take a
                             # healthy provider out of rotation. Auth and endpoint
                             # failures are provider-specific and do get cooldowns.
@@ -393,7 +493,7 @@ async def pos_chat_completion(
             return None
         except asyncio.TimeoutError:
             name = provider["name"] if provider else "unknown"
-            print(f"P.OS API timeout for {name}. Attempting fallback.")
+            logger.warning("P.OS API timeout for %s; attempting fallback.", name)
             if attempt < max_attempts - 1:
                 continue
             return None
@@ -407,7 +507,11 @@ async def pos_chat_completion(
                 else:
                     await _mark_provider_backoff(provider_index, 60.0)
             name = provider["name"] if provider else "unknown"
-            print(f"P.OS API request failed ({name}): {exc}")
+            logger.warning(
+                "P.OS API request failed (%s, %s); attempting fallback.",
+                name,
+                type(exc).__name__,
+            )
             if attempt < max_attempts - 1:
                 continue
             return None
@@ -416,12 +520,18 @@ async def pos_chat_completion(
         try:
             data = json.loads(response_text)
         except Exception:
-            print(f"P.OS API returned non-JSON: {response_text[:500]}")
+            logger.warning(
+                "P.OS API returned non-JSON: body_sha256=%s",
+                _upstream_body_fingerprint(response_text),
+            )
             return None
 
         msg = _extract_message_from_payload(data)
         if not msg:
-            print(f"P.OS API empty response: {response_text[:500]}")
+            logger.warning(
+                "P.OS API response had no message: body_sha256=%s",
+                _upstream_body_fingerprint(response_text),
+            )
             return None
         return msg
 

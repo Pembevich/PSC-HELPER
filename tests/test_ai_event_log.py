@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import unittest
@@ -76,6 +77,31 @@ class AiEventLogTests(unittest.IsolatedAsyncioTestCase):
                 db_path=db_path,
             )
             self.assertEqual(missing, [])
+
+    async def test_concurrent_event_transactions_keep_recipients_attached(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "concurrent-events.db")
+            await init_db(db_path)
+
+            async def record(index: int) -> int:
+                return await add_ai_event(
+                    guild_id=123,
+                    event_type="message_mention",
+                    message_id=10_000 + index,
+                    summary=f"ping {index}",
+                    recipient_user_ids=[20_000 + index],
+                    db_path=db_path,
+                )
+
+            event_ids = await asyncio.gather(*(record(index) for index in range(50)))
+            self.assertEqual(len(set(event_ids)), 50)
+            for index, event_id in enumerate(event_ids):
+                rows = await search_ai_events(
+                    guild_id=123,
+                    recipient_user_id=20_000 + index,
+                    db_path=db_path,
+                )
+                self.assertEqual([row["id"] for row in rows], [event_id])
 
 
 if __name__ == "__main__":

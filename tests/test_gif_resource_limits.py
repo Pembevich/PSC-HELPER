@@ -7,7 +7,7 @@ from unittest import IsolatedAsyncioTestCase
 from unittest.mock import patch
 
 import commands
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 
 
 class FakeAttachment:
@@ -79,7 +79,10 @@ class GifQualityTests(TestCase):
                 )
 
             self.assertEqual(Path(output_path).read_bytes(), b"x" * 5)
-            self.assertEqual(calls, [(720, 15), (640, 15), (560, 15)])
+            self.assertEqual(
+                calls,
+                [(960, 15), (840, 15), (720, 15), (640, 15), (560, 15)],
+            )
 
     def test_uses_guild_upload_limit_with_headroom_and_hard_cap(self):
         guild_limit = 10 * 1024 * 1024
@@ -117,3 +120,50 @@ class GifQualityTests(TestCase):
             self.assertTrue(animated)
             self.assertEqual(len(frames), 2)
             self.assertEqual(durations, [40, 120])
+
+            output_path = Path(temp_dir) / "output.gif"
+            commands._build_gif_from_images(
+                [str(source_path)],
+                str(output_path),
+                max_output_bytes=2 * 1024 * 1024,
+            )
+            with Image.open(output_path) as encoded:
+                encoded_durations = []
+                for frame_index in range(encoded.n_frames):
+                    encoded.seek(frame_index)
+                    encoded_durations.append(encoded.info.get("duration"))
+            self.assertEqual(encoded_durations, [40, 120])
+
+    def test_dark_gradient_preserves_resolution_and_tonal_detail(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "source.png"
+            output_path = Path(temp_dir) / "result.gif"
+            width, height = 320, 180
+            source = Image.new("RGB", (width, height))
+            source.putdata(
+                [
+                    (
+                        8 + (x * 40 // width),
+                        5 + (y * 28 // height),
+                        12 + ((x + y) * 34 // (width + height)),
+                    )
+                    for y in range(height)
+                    for x in range(width)
+                ]
+            )
+            source.save(source_path)
+
+            commands._build_gif_from_images(
+                [str(source_path)],
+                str(output_path),
+                max_output_bytes=2 * 1024 * 1024,
+            )
+
+            with Image.open(output_path) as encoded:
+                restored = encoded.convert("RGB")
+                self.assertEqual(restored.size, source.size)
+                color_count = len(restored.getcolors(maxcolors=1_000_000) or [])
+                mean_error = sum(ImageStat.Stat(ImageChops.difference(source, restored)).mean) / 3
+
+            self.assertGreaterEqual(color_count, 128)
+            self.assertLess(mean_error, 4.0)

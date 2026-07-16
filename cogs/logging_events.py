@@ -120,8 +120,8 @@ async def _broadcast_embed(
             continue
         try:
             await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-        except Exception as e:
-            print(f"{error_label} (канал {channel_id}): {e}")
+        except Exception:
+            logger.exception("%s (канал %s).", error_label, channel_id)
 
 
 def _should_log_message(message: discord.Message) -> bool:
@@ -621,8 +621,8 @@ class LoggingCog(commands.Cog):
                     _build_welcome_embed(member),
                     error_label="Ошибка приветствия on_member_join",
                 )
-        except Exception as e:
-            print(f"Ошибка приветствия on_member_join: {e}")
+        except Exception:
+            logger.exception("Ошибка приветствия on_member_join для %s.", member.id)
 
         try:
             # В режиме рейда стартовые роли не выдаём: карантин (мут) от антирейда
@@ -632,8 +632,8 @@ class LoggingCog(commands.Cog):
                 if roles:
                     # Одним вызовом вместо семи — меньше запросов к API на каждого новичка.
                     await member.add_roles(*roles, reason="Выдача ролей новым игрокам")
-        except Exception as e:
-            print(f"Ошибка выдачи ролей on_member_join: {e}")
+        except Exception:
+            logger.exception("Ошибка выдачи стартовых ролей участнику %s.", member.id)
 
         try:
             await send_log_embed(
@@ -656,8 +656,8 @@ class LoggingCog(commands.Cog):
                 _build_goodbye_embed(member),
                 error_label="Ошибка прощания on_member_remove",
             )
-        except Exception as e:
-            print(f"Ошибка on_member_remove: {e}")
+        except Exception:
+            logger.exception("Ошибка прощания on_member_remove для %s.", member.id)
 
         try:
             await send_log_embed(

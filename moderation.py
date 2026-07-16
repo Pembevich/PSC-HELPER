@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import tempfile
@@ -11,9 +12,10 @@ import re
 import subprocess
 import logging
 import unicodedata
+import zipfile
 from collections import defaultdict, deque
 from datetime import timedelta
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlsplit, urlunsplit, unquote
 
 import asyncio
 import aiohttp
@@ -79,6 +81,8 @@ SAFE_PIL_FORMATS = {"JPEG", "PNG", "WEBP", "BMP", "GIF"}
 DANGEROUS_ATTACHMENT_EXTENSIONS = {
     ".exe", ".scr", ".com", ".bat", ".cmd", ".ps1", ".psm1", ".vbs",
     ".vbe", ".wsf", ".wsh", ".hta", ".lnk", ".url", ".reg",
+    ".msi", ".msp", ".dll", ".cpl", ".chm", ".apk", ".appimage",
+    ".dmg", ".pkg", ".iso",
 }
 DANGEROUS_ATTACHMENT_MIME_TYPES = {
     "application/x-msdownload",
@@ -89,7 +93,19 @@ DANGEROUS_ATTACHMENT_MIME_TYPES = {
 MAX_URLS_PER_MESSAGE = 10
 CONTENT_HOST_DOMAINS = {
     "cdn.discordapp.com", "media.discordapp.net", "github.com",
+    "raw.githubusercontent.com", "gist.github.com", "github.io",
     "imgur.com", "i.imgur.com", "reddit.com", "redd.it",
+    "drive.google.com", "docs.google.com", "sites.google.com",
+}
+URL_SHORTENER_DOMAINS = {
+    "bit.ly", "tinyurl.com", "t.co", "cutt.ly", "is.gd", "rb.gy",
+    "shorturl.at", "tiny.one", "rebrand.ly", "buff.ly", "soo.gd",
+}
+TRUSTED_REDIRECT_PATHS = {
+    "google.com": {"/url"},
+    "www.google.com": {"/url"},
+    "youtube.com": {"/redirect"},
+    "www.youtube.com": {"/redirect"},
 }
 _ADULT_GAMBLING_MARKERS = {
     "porn", "xxx", "sex", "adult", "erotic", "onlyfans", "casino", "bet",
@@ -97,13 +113,28 @@ _ADULT_GAMBLING_MARKERS = {
 }
 LOG_EVIDENCE_MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
 LOG_EVIDENCE_MAX_TOTAL_BYTES = 20 * 1024 * 1024
+MAX_ATTACHMENT_INSPECTION_BYTES = 25 * 1024 * 1024
+MAX_ATTACHMENT_INSPECTION_TOTAL_BYTES = 100 * 1024 * 1024
+ATTACHMENT_INSPECTION_TIMEOUT_SECONDS = 20
+MAX_ARCHIVE_MEMBERS = 2000
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = 250 * 1024 * 1024
+_BIDI_URL_CHARS = frozenset("\u202a\u202b\u202d\u202e\u2066\u2067\u2068\u2069")
+_MACHO_MAGICS = {
+    b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+}
 
 _vt_cache: dict[str, tuple[bool, float]] = {}
+_gsb_cache: dict[str, tuple[bool, float]] = {}
+_vt_file_cache: dict[str, tuple[bool, float]] = {}
 _ai_url_cache: dict[str, tuple[str, str, float]] = {}
 
 # #7: Максимальные размеры кэшей — предотвращаем утечку памяти
 _MAX_VT_CACHE_SIZE = 2000
+_MAX_GSB_CACHE_SIZE = 2000
+_MAX_VT_FILE_CACHE_SIZE = 2000
 _MAX_AI_URL_CACHE_SIZE = 2000
+_GSB_SAFE_CACHE_TTL = 10 * 60
 
 # Трекеры спама/флуда ключуются по (guild_id, user_id): раньше ключом был только
 # user_id, и сообщения одного пользователя в РАЗНЫХ серверах складывались вместе —
@@ -159,6 +190,20 @@ def _trim_url_caches() -> None:
         oldest = sorted(_vt_cache, key=lambda k: _vt_cache[k][1])[:_MAX_VT_CACHE_SIZE // 2]
         for key in oldest:
             _vt_cache.pop(key, None)
+    if len(_gsb_cache) > _MAX_GSB_CACHE_SIZE:
+        oldest = sorted(
+            _gsb_cache,
+            key=lambda key: _gsb_cache[key][1],
+        )[:_MAX_GSB_CACHE_SIZE // 2]
+        for key in oldest:
+            _gsb_cache.pop(key, None)
+    if len(_vt_file_cache) > _MAX_VT_FILE_CACHE_SIZE:
+        oldest = sorted(
+            _vt_file_cache,
+            key=lambda key: _vt_file_cache[key][1],
+        )[:_MAX_VT_FILE_CACHE_SIZE // 2]
+        for key in oldest:
+            _vt_file_cache.pop(key, None)
     if len(_ai_url_cache) > _MAX_AI_URL_CACHE_SIZE:
         oldest = sorted(_ai_url_cache, key=lambda k: _ai_url_cache[k][2])[:_MAX_AI_URL_CACHE_SIZE // 2]
         for key in oldest:
@@ -201,11 +246,115 @@ def extract_urls(text: str) -> list[str]:
     return cleaned
 
 
+def _domain_in(domain: str, hosts: set[str]) -> bool:
+    return any(domain == host or domain.endswith("." + host) for host in hosts)
+
+
+def _canonicalize_url(raw_url: str) -> dict[str, object] | None:
+    """Parse a Discord URL without ever connecting to the destination."""
+    raw = (raw_url or "").strip()
+    if not raw:
+        return None
+    signals: list[str] = []
+    if any(character in _BIDI_URL_CHARS or ord(character) < 32 or ord(character) == 127 for character in raw):
+        signals.append("control-or-bidi")
+
+    candidate = raw if raw.lower().startswith(("http://", "https://", "ftp://")) else "http://" + raw
+    try:
+        parsed = urlsplit(candidate)
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https", "ftp"}:
+            return None
+        if scheme == "ftp":
+            signals.append("unsupported-scheme")
+        raw_domain = (parsed.hostname or "").rstrip(".").lower()
+        if not raw_domain:
+            return None
+        if parsed.username is not None or parsed.password is not None:
+            signals.append("userinfo")
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    try:
+        parsed_address = ipaddress.ip_address(raw_domain)
+    except ValueError:
+        parsed_address = None
+    if parsed_address is not None:
+        normalized_domain = parsed_address.compressed.casefold()
+    else:
+        try:
+            normalized_domain = idna.encode(raw_domain, uts46=True).decode("ascii").lower()
+        except Exception:
+            return None
+    if len(normalized_domain) > 253 or any(
+        not label or len(label) > 63
+        for label in normalized_domain.split(".")
+    ):
+        return None
+
+    if any(label.startswith("xn--") for label in normalized_domain.split(".")):
+        signals.append("idn-punycode")
+    address = parsed_address
+    if address is not None:
+        if (
+            address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_unspecified
+            or address.is_multicast
+        ):
+            signals.append("private-network")
+        else:
+            signals.append("ip-literal")
+
+    path = parsed.path or "/"
+    decoded_path = path
+    for _ in range(2):
+        next_path = unquote(decoded_path)
+        if next_path == decoded_path:
+            break
+        decoded_path = next_path
+    path_for_checks = (
+        decoded_path + (f"?{unquote(parsed.query)}" if parsed.query else "")
+    ).casefold()
+    if _domain_in(normalized_domain, URL_SHORTENER_DOMAINS):
+        signals.append("url-shortener")
+    redirect_paths = TRUSTED_REDIRECT_PATHS.get(normalized_domain, set())
+    if any(decoded_path.casefold().rstrip("/") == redirect_path for redirect_path in redirect_paths):
+        signals.append("trusted-open-redirect")
+
+    default_port = (
+        (scheme == "http" and port in {None, 80})
+        or (scheme == "https" and port in {None, 443})
+        or (scheme == "ftp" and port in {None, 21})
+    )
+    if ":" in normalized_domain and address is not None:
+        host_for_url = f"[{normalized_domain}]"
+    else:
+        host_for_url = normalized_domain
+    netloc = host_for_url if default_port else f"{host_for_url}:{port}"
+    canonical = urlunsplit(
+        (scheme, netloc, path, parsed.query, "")
+    )
+    return {
+        "url": canonical,
+        "display_url": raw[:500],
+        "domain": normalized_domain,
+        "path": path_for_checks[:1000],
+        "signals": list(dict.fromkeys(signals)),
+    }
+
+
 def _normalize_domain(raw_domain: str) -> str:
     try:
         domain = raw_domain.split(":")[0].lower()
         try:
-            domain = idna.encode(domain).decode("ascii")
+            domain = idna.encode(domain, uts46=True).decode("ascii")
         except Exception:
             pass
         return domain
@@ -426,9 +575,12 @@ async def _attachment_video_to_data_urls(att: discord.Attachment) -> list[str]:
                 pass
 
 
-async def check_google_safe_browsing(session: aiohttp.ClientSession, url: str) -> bool:
+async def check_google_safe_browsing(
+    session: aiohttp.ClientSession,
+    url: str,
+) -> bool | None:
     if not GOOGLE_SAFEBROWSING_KEY:
-        return False
+        return None
 
     endpoint = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={GOOGLE_SAFEBROWSING_KEY}"
     payload = {
@@ -445,14 +597,32 @@ async def check_google_safe_browsing(session: aiohttp.ClientSession, url: str) -
             endpoint,
             json=payload,
             timeout=aiohttp.ClientTimeout(total=10),
+            allow_redirects=False,
         ) as response:
             if response.status != 200:
-                return False
+                return None
             payload = await response.json()
             return "matches" in payload and bool(payload["matches"])
     except Exception as exc:
-        logger.error(f"GSB error for {url}: {exc}")
-        return False
+        url_hash = hashlib.sha256(url.encode("utf-8", errors="replace")).hexdigest()[:16]
+        logger.warning(
+            "Google Safe Browsing error for url_sha256=%s (%s)",
+            url_hash,
+            type(exc).__name__,
+        )
+        return None
+
+
+def _virustotal_stats_confirm_malicious(stats: object) -> bool | None:
+    if not isinstance(stats, dict) or not stats:
+        return None
+    try:
+        malicious = max(0, int(stats.get("malicious", 0) or 0))
+        suspicious = max(0, int(stats.get("suspicious", 0) or 0))
+    except (TypeError, ValueError):
+        return None
+    # A single outlier engine is not enough for an automatic punishment.
+    return malicious >= 2 or (malicious >= 1 and suspicious >= 2)
 
 
 async def check_virustotal(session: aiohttp.ClientSession, url: str) -> bool | None:
@@ -461,7 +631,7 @@ async def check_virustotal(session: aiohttp.ClientSession, url: str) -> bool | N
 
     headers = {
         "x-apikey": VIRUSTOTAL_KEY,
-        "User-Agent": "PSC-HELPER/2026.04",
+        "User-Agent": "PSC-HELPER/0.8.1.1",
     }
     try:
         # Query the last completed URL analysis. Submitting and immediately
@@ -472,6 +642,7 @@ async def check_virustotal(session: aiohttp.ClientSession, url: str) -> bool | N
             f"https://www.virustotal.com/api/v3/urls/{url_id}",
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=15),
+            allow_redirects=False,
         ) as response:
             if response.status == 404:
                 return None
@@ -479,11 +650,42 @@ async def check_virustotal(session: aiohttp.ClientSession, url: str) -> bool | N
                 return None
             payload = await response.json()
             stats = payload.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
-            if not isinstance(stats, dict) or not stats:
-                return None
-            return (stats.get("malicious", 0) + stats.get("suspicious", 0)) > 0
+            return _virustotal_stats_confirm_malicious(stats)
     except Exception as exc:
-        logger.error(f"Ошибка VirusTotal: {exc}")
+        url_hash = hashlib.sha256(url.encode("utf-8", errors="replace")).hexdigest()[:16]
+        logger.warning("VirusTotal URL lookup failed for url_sha256=%s: %s", url_hash, exc)
+        return None
+
+
+async def check_virustotal_file_hash(
+    session: aiohttp.ClientSession,
+    sha256: str,
+) -> bool | None:
+    if not VIRUSTOTAL_KEY or not re.fullmatch(r"[0-9a-f]{64}", sha256 or ""):
+        return None
+    cached = _vt_file_cache.get(sha256)
+    if cached and time.time() - cached[1] < _VT_CACHE_TTL:
+        return cached[0]
+    try:
+        async with session.get(
+            f"https://www.virustotal.com/api/v3/files/{sha256}",
+            headers={"x-apikey": VIRUSTOTAL_KEY, "User-Agent": "PSC-HELPER/0.8.1.1"},
+            timeout=aiohttp.ClientTimeout(total=15),
+            allow_redirects=False,
+        ) as response:
+            if response.status == 404:
+                return None
+            if response.status != 200:
+                return None
+            payload = await response.json()
+            verdict = _virustotal_stats_confirm_malicious(
+                payload.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+            )
+            if verdict is not None:
+                _vt_file_cache[sha256] = (verdict, time.time())
+            return verdict
+    except Exception as exc:
+        logger.warning("VirusTotal file lookup failed for sha256=%s: %s", sha256[:16], exc)
         return None
 
 
@@ -605,10 +807,12 @@ def _detect_dangerous_attachment_files(
     reasons: list[str] = []
     for attachment in attachments:
         raw_name = str(attachment.filename or "")
-        normalized_name = unicodedata.normalize("NFKC", raw_name).lower()
+        # Windows strips trailing dots/spaces when materializing a filename.
+        # Normalize the same way so `payload.exe. ` is still recognized.
+        normalized_name = unicodedata.normalize("NFKC", raw_name).casefold().rstrip(" .")
         extension = os.path.splitext(normalized_name)[1]
         content_type = str(attachment.content_type or "").lower().split(";", 1)[0].strip()
-        if any(marker in raw_name for marker in ("\u202a", "\u202b", "\u202d", "\u202e", "\u2066", "\u2067", "\u2068")):
+        if any(marker in raw_name for marker in _BIDI_URL_CHARS):
             reasons.append(f"Опасный-файл: bidi-маскировка имени `{raw_name[:180]}`")
             continue
         if extension in DANGEROUS_ATTACHMENT_EXTENSIONS:
@@ -619,6 +823,154 @@ def _detect_dangerous_attachment_files(
                 f"Опасный-файл: исполняемый MIME `{content_type}` у `{raw_name[:180]}`"
             )
     return reasons
+
+
+def _inspect_archive_bytes(data: bytes, file_name: str) -> list[str]:
+    reasons: list[str] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            members = archive.infolist()
+            if len(members) > MAX_ARCHIVE_MEMBERS:
+                return [f"Опасный-файл: слишком много объектов в архиве `{file_name[:180]}`"]
+            total_uncompressed = sum(max(0, int(member.file_size)) for member in members)
+            if total_uncompressed > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+                return [f"Опасный-файл: архивная бомба `{file_name[:180]}`"]
+            for member in members:
+                member_name = unicodedata.normalize("NFKC", member.filename).replace("\\", "/")
+                parts: list[str] = []
+                for raw_part in member_name.split("/"):
+                    part = raw_part.rstrip(" ")
+                    if part not in {".", ".."}:
+                        part = part.rstrip(".")
+                    if part not in {"", "."}:
+                        parts.append(part)
+                if member_name.startswith("/") or ".." in parts:
+                    reasons.append(
+                        f"Опасный-файл: обход пути внутри архива `{file_name[:180]}`"
+                    )
+                    break
+                normalized_member_name = "/".join(parts).casefold()
+                member_extension = os.path.splitext(normalized_member_name)[1]
+                if member_extension in DANGEROUS_ATTACHMENT_EXTENSIONS:
+                    reasons.append(
+                        f"Опасный-файл: исполняемый объект `{member_name[:140]}` "
+                        f"в архиве `{file_name[:120]}`"
+                    )
+                    break
+                if normalized_member_name.endswith("vbaproject.bin"):
+                    reasons.append(
+                        f"Опасный-файл: макросы VBA в `{file_name[:180]}`"
+                    )
+                    break
+                if member.compress_size > 0 and member.file_size > 10 * 1024 * 1024:
+                    if member.file_size / member.compress_size > 200:
+                        reasons.append(
+                            f"Опасный-файл: аномальное сжатие в `{file_name[:180]}`"
+                        )
+                        break
+    except (OSError, ValueError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        return []
+    return reasons
+
+
+def _inspect_attachment_bytes(data: bytes, file_name: str) -> list[str]:
+    if not data:
+        return []
+    lower_name = unicodedata.normalize("NFKC", file_name or "").casefold().rstrip(" .")
+    reasons: list[str] = []
+    if data.startswith(b"MZ"):
+        reasons.append(f"Опасный-файл: PE/Windows executable `{file_name[:180]}`")
+    elif data.startswith(b"\x7fELF"):
+        reasons.append(f"Опасный-файл: ELF executable `{file_name[:180]}`")
+    elif data[:4] in _MACHO_MAGICS:
+        reasons.append(f"Опасный-файл: Mach-O executable `{file_name[:180]}`")
+    elif data.startswith(b"L\x00\x00\x00\x01\x14\x02\x00"):
+        reasons.append(f"Опасный-файл: Windows shortcut `{file_name[:180]}`")
+
+    if zipfile.is_zipfile(io.BytesIO(data)):
+        reasons.extend(_inspect_archive_bytes(data, file_name))
+    elif lower_name.endswith((".zip", ".docx", ".xlsx", ".pptx")):
+        reasons.append(f"Опасный-файл: повреждённый или подменённый ZIP-контейнер `{file_name[:180]}`")
+    return list(dict.fromkeys(reasons))
+
+
+def _attachment_needs_hash_reputation(attachment: discord.Attachment, data: bytes) -> bool:
+    name = unicodedata.normalize("NFKC", attachment.filename or "").casefold().rstrip(" .")
+    extension = os.path.splitext(name)[1]
+    content_type = str(attachment.content_type or "").casefold().split(";", 1)[0].strip()
+    return bool(
+        data.startswith((b"MZ", b"\x7fELF"))
+        or data[:4] in _MACHO_MAGICS
+        or extension in {
+            ".zip", ".rar", ".7z", ".doc", ".docx", ".docm", ".xls", ".xlsx",
+            ".xlsm", ".ppt", ".pptx", ".pptm", ".pdf", ".jar", ".apk",
+        }
+        or content_type in {"application/octet-stream", "application/zip"}
+    )
+
+
+def _attachment_content_priority(attachment: discord.Attachment) -> int:
+    name = unicodedata.normalize("NFKC", attachment.filename or "").casefold().rstrip(" .")
+    extension = os.path.splitext(name)[1]
+    content_type = str(attachment.content_type or "").casefold().split(";", 1)[0].strip()
+    if extension in DANGEROUS_ATTACHMENT_EXTENSIONS or content_type in DANGEROUS_ATTACHMENT_MIME_TYPES:
+        return 0
+    if extension in {
+        ".zip", ".rar", ".7z", ".jar", ".doc", ".docx", ".docm",
+        ".xls", ".xlsx", ".xlsm", ".ppt", ".pptx", ".pptm", ".pdf",
+    } or content_type in {"application/octet-stream", "application/zip"}:
+        return 1
+    if content_type.startswith(("image/", "video/")):
+        return 3
+    return 2
+
+
+async def _detect_dangerous_attachment_content(
+    attachments: list[discord.Attachment],
+) -> list[str]:
+    reasons: list[str] = []
+    session: aiohttp.ClientSession | None = None
+    try:
+        if VIRUSTOTAL_KEY:
+            session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+        inspection_budget = MAX_ATTACHMENT_INSPECTION_TOTAL_BYTES
+        candidates = sorted(attachments, key=_attachment_content_priority)
+        for attachment in candidates:
+            size = int(attachment.size or 0)
+            if size <= 0 or size > MAX_ATTACHMENT_INSPECTION_BYTES:
+                continue
+            if size > inspection_budget:
+                continue
+            inspection_budget -= size
+            try:
+                data = await asyncio.wait_for(
+                    attachment.read(use_cached=True),
+                    timeout=ATTACHMENT_INSPECTION_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Не удалось прочитать вложение %s (%s).",
+                    getattr(attachment, "id", "unknown"),
+                    type(exc).__name__,
+                )
+                continue
+            if len(data) > MAX_ATTACHMENT_INSPECTION_BYTES:
+                continue
+            if len(data) > size:
+                inspection_budget = max(0, inspection_budget - (len(data) - size))
+            file_name = str(attachment.filename or "attachment")
+            reasons.extend(_inspect_attachment_bytes(data, file_name))
+            if session is not None and _attachment_needs_hash_reputation(attachment, data):
+                digest = hashlib.sha256(data).hexdigest()
+                if await check_virustotal_file_hash(session, digest):
+                    reasons.append(
+                        f"Опасный-файл: VirusTotal подтвердил вредоносный SHA-256 "
+                        f"для `{file_name[:160]}`"
+                    )
+    finally:
+        if session is not None:
+            await session.close()
+    return list(dict.fromkeys(reasons))
 
 
 async def _classify_media_with_ai(
@@ -784,27 +1136,34 @@ async def check_and_handle_urls(
 
     async with aiohttp.ClientSession() as session:
         for url in urls:
-            try:
-                normalized_url = url if url.lower().startswith(("http://", "https://")) else "http://" + url
-                parsed = urlparse(normalized_url)
-                domain = (parsed.hostname or parsed.netloc or "").lower()
-                if not domain or len(domain) > 253 or any(len(label) > 63 for label in domain.split(".")):
-                    continue
-                path = (parsed.path or "") + (f"?{parsed.query}" if parsed.query else "")
-                path_decoded = unquote(path).lower()
-            except Exception:
+            parsed_url = _canonicalize_url(url)
+            if parsed_url is None:
                 continue
-
-            normalized_domain = _normalize_domain(domain)
-            is_content_host = any(
-                normalized_domain == host or normalized_domain.endswith("." + host)
-                for host in CONTENT_HOST_DOMAINS
+            normalized_url = str(parsed_url["url"])
+            normalized_domain = str(parsed_url["domain"])
+            path_decoded = str(parsed_url["path"])
+            raw_signals = parsed_url.get("signals", [])
+            risk_signals = (
+                [str(value) for value in raw_signals]
+                if isinstance(raw_signals, list)
+                else []
             )
-            if _domain_matches_whitelist(domain) and not is_content_host:
+
+            hard_deception = [
+                signal for signal in risk_signals
+                if signal in {"control-or-bidi", "userinfo", "unsupported-scheme"}
+            ]
+            if check_scam and hard_deception:
+                suspicious.append((url, "deceptive-url:" + ",".join(hard_deception)))
                 continue
 
-            if _domain_matches_blacklist(domain):
-                is_ad = _is_advertising_or_adult_url(domain, path_decoded)
+            is_content_host = _domain_in(normalized_domain, CONTENT_HOST_DOMAINS)
+            needs_reputation_review = bool(risk_signals) or is_content_host
+            if _domain_matches_whitelist(normalized_domain) and not needs_reputation_review:
+                continue
+
+            if _domain_matches_blacklist(normalized_domain):
+                is_ad = _is_advertising_or_adult_url(normalized_domain, path_decoded)
                 if (is_ad and check_ads) or (not is_ad and check_scam):
                     suspicious.append((url, "local-domain/keyword"))
                 continue
@@ -815,34 +1174,54 @@ async def check_and_handle_urls(
                 borderline.append(
                     {
                         "url": url,
-                        "domain": _normalize_domain(domain),
+                        "domain": normalized_domain,
                         "path_keywords": path_keywords,
                         "path": path_decoded[:300],
                         "high_risk_path": high_risk_path,
+                        "risk_signals": risk_signals,
+                    }
+                )
+            elif check_scam and risk_signals:
+                borderline.append(
+                    {
+                        "url": url,
+                        "domain": normalized_domain,
+                        "path_keywords": path_keywords,
+                        "path": path_decoded[:300],
+                        "high_risk_path": False,
+                        "risk_signals": risk_signals,
                     }
                 )
 
             if not check_scam:
                 continue
 
-            cached = _vt_cache.get(url)
-            if cached and (time.time() - cached[1]) < _VT_CACHE_TTL:
+            now = time.time()
+            gsb_bad: bool | None = None
+            if GOOGLE_SAFEBROWSING_KEY:
+                gsb_cached = _gsb_cache.get(normalized_url)
+                if gsb_cached:
+                    gsb_ttl = _VT_CACHE_TTL if gsb_cached[0] else _GSB_SAFE_CACHE_TTL
+                    if now - gsb_cached[1] < gsb_ttl:
+                        gsb_bad = gsb_cached[0]
+                if gsb_bad is None:
+                    gsb_bad = await check_google_safe_browsing(session, normalized_url)
+                    if gsb_bad is not None:
+                        _gsb_cache[normalized_url] = (gsb_bad, now)
+                if gsb_bad:
+                    suspicious.append((url, "GoogleSafeBrowsing"))
+                    continue
+
+            cached = _vt_cache.get(normalized_url)
+            if cached and (now - cached[1]) < _VT_CACHE_TTL:
                 if cached[0]:
                     suspicious.append((url, "vt-cache"))
                 continue
 
             try:
-                if await check_google_safe_browsing(session, normalized_url):
-                    suspicious.append((url, "GoogleSafeBrowsing"))
-                    _vt_cache[url] = (True, time.time())
-                    continue
-            except Exception as exc:
-                logger.error(f"GSB check error: {exc}")
-
-            try:
                 vt_bad = await check_virustotal(session, normalized_url)
                 if vt_bad is not None:
-                    _vt_cache[url] = (vt_bad, time.time())
+                    _vt_cache[normalized_url] = (vt_bad, now)
                 if vt_bad:
                     suspicious.append((url, "VirusTotal"))
             except Exception as exc:
@@ -1320,6 +1699,7 @@ async def detect_attachment_violations(
 ):
     attachment_list = list(attachments)
     dangerous_file_reasons = _detect_dangerous_attachment_files(attachment_list)
+    dangerous_content_reasons = await _detect_dangerous_attachment_content(attachment_list)
     metadata_flags = _detect_attachment_metadata_flags(
         attachment_list,
         check_nsfw=check_nsfw,
@@ -1340,8 +1720,8 @@ async def detect_attachment_violations(
         else {}
     )
 
-    reasons: list[str] = list(dangerous_file_reasons)
-    already_added = set(dangerous_file_reasons)
+    reasons: list[str] = list(dict.fromkeys(dangerous_file_reasons + dangerous_content_reasons))
+    already_added = set(reasons)
 
     metadata_attachment_keys: set[int] = set()
     for attachment_key, file_name, reason in metadata_flags:
@@ -1412,7 +1792,11 @@ async def _delete_spam_messages(channel: object, message_ids: list[int]) -> int:
     return 0
 
 
-async def handle_spam_if_needed(message: discord.Message):
+async def handle_spam_if_needed(
+    message: discord.Message,
+    *,
+    in_raid: bool = False,
+):
     user_id = message.author.id
     member = message.author if isinstance(message.author, discord.Member) else None
     now = time.time()
@@ -1433,6 +1817,10 @@ async def handle_spam_if_needed(message: discord.Message):
     flood_window = int(settings.get("flood_window_seconds", FLOOD_WINDOW_SECONDS) or FLOOD_WINDOW_SECONDS)
     flood_threshold = int(settings.get("flood_messages_threshold", FLOOD_MESSAGES_THRESHOLD) or FLOOD_MESSAGES_THRESHOLD)
     crosschannel_window = int(settings.get("crosschannel_window_seconds", 15) or 15)
+    if in_raid:
+        spam_threshold = min(spam_threshold, 2)
+        flood_threshold = min(flood_threshold, 4)
+        flood_window = max(flood_window, 8)
 
     tracker_key = (guild_id, user_id)
     key = message_key_for_spam(message)

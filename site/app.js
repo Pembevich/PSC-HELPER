@@ -3,6 +3,26 @@ const STORAGE_KEYS = {
   theme: "pos-theme",
 };
 
+const storage = {
+  get(key) {
+    try {
+      return localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  },
+  set(key, value) {
+    try {
+      localStorage.setItem(key, value);
+    } catch {}
+  },
+  remove(key) {
+    try {
+      localStorage.removeItem(key);
+    } catch {}
+  },
+};
+
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 const finePointer = window.matchMedia("(pointer: fine)");
 const systemTheme = window.matchMedia("(prefers-color-scheme: light)");
@@ -60,7 +80,7 @@ const translations = {
     promptRaid: "Проверь всплеск входов",
     creatorLabel: "Пумба",
     ecosystemTitle: "Сервер как единая система",
-    ecosystemText: "P.OS связывает разговор, состояние Discord и подтверждённые действия в один понятный процесс.",
+    ecosystemText: "P.OS связывает разговор, состояние Discord и проверенные действия в один понятный процесс.",
     ecosystemAria: "Экосистема P.OS",
     logoAlt: "Графический знак P.OS",
     nodeUsers: "Участники",
@@ -84,7 +104,7 @@ const translations = {
     layerAiText: "Текст и медиа получают дополнительную оценку без слепого наказания.",
     layerContext: "По контексту",
     layerAuthority: "Полномочия",
-    layerAuthorityText: "Права, иерархия и подтверждение проверяются вне модели.",
+    layerAuthorityText: "ID инициатора, права и иерархия проверяются кодом вне модели.",
     layerVerified: "Проверено",
     operatorTitle: "Управление словами",
     operatorText: "От участника до структуры сервера: P.OS превращает запрос в проверяемый план действий.",
@@ -95,8 +115,8 @@ const translations = {
     stepResolveText: "Пользователь, роль или канал сопоставляются с объектом Discord.",
     stepCheck: "Проверить возможность",
     stepCheckText: "P.OS сверяет права, иерархию и защищённые цели.",
-    stepConfirm: "Подтвердить изменение",
-    stepConfirmText: "Критичное действие не выполняется только на слове модели.",
+    stepConfirm: "Проверить полномочия",
+    stepConfirmText: "Запрос владельца исполняется после кодовых проверок; остальные ждут его решения.",
     stepRecord: "Записать результат",
     stepRecordText: "Успех или отказ остаются в журнале действий.",
     memoryTitle: "Факты не исчезают вместе с сообщением",
@@ -184,7 +204,7 @@ const translations = {
     promptRaid: "Check the join spike",
     creatorLabel: "Pumba",
     ecosystemTitle: "A server as one system",
-    ecosystemText: "P.OS connects conversation, Discord state and confirmed actions into one understandable process.",
+    ecosystemText: "P.OS connects conversation, Discord state and verified actions into one understandable process.",
     ecosystemAria: "P.OS ecosystem",
     logoAlt: "P.OS graphic mark",
     nodeUsers: "Members",
@@ -208,7 +228,7 @@ const translations = {
     layerAiText: "Text and media receive additional review without blind punishment.",
     layerContext: "Contextual",
     layerAuthority: "Authority",
-    layerAuthorityText: "Permissions, hierarchy and confirmation are enforced outside the model.",
+    layerAuthorityText: "The initiator ID, permissions and hierarchy are enforced in code outside the model.",
     layerVerified: "Verified",
     operatorTitle: "Control in natural language",
     operatorText: "From a member to server structure, P.OS turns a request into a verifiable action plan.",
@@ -219,8 +239,8 @@ const translations = {
     stepResolveText: "A member, role or channel is resolved to a Discord object.",
     stepCheck: "Check feasibility",
     stepCheckText: "P.OS verifies permissions, hierarchy and protected targets.",
-    stepConfirm: "Confirm the change",
-    stepConfirmText: "A critical action never runs on the model's word alone.",
+    stepConfirm: "Verify authority",
+    stepConfirmText: "Owner requests run after code checks; requests from others wait for the owner's decision.",
     stepRecord: "Record the result",
     stepRecordText: "Success or refusal remains in the action journal.",
     memoryTitle: "Facts survive a deleted message",
@@ -282,12 +302,12 @@ const consoleModes = {
     },
     operator: {
       command: "operator.plan --verified",
-      title: "ACTION STAGED",
-      summary: "Цель определена. До изменения сервер проверит права и подтверждение.",
+      title: "ACTION VERIFIED",
+      summary: "Цель и полномочия проверены. Действие готово к исполнению.",
       events: [
         ["01", "green", "Цель разрешена"],
         ["02", "green", "Иерархия проверена"],
-        ["03", "red", "Ожидается подтверждение"],
+        ["03", "green", "Полномочия подтверждены"],
       ],
     },
     memory: {
@@ -324,12 +344,12 @@ const consoleModes = {
     },
     operator: {
       command: "operator.plan --verified",
-      title: "ACTION STAGED",
-      summary: "The target is resolved. Permissions and confirmation come before change.",
+      title: "ACTION VERIFIED",
+      summary: "The target and authority are verified. The action is ready to execute.",
       events: [
         ["01", "green", "Target resolved"],
         ["02", "green", "Hierarchy checked"],
-        ["03", "red", "Confirmation pending"],
+        ["03", "green", "Authority verified"],
       ],
     },
     memory: {
@@ -354,8 +374,8 @@ const dialogueExamples = {
     },
     role: {
       question: "Выдай роль Moderator пользователю north.",
-      answer: "Сначала найду точный логин и роль на сервере, затем проверю иерархию. Изменение потребует подтверждения создателя.",
-      trace: ["цель: найти", "иерархия: проверить", "изменение: подтвердить"],
+      answer: "Сначала найду точный логин и роль, затем проверю права и иерархию. После кодовой проверки действие будет выполнено и записано в журнал.",
+      trace: ["цель: найти", "иерархия: проверить", "полномочия: владелец"],
     },
     raid: {
       question: "Проверь, не начался ли рейд после всплеска входов.",
@@ -371,8 +391,8 @@ const dialogueExamples = {
     },
     role: {
       question: "Assign Moderator to the user north.",
-      answer: "I will resolve the exact login and role on this server, then check hierarchy. The change requires creator confirmation.",
-      trace: ["target: resolve", "hierarchy: verify", "change: confirm"],
+      answer: "I will resolve the exact login and role, then verify permissions and hierarchy. After code checks, the action is executed and recorded.",
+      trace: ["target: resolve", "hierarchy: verify", "authority: owner"],
     },
     raid: {
       question: "Check whether the recent join spike is a raid.",
@@ -394,16 +414,16 @@ const operatorCommands = {
 };
 
 const getInitialLanguage = () => {
-  const stored = localStorage.getItem(STORAGE_KEYS.language);
+  const stored = storage.get(STORAGE_KEYS.language);
   if (stored === "ru" || stored === "en") return stored;
   const browserLanguage = (navigator.languages?.[0] || navigator.language || "en").toLowerCase();
   return browserLanguage.startsWith("ru") ? "ru" : "en";
 };
 
 const getStoredTheme = () => {
-  const stored = localStorage.getItem(STORAGE_KEYS.theme);
+  const stored = storage.get(STORAGE_KEYS.theme);
   if (stored === "light" || stored === "dark") return stored;
-  if (stored !== null) localStorage.removeItem(STORAGE_KEYS.theme);
+  if (stored !== null) storage.remove(STORAGE_KEYS.theme);
   return null;
 };
 
@@ -451,6 +471,7 @@ const renderConsole = () => {
     const selected = button.dataset.consoleMode === activeConsoleMode;
     button.classList.toggle("active", selected);
     button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
   });
 };
 
@@ -475,6 +496,7 @@ const renderDialogue = () => {
     const selected = button.dataset.promptExample === activeDialogueExample;
     button.classList.toggle("active", selected);
     button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
   });
 };
 
@@ -485,6 +507,7 @@ const renderOperator = () => {
     const selected = button.dataset.scope === activeScope;
     button.classList.toggle("active", selected);
     button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
   });
 };
 
@@ -607,7 +630,10 @@ const initNavigation = () => {
         .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
       if (!visible) return;
       links.forEach((link) => {
-        link.classList.toggle("is-active", link.getAttribute("href") === `#${visible.target.id}`);
+        const active = link.getAttribute("href") === `#${visible.target.id}`;
+        link.classList.toggle("is-active", active);
+        if (active) link.setAttribute("aria-current", "location");
+        else link.removeAttribute("aria-current");
       });
     },
     { rootMargin: "-28% 0px -58% 0px", threshold: [0.01, 0.2, 0.5] }
@@ -688,10 +714,33 @@ const initTilt = () => {
   });
 };
 
+const initTabKeyboard = () => {
+  document.querySelectorAll('[role="tablist"]').forEach((tablist) => {
+    tablist.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      const tabs = [...tablist.querySelectorAll('[role="tab"]')].filter(
+        (tab) => !tab.disabled
+      );
+      if (!tabs.length) return;
+      const currentIndex = Math.max(0, tabs.indexOf(document.activeElement));
+      let nextIndex = currentIndex;
+      if (event.key === "Home") nextIndex = 0;
+      if (event.key === "End") nextIndex = tabs.length - 1;
+      if (event.key === "ArrowRight") nextIndex = (currentIndex + 1) % tabs.length;
+      if (event.key === "ArrowLeft") nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+      event.preventDefault();
+      tabs[nextIndex].focus();
+      tabs[nextIndex].click();
+    });
+  });
+};
+
 document.querySelectorAll("[data-lang-choice]").forEach((button) => {
   button.addEventListener("click", () => {
-    currentLanguage = button.dataset.langChoice;
-    localStorage.setItem(STORAGE_KEYS.language, currentLanguage);
+    const language = button.dataset.langChoice;
+    if (language !== "ru" && language !== "en") return;
+    currentLanguage = language;
+    storage.set(STORAGE_KEYS.language, currentLanguage);
     applyTranslations();
   });
 });
@@ -700,28 +749,34 @@ document.querySelectorAll("[data-theme-choice]").forEach((button) => {
   button.addEventListener("click", () => {
     const preference = button.dataset.themeChoice;
     if (preference !== "dark" && preference !== "light") return;
-    localStorage.setItem(STORAGE_KEYS.theme, preference);
+    storage.set(STORAGE_KEYS.theme, preference);
     applyTheme(preference);
   });
 });
 
 document.querySelectorAll("[data-console-mode]").forEach((button) => {
   button.addEventListener("click", () => {
-    activeConsoleMode = button.dataset.consoleMode;
+    const mode = button.dataset.consoleMode;
+    if (!mode || !(mode in consoleModes[currentLanguage])) return;
+    activeConsoleMode = mode;
     renderConsole();
   });
 });
 
 document.querySelectorAll("[data-prompt-example]").forEach((button) => {
   button.addEventListener("click", () => {
-    activeDialogueExample = button.dataset.promptExample;
+    const example = button.dataset.promptExample;
+    if (!example || !(example in dialogueExamples[currentLanguage])) return;
+    activeDialogueExample = example;
     renderDialogue();
   });
 });
 
 document.querySelectorAll("[data-scope]").forEach((button) => {
   button.addEventListener("click", () => {
-    activeScope = button.dataset.scope;
+    const scope = button.dataset.scope;
+    if (!scope || !(scope in operatorCommands[currentLanguage])) return;
+    activeScope = scope;
     renderOperator();
   });
 });
@@ -732,9 +787,14 @@ document.querySelector("[data-evidence-toggle]")?.addEventListener("click", (eve
   event.currentTarget.setAttribute("aria-expanded", String(!collapsed));
 });
 
-systemTheme.addEventListener("change", () => {
+const handleSystemThemeChange = () => {
   if (currentThemePreference === null) applyTheme();
-});
+};
+if (typeof systemTheme.addEventListener === "function") {
+  systemTheme.addEventListener("change", handleSystemThemeChange);
+} else if (typeof systemTheme.addListener === "function") {
+  systemTheme.addListener(handleSystemThemeChange);
+}
 
 window.addEventListener("scroll", updateHeader, { passive: true });
 
@@ -747,3 +807,4 @@ initNavigation();
 initCursor();
 initMagnetic();
 initTilt();
+initTabKeyboard();

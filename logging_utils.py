@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
+from typing import Dict, List, TypedDict
+
 import discord
 from discord import Embed, Color
-from typing import Dict, List, TypedDict
 
 from config import LOG_CATEGORY_ID, LOG_CATEGORY_NAME, PRIMARY_LOG_CHANNEL_ID
 
+logger = logging.getLogger(__name__)
 
 class LogChannelConfig(TypedDict):
     key: str
@@ -248,13 +251,15 @@ async def setup_guild_logging(
                 reason="P.OS: разворачивание системы логов по запросу",
             )
             created_category = True
-        except Exception as exc:
-            return False, f"Не смог создать категорию логов: {exc}"
+        except Exception:
+            logger.exception("Не удалось создать категорию логов на сервере %s.", guild.id)
+            return False, "Не смог создать категорию логов: Discord отклонил операцию."
     else:
         try:
             await category.edit(overwrites=overwrites, reason="P.OS: обновление прав категории логов")
-        except Exception as exc:
-            return False, f"Не смог закрыть существующую категорию логов от обычных участников: {exc}"
+        except Exception:
+            logger.exception("Не удалось обновить права категории логов на сервере %s.", guild.id)
+            return False, "Не смог закрыть категорию логов от обычных участников: Discord отклонил операцию."
 
     created_channels: list[str] = []
     existing_channels = 0
@@ -332,7 +337,19 @@ def get_log_channel(guild: discord.Guild | None, log_type: str = "server") -> di
 
 
 def is_log_channel(channel: object) -> bool:
-    if not channel or not isinstance(channel, discord.TextChannel):
+    if not channel:
+        return False
+    if isinstance(channel, discord.Thread):
+        parent = channel.parent
+        if parent is None:
+            return False
+        if PRIMARY_LOG_CHANNEL_ID and parent.id == PRIMARY_LOG_CHANNEL_ID:
+            return True
+        if is_log_category(getattr(parent, "category", None)):
+            return True
+        cache = _LOG_CHANNEL_CACHE.get(channel.guild.id, {})
+        return parent.id in cache.values()
+    if not isinstance(channel, discord.TextChannel):
         return False
     if PRIMARY_LOG_CHANNEL_ID and channel.id == PRIMARY_LOG_CHANNEL_ID:
         return True
@@ -340,6 +357,56 @@ def is_log_channel(channel: object) -> bool:
         return True
     cache = _LOG_CHANNEL_CACHE.get(channel.guild.id, {})
     return channel.id in cache.values()
+
+
+def _truncate_log_text(value: object, limit: int, fallback: str = "") -> str:
+    text = str(value or "").strip() or fallback
+    return text[:max(0, limit)]
+
+
+def _build_log_embed(
+    log_type: str,
+    title: str,
+    description: str,
+    *,
+    color: Color,
+    fields: list[tuple[str, str, bool]] | None,
+    footer: str | None,
+) -> Embed:
+    """Build an embed that always respects Discord's per-part and 6000-char limits."""
+    label = LOG_TYPE_LABELS.get(log_type, "Логи")
+    author_text = _truncate_log_text(f"P.S.C Logs • {label}", 256, "P.S.C Logs")
+    title_text = _truncate_log_text(title, 256, "Журнал P.OS")
+    footer_text = _truncate_log_text(footer or label, 2048, label)
+    total_budget = 6000 - len(author_text) - len(title_text) - len(footer_text)
+
+    description_limit = 3500 if fields else 4096
+    description_text = _truncate_log_text(
+        description,
+        min(description_limit, max(0, total_budget)),
+    )
+    total_budget -= len(description_text)
+
+    emb = Embed(
+        title=title_text,
+        description=description_text or None,
+        color=color,
+        timestamp=discord.utils.utcnow(),
+    )
+    for raw_name, raw_value, inline in (fields or [])[:25]:
+        if total_budget < 2:
+            break
+        name = _truncate_log_text(raw_name, min(256, total_budget - 1), "—")
+        value_budget = min(1024, total_budget - len(name))
+        if value_budget < 1:
+            break
+        value = _truncate_log_text(raw_value, value_budget, "—")
+        emb.add_field(name=name, value=value, inline=bool(inline))
+        total_budget -= len(name) + len(value)
+
+    emb.set_footer(text=footer_text)
+    emb.set_author(name=author_text)
+    return emb
 
 
 async def send_log_embed(
@@ -370,28 +437,37 @@ async def send_log_embed(
                 },
             )
         except Exception:
-            pass
+            logger.exception("Не удалось сохранить log:%s в SQLite для сервера %s.", log_type, guild.id)
 
     channel = get_log_channel(guild, log_type)
     if not channel:
         return False
 
-    emb = Embed(title=title, description=(description or "")[:4000], color=color, timestamp=discord.utils.utcnow())
-    if fields:
-        for name, value, inline in fields:
-            emb.add_field(name=name, value=(value or "")[:1024], inline=inline)
-    if footer:
-        footer_text = footer[:2048]
-    else:
-        footer_text = LOG_TYPE_LABELS.get(log_type, "Логи")
-    emb.set_footer(text=footer_text)
-    emb.set_author(name=f"P.S.C Logs • {LOG_TYPE_LABELS.get(log_type, 'Логи')}")
+    emb = _build_log_embed(
+        log_type,
+        title,
+        description,
+        color=color,
+        fields=fields,
+        footer=footer,
+    )
 
     try:
         if files:
-            await channel.send(embed=emb, files=files, allowed_mentions=discord.AllowedMentions.none())
+            await channel.send(
+                embed=emb,
+                files=files[:10],
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
         else:
             await channel.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
         return True
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "Не удалось доставить log:%s в канал %s сервера %s (%s).",
+            log_type,
+            channel.id,
+            guild.id if guild else 0,
+            type(exc).__name__,
+        )
         return False

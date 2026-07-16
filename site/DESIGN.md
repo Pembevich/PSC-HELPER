@@ -1,5 +1,5 @@
 ---
-version: "0.8.1"
+version: "0.8.1.1"
 name: P.OS Public Site
 description: A precise graphite product showcase for the P.OS Discord operating system, with restrained motion, signal-red interaction, authored gold identity details, and factual interface demonstrations.
 colors:

@@ -12,8 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.11"
           cache: pip
@@ -24,12 +24,14 @@ jobs:
       - name: Audit dependencies
         run: python -m pip_audit -r requirements.txt
       - name: Compile production modules
-        run: python -m compileall -q main.py ai_client.py antiraid.py commands.py config.py forms.py guild_config.py join_gate.py logging_utils.py message_gate.py moderation.py pos_ai.py storage.py utils.py cogs
+        run: python -m compileall -q main.py ai_client.py antiraid.py commands.py config.py forms.py guild_config.py join_gate.py logging_utils.py message_gate.py moderation.py pos_ai.py security_monitor.py storage.py utils.py cogs
       - name: Lint
-        run: python -m ruff check main.py ai_client.py antiraid.py commands.py config.py forms.py guild_config.py join_gate.py logging_utils.py message_gate.py moderation.py pos_ai.py storage.py utils.py cogs tests
+        run: python -m ruff check main.py ai_client.py antiraid.py commands.py config.py forms.py guild_config.py join_gate.py logging_utils.py message_gate.py moderation.py pos_ai.py security_monitor.py storage.py utils.py cogs tests
       - name: Type check
         run: python -m mypy .
+      - name: Check website JavaScript
+        run: node --check site/app.js
       - name: Security scan
-        run: python -m bandit -q -ll -r main.py ai_client.py antiraid.py commands.py config.py forms.py guild_config.py join_gate.py logging_utils.py message_gate.py moderation.py pos_ai.py storage.py utils.py cogs
+        run: python -m bandit -q -ll -r main.py ai_client.py antiraid.py commands.py config.py forms.py guild_config.py join_gate.py logging_utils.py message_gate.py moderation.py pos_ai.py security_monitor.py storage.py utils.py cogs
       - name: Run tests
         run: python -m pytest -q

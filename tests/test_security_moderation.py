@@ -1,5 +1,7 @@
+import io
 import time
 import unittest
+import zipfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -140,12 +142,141 @@ class ContentPrecisionTests(unittest.TestCase):
         findings = moderation._detect_dangerous_attachment_files([attachment])
         self.assertTrue(any("bidi" in finding for finding in findings))
 
+    def test_bidi_pop_directional_isolate_is_blocked(self):
+        attachment = SimpleNamespace(
+            filename="photo.png\u2069.exe",
+            content_type="application/octet-stream",
+        )
+        findings = moderation._detect_dangerous_attachment_files([attachment])
+        self.assertTrue(any("bidi" in finding for finding in findings))
+
+    def test_windows_trailing_dots_do_not_hide_executable_extension(self):
+        attachment = SimpleNamespace(
+            filename="invoice.pdf.exe. ",
+            content_type="application/octet-stream",
+        )
+        findings = moderation._detect_dangerous_attachment_files([attachment])
+        self.assertTrue(any("исполняемое вложение" in finding for finding in findings))
+
+    def test_url_canonicalization_detects_deceptive_authority(self):
+        parsed = moderation._canonicalize_url(
+            "https://discord.com@evil.example/login#discord.com"
+        )
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["domain"], "evil.example")
+        self.assertIn("userinfo", parsed["signals"])
+        self.assertNotIn("#", parsed["url"])
+
+    def test_url_canonicalization_marks_private_idn_and_redirects(self):
+        private_url = moderation._canonicalize_url("http://127.0.0.1/admin")
+        self.assertIn("private-network", private_url["signals"])
+
+        idn_url = moderation._canonicalize_url("https://аррӏе.com/login")
+        self.assertIn("idn-punycode", idn_url["signals"])
+
+        redirect_url = moderation._canonicalize_url(
+            "https://www.google.com/url?q=https%3A%2F%2Fevil.example"
+        )
+        self.assertIn("trusted-open-redirect", redirect_url["signals"])
+
+    def test_magic_bytes_block_renamed_executables(self):
+        findings = moderation._inspect_attachment_bytes(
+            b"MZ" + b"\x00" * 128,
+            "holiday-photo.png",
+        )
+        self.assertTrue(any("PE/Windows" in finding for finding in findings))
+
+    def test_archive_path_traversal_and_executable_are_blocked(self):
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("../../startup/payload.exe", b"MZ")
+        findings = moderation._inspect_attachment_bytes(payload.getvalue(), "docs.zip")
+        self.assertTrue(any("обход пути" in finding for finding in findings))
+
+    def test_normal_document_container_is_not_blocked(self):
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("word/document.xml", "<document>safe</document>")
+        self.assertEqual(
+            moderation._inspect_attachment_bytes(payload.getvalue(), "report.docx"),
+            [],
+        )
+
+    def test_virustotal_requires_corroboration(self):
+        self.assertFalse(
+            moderation._virustotal_stats_confirm_malicious(
+                {"malicious": 1, "suspicious": 0, "harmless": 70}
+            )
+        )
+        self.assertTrue(
+            moderation._virustotal_stats_confirm_malicious(
+                {"malicious": 2, "suspicious": 0, "harmless": 68}
+            )
+        )
+
 
 class AiModerationSafetyTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         moderation._ai_url_cache.clear()
+        moderation._gsb_cache.clear()
+        moderation._vt_cache.clear()
         moderation._ai_text_cache.clear()
         moderation._AI_TEXT_USER_LAST_CHECK.clear()
+
+    async def test_disguised_executable_after_first_four_attachments_is_inspected(self):
+        class Attachment:
+            def __init__(self, identifier, filename, content_type, data):
+                self.id = identifier
+                self.filename = filename
+                self.content_type = content_type
+                self._data = data
+                self.size = len(data)
+
+            async def read(self, *, use_cached=True):
+                return self._data
+
+        attachments = [
+            Attachment(index, f"image-{index}.png", "image/png", b"safe")
+            for index in range(4)
+        ]
+        attachments.append(
+            Attachment(99, "holiday.png", "application/octet-stream", b"MZ" + b"\x00" * 32)
+        )
+        with patch.object(moderation, "VIRUSTOTAL_KEY", None):
+            findings = await moderation._detect_dangerous_attachment_content(attachments)
+        self.assertTrue(any("PE/Windows" in finding for finding in findings))
+
+    async def test_vt_safe_cache_does_not_suppress_google_check(self):
+        url = "https://example.com/hello"
+        moderation._vt_cache[url] = (False, time.time())
+        google_check = AsyncMock(return_value=False)
+        vt_check = AsyncMock(return_value=False)
+
+        with patch.object(moderation, "GOOGLE_SAFEBROWSING_KEY", "test-key"), patch.object(
+            moderation,
+            "check_google_safe_browsing",
+            google_check,
+        ), patch.object(moderation, "check_virustotal", vt_check):
+            self.assertFalse(await moderation.check_and_handle_urls(_msg(url)))
+
+        google_check.assert_awaited_once()
+        vt_check.assert_not_awaited()
+
+    async def test_google_network_failure_is_not_cached_as_safe(self):
+        url = "https://example.com/hello"
+        moderation._vt_cache[url] = (False, time.time())
+        google_check = AsyncMock(return_value=None)
+
+        with patch.object(moderation, "GOOGLE_SAFEBROWSING_KEY", "test-key"), patch.object(
+            moderation,
+            "check_google_safe_browsing",
+            google_check,
+        ):
+            self.assertFalse(await moderation.check_and_handle_urls(_msg(url)))
+            self.assertFalse(await moderation.check_and_handle_urls(_msg(url)))
+
+        self.assertEqual(google_check.await_count, 2)
+        self.assertNotIn(url, moderation._gsb_cache)
 
     async def test_low_confidence_url_block_is_cached_as_allow(self):
         response = {

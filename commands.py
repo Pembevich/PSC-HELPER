@@ -10,7 +10,7 @@ import subprocess
 import time
 from math import sqrt
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import imageio_ffmpeg
 
@@ -20,11 +20,11 @@ from PIL import Image, ImageOps
 # #4: Защита от декомпрессионных бомб (см. moderation.py).
 Image.MAX_IMAGE_PIXELS = 24_000_000
 
-GIF_MAX_DIMENSION = 720
+GIF_MAX_DIMENSION = 960
 GIF_MAX_VIDEO_SECONDS = 8
 GIF_MIN_VIDEO_FPS = 8
-GIF_MAX_VIDEO_FPS = 15
-GIF_DEFAULT_VIDEO_FPS = 15
+GIF_MAX_VIDEO_FPS = 24
+GIF_DEFAULT_VIDEO_FPS = 20
 GIF_IMAGE_FRAME_MS = 700
 GIF_MAX_ATTACHMENT_BYTES = 60 * 1024 * 1024
 GIF_MAX_TOTAL_BYTES = 80 * 1024 * 1024
@@ -71,7 +71,7 @@ def parse_gif_options_from_text(text: str) -> dict[str, Any]:
         val = fps_match.group(1) or fps_match.group(2)
         try:
             val_i = int(val)
-            if 1 <= val_i <= 30:
+            if 1 <= val_i <= GIF_MAX_VIDEO_FPS:
                 options['fps'] = val_i
         except ValueError:
             pass
@@ -113,7 +113,7 @@ def parse_gif_options_from_text(text: str) -> dict[str, Any]:
                     options['max_video_seconds'] = numeric_value
                     break
                 # If it's an integer between 5 and 30, it's likely FPS
-                elif 5 <= numeric_value <= 30 and numeric_value.is_integer():
+                elif 5 <= numeric_value <= GIF_MAX_VIDEO_FPS and numeric_value.is_integer():
                     options['fps'] = int(numeric_value)
                     break
                 # If it's between 50 and 3000, it's likely milliseconds delay
@@ -182,6 +182,41 @@ def _effective_output_limit(max_output_bytes: int | None) -> int:
     return min(requested, GIF_MAX_OUTPUT_BYTES)
 
 
+def format_gif_error_for_user(error: Exception) -> str:
+    """Return actionable GIF errors without exposing FFmpeg paths or internals."""
+    text = str(error).strip()
+    public_prefixes = (
+        "Не найдено вложений",
+        "Слишком много вложений",
+        "Вложение `",
+        "Суммарный размер вложений",
+        "Фактический суммарный размер вложений",
+        "Готовый GIF превышает",
+        "неподдерживаемый формат изображения",
+        "изображение превышает допустимое разрешение",
+        "неверный лимит размера GIF",
+        "лимит размера GIF должен быть больше нуля",
+        "в исходном GIF слишком много кадров",
+        "не удалось уложить GIF в лимит",
+    )
+    public_runtime_messages = {
+        "Не нашёл подходящих вложений для GIF (нужны изображения или короткое видео).",
+        "GIF не был создан.",
+        "FFmpeg не успел обработать видео в безопасный срок.",
+        "FFmpeg не смог безопасно обработать видео.",
+    }
+    if isinstance(error, ValueError) and text.startswith(public_prefixes):
+        safe_text = text
+    elif isinstance(error, RuntimeError) and text in public_runtime_messages:
+        safe_text = text
+    elif isinstance(error, RuntimeError) and text.startswith("загрузка `"):
+        safe_text = text
+    else:
+        safe_text = "Не удалось безопасно обработать этот файл. Проверь формат и попробуй снова."
+    safe_text = "".join(char for char in safe_text if char >= " " or char in "\n\t")
+    return discord.utils.escape_mentions(discord.utils.escape_markdown(safe_text))[:500]
+
+
 def _fit_frame(frame: Image.Image, max_dim: int) -> Image.Image:
     result = frame.convert("RGBA")
     if max(result.size) > max_dim:
@@ -227,7 +262,7 @@ def _load_image_frames(
                     f"в исходном GIF слишком много кадров: {frame_count} "
                     f"(максимум {GIF_MAX_SOURCE_FRAMES})"
                 )
-            if (source.format or "").upper() == "GIF" and frame_count > 1:
+            if frame_count > 1:
                 max_dim = _frame_budget_dimension(frame_count)
                 frames: list[Image.Image] = []
                 durations: list[int] = []
@@ -252,14 +287,12 @@ def _load_image_frames(
             frame = ImageOps.exif_transpose(source).convert("RGBA")
             frames.append(_fit_frame(frame, max_dim))
     frames = _center_frames(frames)
-    if len(frames) == 1:
-        frames.append(frames[0].copy())
     frame_duration = requested_duration or GIF_IMAGE_FRAME_MS
     return frames, [frame_duration] * len(frames), False
 
 
 def _dimension_ladder(initial: int) -> list[int]:
-    dimensions = [initial, 640, 560, 480, 400, 320, 256, 224, 192]
+    dimensions = [initial, 840, 720, 640, 560, 480, 400, 320, 256, 224, 192]
     result: list[int] = []
     for dimension in dimensions:
         candidate = min(initial, dimension)
@@ -294,16 +327,101 @@ def _save_gif_frames(
     durations: list[int],
     output_path: str,
 ) -> None:
-    frames[0].save(
+    has_transparency = _frames_have_transparency(frames)
+    color_count = 255 if has_transparency else 256
+    quantized_frames: list[Image.Image] = []
+    for frame in frames:
+        rgba = frame.convert("RGBA")
+        alpha = rgba.getchannel("A")
+        quantized = rgba.convert("RGB").quantize(
+            colors=color_count,
+            method=Image.Quantize.MEDIANCUT,
+            dither=Image.Dither.FLOYDSTEINBERG,
+        )
+        if _alpha_has_transparency(alpha):
+            transparent_mask = alpha.point(lambda value: 255 if value <= 127 else 0)
+            quantized.paste(255, mask=transparent_mask)
+        quantized_frames.append(quantized)
+
+    if has_transparency:
+        for frame in quantized_frames:
+            frame.info["transparency"] = 255
+
+    quantized_frames[0].save(
         output_path,
         format="GIF",
         save_all=True,
-        append_images=frames[1:],
+        append_images=quantized_frames[1:],
         duration=durations,
         loop=0,
         optimize=True,
         disposal=2,
     )
+
+
+def _alpha_has_transparency(alpha: Image.Image) -> bool:
+    minimum, _maximum = cast(tuple[int, int], alpha.getextrema())
+    return minimum < 255
+
+
+def _frames_have_transparency(frames: list[Image.Image]) -> bool:
+    return any(
+        _alpha_has_transparency(frame.convert("RGBA").getchannel("A"))
+        for frame in frames
+    )
+
+
+def _gif_palette_filter(max_dim: int, *, transparent: bool) -> str:
+    max_colors = 255 if transparent else 256
+    reserve_transparent = 1 if transparent else 0
+    return (
+        f"scale=w='min(iw,{max_dim})':h='min(ih,{max_dim})':"
+        "force_original_aspect_ratio=decrease:flags=lanczos,"
+        "split[s0][s1];"
+        f"[s0]palettegen=max_colors={max_colors}:reserve_transparent={reserve_transparent}:"
+        "stats_mode=full[p];"
+        "[s1][p]paletteuse=dither=sierra2:diff_mode=rectangle:alpha_threshold=128"
+    )
+
+
+def _run_ffmpeg_image_gif_encode(
+    source_path: str,
+    output_path: str,
+    *,
+    max_dim: int,
+    transparent: bool,
+    timeout: float,
+) -> None:
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [
+        ffmpeg_exe,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        source_path,
+        "-an",
+        "-sn",
+        "-dn",
+        "-vf",
+        _gif_palette_filter(max_dim, transparent=transparent),
+        "-loop",
+        "0",
+        output_path,
+    ]
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    if result.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) <= 0:
+        detail = (result.stderr or "").strip()[-1200:]
+        raise RuntimeError(detail or "FFmpeg не создал GIF из изображения")
 
 
 def _build_gif_from_images(
@@ -315,12 +433,49 @@ def _build_gif_from_images(
 ) -> None:
     frames, durations, animated_source = _load_image_frames(image_paths, duration=duration)
     initial_dimension = max(max(frame.size) for frame in frames)
+    if len(image_paths) == 1:
+        with Image.open(image_paths[0]) as source:
+            initial_dimension = max(
+                initial_dimension,
+                min(max(source.size), GIF_MAX_DIMENSION),
+            )
     profiles = [(dimension, 1) for dimension in _dimension_ladder(initial_dimension)]
+    deadline = time.monotonic() + GIF_MAX_ENCODE_SECONDS
+
+    # Один исходный файл FFmpeg кодирует заметно точнее Pillow: строит палитру по
+    # полным цветовым данным и сохраняет тайминги исходной анимации. При явно
+    # заданной задержке анимированного GIF остаёмся на покадровом пути ниже.
+    if len(image_paths) == 1 and (not animated_source or duration is None):
+        transparent = _frames_have_transparency(frames)
+        for profile_index, (max_dim, _stride) in enumerate(profiles):
+            remaining = deadline - time.monotonic()
+            if remaining <= 1:
+                break
+            candidate_path = f"{output_path}.ffmpeg-candidate-{profile_index}.gif"
+            try:
+                _run_ffmpeg_image_gif_encode(
+                    image_paths[0],
+                    candidate_path,
+                    max_dim=max_dim,
+                    transparent=transparent,
+                    timeout=min(30.0, remaining),
+                )
+                if 0 < os.path.getsize(candidate_path) <= max_output_bytes:
+                    os.replace(candidate_path, output_path)
+                    return
+            except (OSError, RuntimeError, subprocess.SubprocessError):
+                pass
+            finally:
+                if os.path.exists(candidate_path):
+                    os.remove(candidate_path)
+
     if animated_source:
         smallest_dimension = profiles[-1][0]
         profiles.extend((smallest_dimension, stride) for stride in (2, 3, 4))
 
     for profile_index, (max_dim, stride) in enumerate(profiles):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Обработка изображений превысила безопасный срок.")
         candidate_path = f"{output_path}.candidate-{profile_index}.gif"
         resized_frames = _resize_frame_set(frames, max_dim)
         selected_frames, selected_durations = _decimate_animation(
@@ -352,14 +507,7 @@ def _run_ffmpeg_gif_encode(
     timeout: float,
 ) -> None:
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    filter_str = (
-        f"fps={fps},"
-        f"scale='if(gt(iw,ih),min(iw,{max_dim}),-2)':"
-        f"'if(gt(iw,ih),-2,min(ih,{max_dim}))':flags=lanczos,"
-        "split[s0][s1];"
-        "[s0]palettegen=max_colors=256:reserve_transparent=0:stats_mode=diff[p];"
-        "[s1][p]paletteuse=dither=sierra2_4a:diff_mode=rectangle"
-    )
+    filter_str = f"fps={fps}," + _gif_palette_filter(max_dim, transparent=False)
     cmd = [
         ffmpeg_exe,
         "-nostdin",
@@ -398,12 +546,14 @@ def _run_ffmpeg_gif_encode(
 def _video_quality_profiles(max_dim: int, fps: int) -> list[tuple[int, int]]:
     profiles: list[tuple[int, int]] = []
     for dimension in _dimension_ladder(max_dim)[:7]:
-        if dimension >= 560:
+        if dimension >= 720:
             candidate_fps = fps
+        elif dimension >= 560:
+            candidate_fps = min(fps, 18)
         elif dimension >= 400:
-            candidate_fps = min(fps, 12)
+            candidate_fps = min(fps, 15)
         elif dimension >= 320:
-            candidate_fps = min(fps, 10)
+            candidate_fps = min(fps, 12)
         else:
             candidate_fps = GIF_MIN_VIDEO_FPS
         profile = (dimension, max(GIF_MIN_VIDEO_FPS, candidate_fps))

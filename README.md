@@ -1,6 +1,6 @@
 # PSC-HELPER
 
-**Product version:** 0.8.1 · **Current GitHub release:** [v0.8.3](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.8.3) · **License:** [MIT](./LICENSE)
+**Current release:** 0.8.1.1 · **Official site:** [p-os.up.railway.app](https://p-os.up.railway.app) · **License:** [MIT](./LICENSE)
 
 A self-hosted Discord bot for communities that need automated moderation, an in-character AI assistant (**P.OS**), application/complaint workflows, detailed audit logging, and media utilities such as on-the-fly GIF generation.
 
@@ -15,38 +15,35 @@ Typical use cases:
 - Community servers that want layered automoderation without a paid SaaS bot
 - Staff teams that need structured application and complaint forms
 - Admins who want searchable audit trails across channels, roles, and moderation actions
-- Servers that want a configurable AI persona with hardcoded safety boundaries around privileged tools
+- Servers that want a distinct AI persona with code-enforced safety boundaries around privileged tools
 
 ## Adoption / Community
 
-PSC-HELPER is in **early adoption**:
+PSC-HELPER is in early development. Public adoption figures are not published yet, and a dedicated project Discord server is still being prepared. Until then, use [GitHub Issues](https://github.com/Pembevich/PSC-HELPER/issues) for reproducible bug reports and feature proposals.
 
-| Signal | Status |
-| --- | --- |
-| Servers actively testing | **30** servers in private testing and pilot deployments |
-| Interested server owners | **20** additional owners/operators who reached out about setup, hosting, or feature fit |
-| Project Discord server | **In development** — a dedicated community server is being prepared; until launch, use [GitHub Issues](https://github.com/Pembevich/PSC-HELPER/issues) for support and discussion |
-| Feedback | Early feedback from moderators on raid handling, form flows, and P.OS tool safety; please open issues for bugs and ideas |
-| Pricing | **Free** — self-host on Railway or your own infrastructure; bring your own AI API keys |
-
-If you try PSC-HELPER, an issue describing your server size and setup helps the roadmap.
+The project is free to self-host on Railway or other infrastructure; operators provide their own Discord and optional AI/reputation API credentials.
 
 ## Core features
 
-- **Automated moderation** — deterministic link and executable-attachment screening, normalized spam detection, AI-assisted review, mass-mention protection, and persistent anti-raid state
+- **Automated moderation** — canonical URL screening with Google Safe Browsing/VirusTotal support, attachment magic/archive checks, normalized spam detection, AI-assisted review, mass-mention protection, and persistent anti-raid state
 - **P.OS AI assistant** — responds to mentions and replies, keeps conversational context, supports vision inputs
-- **Owner-gated tools** — factual server inspection plus confirmed bans, timeouts, roles, channels, settings, and cross-server actions; enforced in code, not prompt-only
+- **Owner-gated tools** — factual server inspection plus bans, timeouts, roles, channels, settings, and cross-server actions; owner commands execute directly, third-party requests require approval
 - **Application workflows** — interactive forms for applications, reports, and staff review
-- **Audit logging** — structured server event journals and a persistent, redacted history of P.OS tool activity
+- **Continuous security posture** — an initial audit plus persisted baselines for Discord MFA, verification/media filters, privileged roles, channel overwrites, bot permissions, webhooks, and AutoMod rules, with owner alerts on dangerous changes
+- **Audit logging** — structured server event journals and a persistent, redacted history of P.OS tool activity and AI security detections
 - **Media utilities** — adaptive `p.gif` conversion that preserves animation timing and searches for the best quality that fits the server upload limit
 
 ## Security model (important)
 
-High-privilege operations are **never delegated directly to the LLM**. The model may request actions through tool calls; `pos_ai.py` resolves targets to canonical Discord IDs, checks permissions and role hierarchy, protects the owner and bot, and requires an out-of-band confirmation before execution.
+High-privilege operations are **never delegated directly to the LLM**. The model may request actions through tool calls; `pos_ai.py` validates every argument against a closed schema, resolves targets to canonical Discord IDs, checks the current message's intent, permissions and role hierarchy, limits actions per turn, and protects the owner and bot before execution. Mutating requests do not expose channel history or visual payloads to the action-selection context.
 
-The only privileged operator is Pumba, identified by the immutable Discord user ID `968698192411652176`. This trust boundary cannot be expanded through an environment variable. Read-only factual tools may run immediately for Pumba; every state-changing action is sent to Pumba's DM for explicit button confirmation and expires after 10 minutes.
+The only direct privileged operator is Pumba, identified by the immutable Discord user ID `968698192411652176`. This trust boundary cannot be expanded through an environment variable. Pumba's verified Discord actions execute immediately and return the factual API result. A state-changing request from anyone else is sent to Pumba's DM for explicit button approval and expires after 10 minutes. Process shutdown still requires Pumba's separate confirmation.
 
-AI moderation findings are advisory unless a deterministic signal or independently confirmed visual signal reaches the required confidence threshold. This prevents a model response or prompt-injected message from becoming an automatic punishment by itself.
+AI moderation findings are advisory unless a deterministic signal or independently confirmed visual signal reaches the required confidence threshold. URL and file reputation also require corroborated verdicts before automatic punishment. This prevents a model response, one outlier scanner, or prompt-injected message from becoming an automatic punishment by itself.
+
+Link reputation is optional and layered: local canonicalization and deception checks always run; Google Safe Browsing and VirusTotal run only when their keys are configured. Their caches are independent, and network/API failures are never stored as a safe verdict. P.OS never follows a user-supplied URL, which keeps the link scanner outside the server's private network boundary.
+
+P.OS treats prompt injection as an expected hostile input, not as an authentication mechanism. Tools remain unavailable unless the current Discord message expresses a matching intent; authorization is bound to the immutable Discord ID in code. Injection detections are stored as hashes and reason labels without retaining the adversarial payload.
 
 ## Quick start (local)
 
@@ -77,7 +74,7 @@ Configure environment variables in Railway. A local `.env` is for development on
 | --- | --- |
 | `DISCORD_TOKEN` | Discord bot token |
 
-### P.OS / AI (GitHub Models recommended)
+### P.OS / AI (GitHub Models configuration)
 
 | Variable | Description |
 | --- | --- |
@@ -106,16 +103,21 @@ POS_AI_PROVIDER_MODELS=openai/gpt-4.1,openai/gpt-4.1
 
 ### Other useful settings
 
-- `POS_AI_SYSTEM_PROMPT` — override P.OS persona prompt
+- `POS_AI_SYSTEM_PROMPT` — optional owner context appended to the immutable P.OS identity and safety core
 - `POS_AI_MAX_TOKENS`, `POS_AI_TEMPERATURE`, `POS_AI_TOP_P`, `POS_AI_TIMEOUT_SECONDS`, `POS_AI_MAX_CONCURRENT_REQUESTS`
 - `PRIMARY_LOG_CHANNEL_ID`, `UPDATE_LOG_CHANNEL_ID`, `LOG_CATEGORY_ID`, `LOG_CATEGORY_NAME`
-- `DB_BACKUP_CHANNEL_ID` — Discord channel for SQLite backup uploads (recommended on Railway)
+- `DB_BACKUP_CHANNEL_ID` — private Discord channel for gzip-compressed, integrity-checked SQLite backups (recommended on Railway)
+- `GOOGLE_SAFEBROWSING_KEY`, `VIRUSTOTAL_KEY` — optional independent URL/file reputation sources
+- `SECURITY_MONITOR_INTERVAL_SECONDS` — continuous Discord posture scan interval, clamped to 120-3600 seconds (default: 900)
 
 See `.env.example` for the full list.
 
-### Suggested free/low-cost AI providers
+### Production security baseline
 
-OpenRouter, Groq, Hugging Face Inference, Together AI, and Cloudflare Workers AI often have free tiers or credits. Verify current limits and terms before production use.
+- Require 2FA for moderation, use an appropriate member verification level, and enable Discord's explicit-media filter for all members.
+- Keep dangerous `@everyone` permissions and channel overwrites disabled. Place the P.OS role above the roles it must moderate and grant only the permissions reported by its initial security audit.
+- Keep log and database-backup channels private, restrict webhook creation, and configure native Discord AutoMod as a separate fallback layer.
+- Store tokens only in Railway variables, rotate any exposed credential, and enable both reputation providers when preparing a public server.
 
 ## Repository layout
 
@@ -125,11 +127,12 @@ OpenRouter, Groq, Hugging Face Inference, Together AI, and Cloudflare Workers AI
 | `config.py` | Environment parsing, static Discord IDs, filter lists |
 | `moderation.py` | Text/attachment filters, spam, AI moderation hooks |
 | `antiraid.py` | Join-rate raid detection and reactions |
+| `security_monitor.py` | Persisted Discord security posture snapshots and deterministic diffs |
 | `pos_ai.py` | P.OS orchestration, context, tool execution policy |
 | `ai_client.py` | OpenAI-compatible client with provider pooling |
 | `commands.py` | Генерация GIF для единственной пользовательской команды `p.gif` |
 | `forms.py` | Application/report UI (views, modals) |
-| `storage.py` | Async SQLite persistence and Discord backup |
+| `storage.py` | Serialized async SQLite persistence and backward-compatible gzip Discord backup/restore |
 | `guild_config.py` | Per-guild settings merged with defaults |
 | `logging_utils.py` | Log category/channel helpers |
 | `cogs/` | Thin Discord event and command wrappers |
@@ -148,6 +151,7 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md). Roadmap areas use labels: `good first 
 | [v0.8.1](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.8.1) | Raid quarantine default, owner ping/DM/lift tools, form fixes |
 | [v0.8.2](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.8.2) | Technical publication tag for the completed P.OS 0.8.1 product line: security, reliability, GIF pipeline, `p.` prefix, and official site |
 | [v0.8.3](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.8.3) | Final 0.8.1 site polish: automatic system theme selection with persistent Dark/Light override |
+| [v0.8.1.1](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.8.1.1) | Current product patch: reliability, database recovery, moderation, AI tool execution, prompt-injection defenses, GIF quality, and continuous security monitoring |
 | [v0.9.0](https://github.com/Pembevich/PSC-HELPER/releases/tag/v0.9.0) | Planned milestone (pre-release) |
 
 ## GitHub Models token hygiene

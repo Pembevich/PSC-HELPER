@@ -14,17 +14,33 @@
       content="AI management, administration, security, memory and media for Discord."
     />
     <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://p-os.up.railway.app/" />
+    <meta property="og:image" content="https://p-os.up.railway.app/assets/pos-logo-clean.png" />
+    <meta property="og:image:width" content="783" />
+    <meta property="og:image:height" content="771" />
+    <meta name="twitter:card" content="summary_large_image" />
     <title>P.OS | Provision Operating System</title>
+    <link rel="canonical" href="https://p-os.up.railway.app/" />
     <link rel="icon" href="./assets/pos-logo-mark.png" type="image/png" />
     <link rel="apple-touch-icon" href="./assets/pos-logo-mark.png" />
     <script>
       (() => {
-        const storedTheme = localStorage.getItem("pos-theme");
+        const storage = {
+          get(key) {
+            try { return localStorage.getItem(key); } catch { return null; }
+          },
+          remove(key) {
+            try { localStorage.removeItem(key); } catch {}
+          },
+        };
+        const storedTheme = storage.get("pos-theme");
         const preference = storedTheme === "dark" || storedTheme === "light" ? storedTheme : null;
-        if (storedTheme !== null && preference === null) localStorage.removeItem("pos-theme");
+        if (storedTheme !== null && preference === null) storage.remove("pos-theme");
         const systemLight = window.matchMedia("(prefers-color-scheme: light)").matches;
         const theme = preference || (systemLight ? "light" : "dark");
-        const savedLanguage = localStorage.getItem("pos-language");
+        const storedLanguage = storage.get("pos-language");
+        const savedLanguage = storedLanguage === "ru" || storedLanguage === "en" ? storedLanguage : null;
+        if (storedLanguage !== null && savedLanguage === null) storage.remove("pos-language");
         const browserLanguage = (navigator.languages?.[0] || navigator.language || "en").toLowerCase();
         const language = savedLanguage || (browserLanguage.startsWith("ru") ? "ru" : "en");
 
@@ -34,7 +50,7 @@
         document.documentElement.lang = language;
       })();
     </script>
-    <link rel="stylesheet" href="./styles.css?v=20260712-6" />
+    <link rel="stylesheet" href="./styles.css?v=20260713-1" />
   </head>
   <body>
     <a class="skip-link" href="#content" data-i18n="skip">Перейти к содержимому</a>
@@ -218,7 +234,7 @@
         <div class="section-inner">
           <header class="center-heading reveal">
             <h2 id="ecosystem-title" data-i18n="ecosystemTitle">Сервер как единая система</h2>
-            <p data-i18n="ecosystemText">P.OS связывает разговор, состояние Discord и подтверждённые действия в один понятный процесс.</p>
+            <p data-i18n="ecosystemText">P.OS связывает разговор, состояние Discord и проверенные действия в один понятный процесс.</p>
           </header>
 
           <div class="system-map reveal" aria-label="Экосистема P.OS" data-i18n-aria="ecosystemAria">
@@ -226,7 +242,7 @@
             <div class="map-node map-node-channels"><span>02</span><strong data-i18n="nodeChannels">Каналы</strong></div>
             <div class="map-node map-node-roles"><span>03</span><strong data-i18n="nodeRoles">Роли</strong></div>
             <div class="system-core">
-              <img src="./assets/pos-logo-mark.png" alt="Графический знак P.OS" data-i18n-alt="logoAlt" />
+              <img src="./assets/pos-logo-mark.png" width="655" height="656" loading="lazy" decoding="async" alt="Графический знак P.OS" data-i18n-alt="logoAlt" />
               <span>P.OS</span>
             </div>
             <div class="map-node map-node-settings"><span>04</span><strong data-i18n="nodeSettings">Настройки</strong></div>
@@ -265,7 +281,7 @@
             </article>
             <article class="security-layer">
               <span>03</span>
-              <div><h3 data-i18n="layerAuthority">Полномочия</h3><p data-i18n="layerAuthorityText">Права, иерархия и подтверждение проверяются вне модели.</p></div>
+              <div><h3 data-i18n="layerAuthority">Полномочия</h3><p data-i18n="layerAuthorityText">ID инициатора, права и иерархия проверяются кодом вне модели.</p></div>
               <i class="layer-state verified" data-i18n="layerVerified">Проверено</i>
             </article>
           </div>
@@ -299,7 +315,7 @@
             <ol class="operation-steps">
               <li class="is-complete"><span>01</span><div><strong data-i18n="stepResolve">Определить цель</strong><p data-i18n="stepResolveText">Пользователь, роль или канал сопоставляются с объектом Discord.</p></div></li>
               <li class="is-complete"><span>02</span><div><strong data-i18n="stepCheck">Проверить возможность</strong><p data-i18n="stepCheckText">P.OS сверяет права, иерархию и защищённые цели.</p></div></li>
-              <li class="is-current"><span>03</span><div><strong data-i18n="stepConfirm">Подтвердить изменение</strong><p data-i18n="stepConfirmText">Критичное действие не выполняется только на слове модели.</p></div></li>
+              <li class="is-current"><span>03</span><div><strong data-i18n="stepConfirm">Проверить полномочия</strong><p data-i18n="stepConfirmText">Запрос владельца исполняется после кодовых проверок; остальные ждут его решения.</p></div></li>
               <li><span>04</span><div><strong data-i18n="stepRecord">Записать результат</strong><p data-i18n="stepRecordText">Успех или отказ остаются в журнале действий.</p></div></li>
             </ol>
           </div>
@@ -378,6 +394,6 @@
       <a href="#top" data-i18n="backTop">Наверх ↑</a>
     </footer>
 
-    <script src="./app.js?v=20260712-4"></script>
+    <script src="./app.js?v=20260713-2"></script>
   </body>
 </html>

@@ -175,7 +175,7 @@ POS_AI_TOOLS = [
         "type": "function",
         "function": {
             "name": "edit_role",
-            "description": "Изменяет существующую роль: имя, цвет, отображение отдельно (hoist), упоминаемость, позицию в иерархии и базовые права. Указывай только те поля, которые надо поменять.",
+            "description": "Изменяет обычную существующую роль: имя, цвет, отображение отдельно (hoist), упоминаемость, позицию и Discord-права. Можно отдельно добавить или снять права, включая снятие всех. Роль интеграции/бота с managed=true Discord API не разрешает редактировать; для неё используй права канала или действие с самим ботом.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -185,7 +185,9 @@ POS_AI_TOOLS = [
                     "hoist": {"type": "string", "description": "Необязательно. 'true'/'false' — отображать ли роль отдельно в списке участников."},
                     "mentionable": {"type": "string", "description": "Необязательно. 'true'/'false' — можно ли упоминать роль."},
                     "position": {"type": "string", "description": "Необязательно. Новая позиция в иерархии (целое число, чем больше — тем выше)."},
-                    "permissions": {"type": "string", "description": "Необязательно. Список прав через запятую для выдачи (например 'manage_messages, kick_members, manage_roles'). Имена прав discord.py."}
+                    "permissions": {"type": "string", "description": "Совместимость: список прав через запятую, которые нужно добавить."},
+                    "grant_permissions": {"type": "string", "description": "Необязательно. Права discord.py через запятую, которые нужно добавить, например 'manage_messages, kick_members'."},
+                    "revoke_permissions": {"type": "string", "description": "Необязательно. Права discord.py через запятую, которые нужно снять. Значение 'all' снимает все права роли."}
                 },
                 "required": ["role_id_or_name"]
             }
@@ -350,7 +352,7 @@ POS_AI_TOOLS = [
         "type": "function",
         "function": {
             "name": "send_message",
-            "description": "Отправляет сообщение от имени P.OS в указанный канал (можно на другом сервере, где есть P.OS). ТОЛЬКО для владельца.",
+            "description": "Отправляет сообщение от имени P.OS в указанный канал (можно на другом сервере, где есть P.OS). Команда Пумбы выполняется сразу; запрос другого участника отправляется Пумбе на подтверждение.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -381,7 +383,7 @@ POS_AI_TOOLS = [
         "function": {
             "name": "update_settings",
             "description": (
-                "Изменяет настройки модерации/безопасности P.OS на сервере. ТОЛЬКО для владельца. "
+                "Изменяет настройки модерации/безопасности P.OS на сервере. Команда Пумбы выполняется сразу; запрос другого участника отправляется Пумбе на подтверждение. "
                 "Передавай только те поля, которые нужно изменить. Булевы ключи (true/false): "
                 "enabled, filter_ads, filter_spam, filter_flood, filter_scam, filter_nsfw, filter_raid, "
                 "filter_mention_spam, filter_crosschannel, ai_moderation, allow_profanity, log_messages, log_reactions. "
@@ -405,7 +407,7 @@ POS_AI_TOOLS = [
         "type": "function",
         "function": {
             "name": "ping_user",
-            "description": "Пингует (упоминает) пользователя в канале так, чтобы пинг реально прошёл (пришло уведомление). ТОЛЬКО для владельца.",
+            "description": "Пингует пользователя в канале с реальным уведомлением. Команда Пумбы выполняется сразу; запрос другого участника отправляется Пумбе на подтверждение.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -422,7 +424,7 @@ POS_AI_TOOLS = [
         "type": "function",
         "function": {
             "name": "dm_user",
-            "description": "Отправляет личное сообщение (ЛС) пользователю от имени P.OS. ТОЛЬКО для владельца.",
+            "description": "Отправляет ЛС пользователю от имени P.OS. Команда Пумбы выполняется сразу; запрос другого участника отправляется Пумбе на подтверждение.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -437,7 +439,7 @@ POS_AI_TOOLS = [
         "type": "function",
         "function": {
             "name": "lift_restrictions",
-            "description": "Снимает ограничения с пользователя (тайм-аут/карантин/роль-мут) и уведомляет его в ЛС. Используй, когда владелец решил, что аккаунт нормальный. ТОЛЬКО для владельца.",
+            "description": "Снимает ограничения с пользователя (тайм-аут/карантин/роль-мут) и уведомляет его в ЛС. Команда Пумбы выполняется сразу; запрос другого участника отправляется Пумбе на подтверждение.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -453,7 +455,7 @@ POS_AI_TOOLS = [
         "type": "function",
         "function": {
             "name": "deactivate_raid_mode",
-            "description": "Снимает (деактивирует) режим рейда на сервере по команде владельца. ТОЛЬКО для владельца.",
+            "description": "Снимает режим рейда на сервере. Команда Пумбы выполняется сразу; запрос другого участника отправляется Пумбе на подтверждение.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -467,7 +469,7 @@ POS_AI_TOOLS = [
         "type": "function",
         "function": {
             "name": "leave_server",
-            "description": "P.OS покидает (выходит с) указанный сервер. Необратимо. ТОЛЬКО для владельца, требует подтверждения.",
+            "description": "P.OS покидает указанный сервер. Необратимо. Команда Пумбы после code-level проверки выполняется сразу; запрос другого участника отправляется Пумбе на подтверждение.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -533,7 +535,7 @@ POS_AI_TOOLS.extend([
         "type": "function",
         "function": {
             "name": "edit_server",
-            "description": "Изменяет базовые настройки сервера: название, описание, уровень проверки, фильтр контента, режим уведомлений. ТОЛЬКО для владельца.",
+            "description": "Изменяет базовые настройки сервера: название, описание, уровень проверки, фильтр контента, режим уведомлений. Команда Пумбы выполняется сразу; запрос другого участника отправляется Пумбе на подтверждение.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -552,7 +554,7 @@ POS_AI_TOOLS.extend([
         "type": "function",
         "function": {
             "name": "lock_channel",
-            "description": "Закрывает канал для @everyone или указанной роли/пользователя: просмотр, отправку сообщений или оба права. ТОЛЬКО для владельца.",
+            "description": "Закрывает канал для @everyone или указанной роли/пользователя: просмотр, отправку сообщений или оба права. Команда Пумбы выполняется сразу; запрос другого участника отправляется Пумбе на подтверждение.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -569,7 +571,7 @@ POS_AI_TOOLS.extend([
         "type": "function",
         "function": {
             "name": "unlock_channel",
-            "description": "Снимает запрет просмотра/отправки сообщений в канале для @everyone или указанной роли/пользователя. ТОЛЬКО для владельца.",
+            "description": "Снимает запрет просмотра/отправки сообщений в канале для @everyone или указанной роли/пользователя. Команда Пумбы выполняется сразу; запрос другого участника отправляется Пумбе на подтверждение.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -586,7 +588,7 @@ POS_AI_TOOLS.extend([
         "type": "function",
         "function": {
             "name": "create_thread",
-            "description": "Создаёт ветку в текстовом канале или от конкретного сообщения. ТОЛЬКО для владельца.",
+            "description": "Создаёт ветку в текстовом канале или от конкретного сообщения. Команда Пумбы выполняется сразу; запрос другого участника отправляется Пумбе на подтверждение.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -604,7 +606,7 @@ POS_AI_TOOLS.extend([
         "type": "function",
         "function": {
             "name": "archive_thread",
-            "description": "Архивирует/разархивирует и при необходимости блокирует/разблокирует ветку. ТОЛЬКО для владельца.",
+            "description": "Архивирует/разархивирует и при необходимости блокирует/разблокирует ветку. Команда Пумбы выполняется сразу; запрос другого участника отправляется Пумбе на подтверждение.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -621,7 +623,7 @@ POS_AI_TOOLS.extend([
         "type": "function",
         "function": {
             "name": "voice_action",
-            "description": "Выполняет действие с участником в голосе: disconnect, mute, unmute, deafen, undeafen, move. ТОЛЬКО для владельца.",
+            "description": "Выполняет действие с участником в голосе: disconnect, mute, unmute, deafen, undeafen, move. Команда Пумбы выполняется сразу; запрос другого участника отправляется Пумбе на подтверждение.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -652,7 +654,7 @@ POS_AI_TOOLS.extend([
         "type": "function",
         "function": {
             "name": "set_security_preset",
-            "description": "Быстро применяет профиль безопасности P.OS: normal, strict или raid. Меняет настройки автомодерации/антирейда. ТОЛЬКО для владельца.",
+            "description": "Применяет профиль безопасности P.OS: normal, strict или raid. Команда Пумбы выполняется сразу; запрос другого участника отправляется Пумбе на подтверждение.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -803,7 +805,7 @@ POS_AI_TOOLS.extend([
         "type": "function",
         "function": {
             "name": "bulk_user_action",
-            "description": "Выполняет массовое действие по списку username/login/ID: ban, kick, timeout, untimeout, add_role, remove_role, lift_restrictions. ТОЛЬКО для владельца.",
+            "description": "Выполняет массовое действие по списку username/login/ID: ban, kick, timeout, untimeout, add_role, remove_role, lift_restrictions. Команда Пумбы выполняется сразу; запрос другого участника отправляется Пумбе на подтверждение.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -854,7 +856,7 @@ def _inject_cross_server_param(tools: list) -> None:
                 "server_id_or_name",
                 {
                     "type": "string",
-                    "description": "Необязательно. Сервер (ID или имя), на котором выполнить действие. Если не указан — текущий сервер. Только владелец может указывать другой сервер.",
+                    "description": "Необязательно. Сервер (ID или имя), на котором выполнить действие. Если не указан — текущий. Для Пумбы выполняется сразу; запрос другого участника на другой сервер ждёт подтверждения Пумбы.",
                 },
             )
 
@@ -887,3 +889,42 @@ def _inject_user_identifier_param(tools: list) -> None:
 
 
 _inject_user_identifier_param(POS_AI_TOOLS)
+
+
+_TOOL_FIELD_MAX_LENGTHS = {
+    "reason": 512,
+    "text": 1900,
+    "topic": 1024,
+    "name": 100,
+    "new_name": 100,
+    "nickname": 32,
+    "query": 500,
+    "settings_json": 8000,
+    "user_identifiers": 5000,
+}
+
+
+def _harden_tool_schemas(tools: list) -> None:
+    """Make provider hints match the code-level tool boundary.
+
+    Providers may ignore parts of JSON Schema, so runtime validation remains
+    mandatory in pos_ai.execute_pos_tool. These constraints still reduce
+    malformed calls and prevent the model from inventing hidden parameters.
+    """
+    for tool in tools:
+        function = tool.get("function", {})
+        parameters = function.get("parameters", {})
+        if parameters.get("type") != "object":
+            continue
+        parameters["additionalProperties"] = False
+        properties = parameters.get("properties", {})
+        for field_name, field_schema in properties.items():
+            if not isinstance(field_schema, dict) or field_schema.get("type") != "string":
+                continue
+            field_schema.setdefault(
+                "maxLength",
+                _TOOL_FIELD_MAX_LENGTHS.get(field_name, 512),
+            )
+
+
+_harden_tool_schemas(POS_AI_TOOLS)

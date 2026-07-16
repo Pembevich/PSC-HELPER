@@ -13,10 +13,12 @@ from utils import collect_runtime_health
 
 # Из commands.py
 from commands import (
+    format_gif_error_for_user,
     generate_gif_from_attachments,
     gif_output_limit_for_guild,
     parse_gif_options_from_text,
 )
+from message_gate import wait_for_moderation
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,7 @@ class GeneralCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._commands_synced = False
+        self._startup_logged_guild_ids: set[int] = set()
         self.db_backup_task.start()
 
     def cog_unload(self):
@@ -37,13 +40,14 @@ class GeneralCog(commands.Cog):
             # Сбрасываем накопленную память P.OS в БД, чтобы бэкап был актуальным.
             from pos_ai import flush_ai_memory
             await flush_ai_memory()
-        except Exception as e:
-            logger.error(f"Error flushing AI memory before backup: {e}")
+        except Exception:
+            logger.exception("Error flushing AI memory before backup; this backup cycle is skipped.")
+            return
         try:
             from storage import backup_db_to_discord
             await backup_db_to_discord(self.bot)
-        except Exception as e:
-            logger.error(f"Error backing up DB in task: {e}")
+        except Exception:
+            logger.exception("Error backing up DB in periodic task.")
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -88,6 +92,8 @@ class GeneralCog(commands.Cog):
 
         try:
             for guild in self.bot.guilds:
+                if guild.id in self._startup_logged_guild_ids:
+                    continue
                 await send_log_embed(
                     guild,
                     "server",
@@ -95,12 +101,22 @@ class GeneralCog(commands.Cog):
                     f"Бот запущен как {self.bot.user}.",
                     color=Color.green()
                 )
+                self._startup_logged_guild_ids.add(guild.id)
         except Exception:
-            pass
+            logger.exception("Не удалось отправить журнал запуска P.OS.")
 
     @commands.command(name="gif")
     @commands.cooldown(1, 20, commands.BucketType.user)
     async def gif(self, ctx: commands.Context, *, args: str = ""):
+        moderation_result = await wait_for_moderation(ctx.message.id)
+        if moderation_result is not False:
+            if moderation_result is None:
+                await ctx.send(
+                    "Не удалось безопасно проверить сообщение. Попробуй ещё раз.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            return
+
         attachments = list(ctx.message.attachments)
         if not attachments and ctx.message.reference and ctx.message.reference.message_id:
             try:
@@ -127,9 +143,12 @@ class GeneralCog(commands.Cog):
                 max_output_bytes=gif_output_limit_for_guild(ctx.guild),
             )
             await ctx.send(file=discord.File(output_path, filename="psc.gif"))
-        except Exception as e:
-            logger.error(f"Error generating GIF: {e}", exc_info=True)
-            await ctx.send(f"❌ Ошибка при создании GIF: {e}")
+        except Exception as exc:
+            logger.error("Error generating GIF: %s", exc, exc_info=True)
+            await ctx.send(
+                f"❌ Ошибка при создании GIF: {format_gif_error_for_user(exc)}",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             return
         finally:
             if "temp_dir" in locals():

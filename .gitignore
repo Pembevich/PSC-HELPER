@@ -8,6 +8,9 @@ bot_data.db
 bot_data.db-wal
 bot_data.db-shm
 bot_data.db.backup
+bot_data.db.backup.gz
+bot_data.db.restore-rollback-*
+.pos-restore-*.db
 temp/
 .DS_Store
 .claude/

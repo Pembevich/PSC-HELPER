@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 
 import discord
@@ -8,21 +9,30 @@ from discord import Embed, Color
 from discord.ui import View, button, Modal, TextInput
 
 from logging_utils import send_log_embed
+from storage import claim_form_decision
 from utils import safe_send_dm
+
+logger = logging.getLogger(__name__)
 
 # ID из embed: "ID пользователя: 123" (футер заявки) / "(ID: 123)" (поле жалобы).
 _EMBED_USER_ID = re.compile(r"ID(?:\s*пользователя)?\s*[:#]?\s*(\d{17,21})", re.IGNORECASE)
 
-# Защита от двойного клика в рамках процесса: message.id уже обработанных заявок.
-# Долговременная защита — отключённые кнопки, которые сохраняются в самом сообщении.
+# Быстрый локальный кэш поверх атомарной записи form_decisions в SQLite.
 _processed_messages: set[int] = set()
 
 
-def _claim_message(message: discord.Message | None) -> bool:
-    """True, если сообщение ещё не обрабатывалось (и помечает его обработанным)."""
+async def _claim_message(message: discord.Message | None) -> bool:
+    """Persistently claim a form message before changing Discord state."""
     if message is None:
-        return True
+        return False
     if message.id in _processed_messages:
+        return False
+    try:
+        claimed = await claim_form_decision(message.id)
+    except Exception:
+        logger.exception("Не удалось зафиксировать решение формы %s.", message.id)
+        return False
+    if not claimed:
         return False
     _processed_messages.add(message.id)
     if len(_processed_messages) > 5000:
@@ -31,10 +41,17 @@ def _claim_message(message: discord.Message | None) -> bool:
     return True
 
 
-def _claim_message_id(message_id: int | None) -> bool:
+async def _claim_message_id(message_id: int | None) -> bool:
     if not message_id:
-        return True
+        return False
     if message_id in _processed_messages:
+        return False
+    try:
+        claimed = await claim_form_decision(message_id)
+    except Exception:
+        logger.exception("Не удалось зафиксировать решение формы %s.", message_id)
+        return False
+    if not claimed:
         return False
     _processed_messages.add(message_id)
     if len(_processed_messages) > 5000:
@@ -131,10 +148,6 @@ class ConfirmView(View):
         # лимит первичного ответа interaction.
         await interaction.response.defer(ephemeral=True)
 
-        if not _claim_message(interaction.message):
-            await interaction.followup.send("Эта заявка уже обработана.", ephemeral=True)
-            return
-
         target_user_id = self.target_user_id or _extract_user_id_from_embed(interaction.message)
         if not target_user_id:
             await interaction.followup.send(
@@ -153,61 +166,69 @@ class ConfirmView(View):
                 member = await guild.fetch_member(target_user_id)
             except Exception:
                 member = None
+        if member is None:
+            await interaction.followup.send(
+                "⚠️ Участник не найден на сервере; заявка пока не помечена обработанной.",
+                ephemeral=True,
+            )
+            return
+
+        if not await _claim_message(interaction.message):
+            await interaction.followup.send("Эта заявка уже обработана.", ephemeral=True)
+            return
+        await _disable_view_on_message(interaction, self)
 
         failed_roles: list[str] = []
-        if member:
-            granted_roles: list[str] = []
-            for role_id in self._resolve_role_ids():
-                role = guild.get_role(role_id)
-                if not role:
-                    failed_roles.append(f"`{role_id}` (роль не найдена на сервере)")
-                    continue
-                try:
-                    await member.add_roles(role, reason="Принят в отряд через форму")
-                    granted_roles.append(role.name)
-                except discord.Forbidden:
-                    failed_roles.append(f"{role.name} (недостаточно прав / иерархия ролей)")
-                except Exception as e:
-                    failed_roles.append(f"{role.name} ({e})")
+        granted_roles: list[str] = []
+        for role_id in self._resolve_role_ids():
+            role = guild.get_role(role_id)
+            if not role:
+                failed_roles.append(f"`{role_id}` (роль не найдена на сервере)")
+                continue
             try:
-                dm_embed = Embed(
-                    title="⏳ Ваша заявка принята!",
-                    description="Вы успешно прошли предварительное подтверждение. Ожидайте связи от офицера отряда.",
-                    color=Color.green()
-                )
-                await member.send(embed=dm_embed)
+                await member.add_roles(role, reason="Принят в отряд через форму")
+                granted_roles.append(role.name)
+            except discord.Forbidden:
+                failed_roles.append(f"{role.name} (недостаточно прав / иерархия ролей)")
             except Exception:
-                pass
-            # Ответ на исходное сообщение-заявку возможен только пока бот не
-            # рестартовал (self.message теряется) — это некритично, DM ушёл.
-            if self.message:
-                try:
-                    await self.message.reply(embed=Embed(title="✅ Принято", description=f"Вы зачислены в отряд **{self.squad_name}**!", color=Color.green()))
-                except Exception:
-                    pass
-
+                logger.exception("Не удалось выдать роль %s кандидату %s.", role.id, member.id)
+                failed_roles.append(f"{role.name} (ошибка Discord API)")
+        try:
+            dm_embed = Embed(
+                title="⏳ Ваша заявка принята!",
+                description="Вы успешно прошли предварительное подтверждение. Ожидайте связи от офицера отряда.",
+                color=Color.green()
+            )
+            await member.send(embed=dm_embed)
+        except Exception:
+            pass
+        # Ответ на исходное сообщение-заявку возможен только пока бот не
+        # рестартовал (self.message теряется) — это некритично, DM ушёл.
+        if self.message:
             try:
-                log_fields = [
-                    ("Модератор", interaction.user.mention, False),
-                    ("Выданные роли", ", ".join(granted_roles) or "—", False),
-                ]
-                if failed_roles:
-                    log_fields.append(("⚠️ НЕ выданы", "\n".join(failed_roles), False))
-                await send_log_embed(
-                    interaction.guild,
-                    "forms",
-                    "✅ Заявка принята" if not failed_roles else "⚠️ Заявка принята (роли выданы частично)",
-                    f"{member.mention} принят в отряд **{self.squad_name}**.",
-                    color=Color.green() if not failed_roles else Color.orange(),
-                    fields=log_fields,
-                )
+                await self.message.reply(embed=Embed(title="✅ Принято", description=f"Вы зачислены в отряд **{self.squad_name}**!", color=Color.green()))
             except Exception:
                 pass
 
-        await _disable_view_on_message(interaction, self)
-        if not member:
-            confirm_text = "⚠️ Участник не найден на сервере — роли не выданы."
-        elif failed_roles:
+        try:
+            log_fields = [
+                ("Модератор", interaction.user.mention, False),
+                ("Выданные роли", ", ".join(granted_roles) or "—", False),
+            ]
+            if failed_roles:
+                log_fields.append(("⚠️ НЕ выданы", "\n".join(failed_roles), False))
+            await send_log_embed(
+                interaction.guild,
+                "forms",
+                "✅ Заявка принята" if not failed_roles else "⚠️ Заявка принята (роли выданы частично)",
+                f"{member.mention} принят в отряд **{self.squad_name}**.",
+                color=Color.green() if not failed_roles else Color.orange(),
+                fields=log_fields,
+            )
+        except Exception:
+            pass
+
+        if failed_roles:
             confirm_text = "⚠️ Принято, но часть ролей не выдана:\n" + "\n".join(failed_roles)
         else:
             confirm_text = "✅ Принято, роли выданы."
@@ -217,11 +238,17 @@ class ConfirmView(View):
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
 
-        if not _claim_message(interaction.message):
+        target_user_id = self.target_user_id or _extract_user_id_from_embed(interaction.message)
+        if not target_user_id:
+            await interaction.followup.send(
+                "⚠️ Не удалось определить кандидата; заявка не изменена.",
+                ephemeral=True,
+            )
+            return
+        if not await _claim_message(interaction.message):
             await interaction.followup.send("Эта заявка уже обработана.", ephemeral=True)
             return
-
-        target_user_id = self.target_user_id or _extract_user_id_from_embed(interaction.message)
+        await _disable_view_on_message(interaction, self)
         if self.message:
             try:
                 await self.message.add_reaction("❌")
@@ -238,7 +265,6 @@ class ConfirmView(View):
             )
         except Exception:
             pass
-        await _disable_view_on_message(interaction, self)
         await interaction.followup.send("Отказ зарегистрирован.", ephemeral=True)
 
 
@@ -315,16 +341,21 @@ class PosActionConfirmView(View):
             return
         try:
             result = await self.executor()
-        except Exception as e:
-            result = f"Ошибка при выполнении: {e}"
+        except Exception:
+            logger.exception("Подтверждённое действие P.OS завершилось исключением.")
+            result = "Действие не выполнено из-за внутренней ошибки; подробности записаны в журнал."
         try:
-            await interaction.followup.send(f"✅ Действие выполнено.\n{result}", ephemeral=True)
+            await interaction.followup.send(
+                f"✅ Запрос обработан. Фактический результат:\n{result}",
+                ephemeral=True,
+            )
         except Exception:
             pass
         if interaction.message:
             try:
                 await interaction.message.reply(
-                    f"✅ Запрос одобрен владельцем и выполнен:\n> {self.action_summary}\n{result}",
+                    f"✅ Запрос одобрен владельцем. Фактический результат:\n"
+                    f"> {self.action_summary}\n{result}",
                     mention_author=False,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
@@ -366,6 +397,7 @@ class RejectModal(Modal):
             label="Причина отклонения",
             style=discord.TextStyle.long,
             required=True,
+            max_length=1000,
             placeholder="Объясните почему отклоняете жалобу",
         )
         self.add_item(self.reason)
@@ -374,20 +406,25 @@ class RejectModal(Modal):
         # Сразу defer: чтение истории (до 200 сообщений) + DM занимают дольше
         # 3 секунд — без defer interaction «умирал» с ошибкой у модератора.
         await interaction.response.defer(ephemeral=True)
-        if not _claim_message_id(self.source_message_id):
-            await interaction.followup.send("Эта жалоба уже обработана.", ephemeral=True)
-            return
         reason_text = self.reason.value
         guild = interaction.guild
         if guild is None:
             await interaction.followup.send("Сервер недоступен; жалоба не изменена.", ephemeral=True)
             return
+        complaint_channel = guild.get_channel(self.complaint_channel_id)
+        if not isinstance(complaint_channel, (discord.TextChannel, discord.Thread)):
+            await interaction.followup.send(
+                "Канал жалобы недоступен; решение не сохранено.",
+                ephemeral=True,
+            )
+            return
+        if not await _claim_message_id(self.source_message_id):
+            await interaction.followup.send("Эта жалоба уже обработана.", ephemeral=True)
+            return
         try:
-            c = guild.get_channel(self.complaint_channel_id)
             history = []
-            if isinstance(c, (discord.TextChannel, discord.Thread)):
-                async for m in c.history(limit=200, oldest_first=True):
-                    history.append(f"{m.author.display_name}: {m.content}")
+            async for m in complaint_channel.history(limit=200, oldest_first=True):
+                history.append(f"{m.author.display_name}: {m.content}")
             history_text = "\n".join(history) if history else "(нет истории)"
         except Exception:
             history_text = "(не удалось получить историю)"
@@ -418,9 +455,7 @@ class RejectModal(Modal):
         notification = "Автор уведомлён." if dm_sent else "ЛС автору отправить не удалось."
         await interaction.followup.send(f"Отклонение зарегистрировано. {notification} Канал жалобы будет удалён.", ephemeral=True)
         try:
-            channel = guild.get_channel(self.complaint_channel_id)
-            if channel:
-                await channel.delete(reason=f"Жалоба отклонена админом {interaction.user}")
+            await complaint_channel.delete(reason=f"Жалоба отклонена админом {interaction.user}")
         except Exception:
             pass
 
@@ -473,10 +508,6 @@ class ComplaintView(View):
         # defer до чтения истории/DM (3-секундный лимит первичного ответа).
         await interaction.response.defer(ephemeral=True)
 
-        if not _claim_message(interaction.message):
-            await interaction.followup.send("Эта жалоба уже обработана.", ephemeral=True)
-            return
-
         guild = interaction.guild
         if guild is None:
             await interaction.followup.send("Сервер недоступен; жалоба не изменена.", ephemeral=True)
@@ -485,12 +516,21 @@ class ComplaintView(View):
         channel_id = self._resolve_channel_id(interaction)
         history = []
         channel = guild.get_channel(channel_id)
-        if isinstance(channel, (discord.TextChannel, discord.Thread)):
-            try:
-                async for m in channel.history(limit=200, oldest_first=True):
-                    history.append(f"{m.author.display_name}: {m.content}")
-            except Exception:
-                pass
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            await interaction.followup.send(
+                "Канал жалобы недоступен; решение не сохранено.",
+                ephemeral=True,
+            )
+            return
+        if not await _claim_message(interaction.message):
+            await interaction.followup.send("Эта жалоба уже обработана.", ephemeral=True)
+            return
+        await _disable_view_on_message(interaction, self)
+        try:
+            async for m in channel.history(limit=200, oldest_first=True):
+                history.append(f"{m.author.display_name}: {m.content}")
+        except Exception:
+            pass
         history_text = "\n".join(history) if history else "(нет истории)"
 
         if submitter:

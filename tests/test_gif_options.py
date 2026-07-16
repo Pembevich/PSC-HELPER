@@ -1,6 +1,6 @@
 import unittest
 
-from commands import parse_gif_options_from_text
+from commands import format_gif_error_for_user, parse_gif_options_from_text
 
 
 class ParseGifOptionsFromTextTests(unittest.TestCase):
@@ -34,10 +34,13 @@ class ParseGifOptionsFromTextTests(unittest.TestCase):
         self.assertEqual(opts.get("duration"), 5000)
 
     def test_parses_standalone_number_fps(self):
-        # 5 to 30 integer is treated as FPS
+        # Supported integer values are treated as FPS.
         opts = parse_gif_options_from_text("12")
         self.assertEqual(opts.get("fps"), 12)
         self.assertNotIn("duration", opts)
+
+    def test_unsupported_fps_is_not_silently_clamped(self):
+        self.assertNotIn("fps", parse_gif_options_from_text("fps=30"))
 
     def test_parses_standalone_number_delay_ms(self):
         # 50 to 3000 is treated as delay in ms
@@ -54,6 +57,13 @@ class ParseGifOptionsFromTextTests(unittest.TestCase):
     def test_empty_or_no_match(self):
         opts = parse_gif_options_from_text("просто гифка")
         self.assertEqual(opts, {})
+
+    def test_internal_gif_error_is_not_exposed(self):
+        result = format_gif_error_for_user(
+            RuntimeError("ffmpeg failed at /private/tmp/secret/input.mov")
+        )
+        self.assertNotIn("/private/tmp", result)
+        self.assertIn("Проверь формат", result)
 
 
 if __name__ == "__main__":

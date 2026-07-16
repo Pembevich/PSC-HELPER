@@ -13,5 +13,4 @@ exclude = [
     "^\\.codex/",
     "^\\.agents/",
     "^site/",
-    "^(rewrite_pos_ai|scratch)\\.py$",
 ]

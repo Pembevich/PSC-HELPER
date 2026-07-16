@@ -1,4 +1,7 @@
+import asyncio
+import json
 import unittest
+from unittest.mock import patch
 
 import guild_config
 
@@ -51,6 +54,55 @@ class MergeDefaultsTests(unittest.TestCase):
     def test_defaults_allow_profanity(self):
         # Маты/оскорбления разрешены по умолчанию.
         self.assertIs(guild_config.defaults()["allow_profanity"], True)
+
+
+class GuildSettingsConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        guild_config.invalidate()
+        self.rows: dict[int, str] = {}
+
+    def tearDown(self):
+        guild_config.invalidate()
+
+    async def _read(self, guild_id: int):
+        await asyncio.sleep(0)
+        return self.rows.get(guild_id)
+
+    async def _write(self, guild_id: int, raw: str):
+        await asyncio.sleep(0)
+        self.rows[guild_id] = raw
+
+    async def test_parallel_updates_do_not_overwrite_each_other(self):
+        with patch.object(guild_config, "get_guild_settings_raw", self._read), patch.object(
+            guild_config,
+            "set_guild_settings_raw",
+            self._write,
+        ):
+            await asyncio.gather(
+                guild_config.update_settings(123, {"filter_ads": False}),
+                guild_config.update_settings(123, {"mention_limit": 12}),
+            )
+
+        stored = json.loads(self.rows[123])
+        self.assertIs(stored["filter_ads"], False)
+        self.assertEqual(stored["mention_limit"], 12)
+
+    async def test_stored_values_are_coerced_and_unknown_keys_ignored(self):
+        self.rows[123] = json.dumps(
+            {
+                "filter_ads": "false",
+                "mention_limit": 9999,
+                "timeout_hours": "not-a-number",
+                "unknown": True,
+            }
+        )
+        with patch.object(guild_config, "get_guild_settings_raw", self._read):
+            settings = await guild_config.get_settings(123)
+
+        self.assertIs(settings["filter_ads"], False)
+        self.assertEqual(settings["mention_limit"], 50)
+        self.assertEqual(settings["timeout_hours"], 24)
+        self.assertNotIn("unknown", settings)
 
 
 if __name__ == "__main__":

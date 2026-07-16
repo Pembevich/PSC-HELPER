@@ -35,6 +35,7 @@ from utils import (
     safe_send_dm,
 )
 from logging_utils import send_log_embed
+from message_gate import wait_for_moderation
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,14 @@ class FormsCog(commands.Cog):
         if not message.guild or author.bot or not isinstance(author, discord.Member):
             return
         author_member = cast(discord.Member, author)
+
+        # Listeners and command processing run concurrently in discord.py. Do
+        # not copy, repost or transform a message until moderation has accepted
+        # it. A timeout is fail-closed so unsafe content is never published by
+        # the bot while its verdict is unknown.
+        moderation_result = await wait_for_moderation(message.id)
+        if moderation_result is not False:
+            return
 
         # Авто-отписки
         try:
@@ -615,18 +624,18 @@ class FormsCog(commands.Cog):
                 if roles_to_add:
                     try:
                         await member.add_roles(*roles_to_add, reason=f"P.OS punishment by {message.author}")
-                    except Exception as exc:
+                    except Exception:
                         names = ", ".join(role.name for role in roles_to_add)
-                        role_errors.append(f"не удалось выдать {names}: {exc}")
-                        logger.error("Failed to add punishment roles: %s", exc)
+                        role_errors.append(f"не удалось выдать {names}: Discord отклонил операцию")
+                        logger.error("Failed to add punishment roles.", exc_info=True)
                         return False
                 if roles_to_remove:
                     try:
                         await member.remove_roles(*roles_to_remove, reason=f"P.OS punishment by {message.author}")
-                    except Exception as exc:
+                    except Exception:
                         names = ", ".join(role.name for role in roles_to_remove)
-                        role_errors.append(f"не удалось снять {names}: {exc}")
-                        logger.error("Failed to remove punishment roles: %s", exc)
+                        role_errors.append(f"не удалось снять {names}: Discord отклонил операцию")
+                        logger.error("Failed to remove punishment roles.", exc_info=True)
                         return False
                 return True
 
