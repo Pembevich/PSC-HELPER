@@ -449,6 +449,24 @@ class ToolExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(permissions.manage_messages)
         self.assertTrue(permissions.kick_members)
         self.assertIn("обновлена", result)
+        self.assertIn("права", result)
+        self.assertNotIn("permissions", result)
+
+    async def test_list_servers_hides_internal_cache_name(self):
+        current_guild = SimpleNamespace(id=1, name="Test", member_count=3)
+        message = SimpleNamespace(guild=current_guild)
+        bot = SimpleNamespace(guilds=[current_guild], user=None)
+
+        result = await pos_ai._perform_tool_action(
+            bot,
+            message,
+            "list_servers",
+            {},
+            None,
+        )
+
+        self.assertIn("Фактические серверы", result)
+        self.assertNotIn("bot.guilds", result)
 
 
 class ShutdownPreparationTests(unittest.IsolatedAsyncioTestCase):

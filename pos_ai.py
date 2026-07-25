@@ -605,6 +605,39 @@ _TOOL_ARGUMENT_LABELS = {
     "include_roles": "показывать роли",
 }
 
+_UPDATED_FIELD_LABELS = {
+    "name": "имя",
+    "colour": "цвет",
+    "hoist": "отдельное отображение",
+    "mentionable": "возможность упоминания",
+    "position": "позиция",
+    "permissions": "права",
+    "topic": "описание",
+    "slowmode_delay": "медленный режим",
+    "nsfw": "возрастное ограничение",
+    "category": "категория",
+    "description": "описание",
+    "verification_level": "уровень проверки",
+    "explicit_content_filter": "фильтр контента",
+    "default_notifications": "уведомления по умолчанию",
+    "archived": "состояние архива",
+    "locked": "блокировка",
+}
+
+_BULK_ACTION_LABELS = {
+    "ban": "бан",
+    "kick": "кик",
+    "timeout": "тайм-аут",
+    "untimeout": "снятие тайм-аута",
+    "add_role": "выдача роли",
+    "remove_role": "снятие роли",
+    "lift_restrictions": "снятие ограничений",
+}
+
+
+def _format_updated_fields(keys) -> str:
+    return ", ".join(_UPDATED_FIELD_LABELS.get(str(key), str(key)) for key in keys)
+
 
 async def _resolve_member(guild: discord.Guild, user_id: int | None):
     if not user_id:
@@ -955,7 +988,8 @@ async def _prepare_mutating_tool_action(
         resolved_guild = _resolve_guild_by_ident(bot, server_ident)
         if resolved_guild is None:
             return args, current_user_id, None, [], (
-                f"сервер `{server_ident}` не найден однозначно среди фактических bot.guilds"
+                f"сервер `{server_ident}` не найден однозначно среди серверов, "
+                "где сейчас присутствует P.OS"
             )
         guild = resolved_guild
     args["server_id_or_name"] = str(guild.id)
@@ -1403,7 +1437,7 @@ async def _perform_bulk_user_action(
 ) -> str:
     action = (action or "").strip().lower()
     if not identifiers:
-        return "Ошибка: передай список пользователей в user_identifiers."
+        return "Ошибка: передай список точных username/login, Discord ID или упоминаний."
     role = None
     if action in {"add_role", "remove_role"}:
         role = resolve_role_smart(guild, str(args.get("role_id_or_name", "")))
@@ -1413,7 +1447,8 @@ async def _perform_bulk_user_action(
         minutes = max(1, min(int(args.get("minutes", 10)), 40320))
     except (TypeError, ValueError):
         minutes = 10
-    reason = str(args.get("reason", "")).strip() or f"Массовое действие P.OS: {action}"
+    action_label = _BULK_ACTION_LABELS.get(action, "массовое действие")
+    reason = str(args.get("reason", "")).strip() or f"P.OS: {action_label}"
     protected = set(POS_OWNER_USER_IDS)
     if bot.user:
         protected.add(bot.user.id)
@@ -1446,7 +1481,7 @@ async def _perform_bulk_user_action(
                 from moderation import lift_member_restrictions
                 await lift_member_restrictions(member, reason)
             else:
-                failed.append(f"{ident}: неизвестное действие '{action}'")
+                failed.append(f"{ident}: неподдерживаемое массовое действие")
                 continue
             ok.append(f"{member.name} (`{member.id}`)")
         except discord.Forbidden:
@@ -1454,7 +1489,10 @@ async def _perform_bulk_user_action(
         except Exception as exc:
             failed.append(f"{ident}: {_safe_action_failure('массовое действие', exc)}")
 
-    parts = [f"Массовое действие `{action}` на сервере `{guild.name}`: успешно {len(ok)}, ошибок {len(failed)}."]
+    parts = [
+        f"Массовое действие «{action_label}» на сервере `{guild.name}`: "
+        f"успешно {len(ok)}, ошибок {len(failed)}."
+    ]
     if ok:
         parts.append("Успешно: " + ", ".join(ok[:20]))
     if failed:
@@ -1483,7 +1521,10 @@ async def _perform_tool_action(
     if server_ident:
         target_guild = _resolve_guild_by_ident(bot, server_ident)
         if not target_guild:
-            return f"Сервер '{server_ident}' не найден среди тех, где есть P.OS. Список — через list_servers."
+            return (
+                f"Сервер '{server_ident}' не найден среди тех, где сейчас есть P.OS. "
+                "Попроси показать фактический список доступных серверов."
+            )
         guild = target_guild
 
     # Инструменты, которым НЕ нужен сервер-контекст, обрабатываются раньше.
@@ -1500,10 +1541,10 @@ async def _perform_tool_action(
 
     if name == "dm_user":
         if not user_id:
-            return "Ошибка: не указан user_id"
+            return "Ошибка: не указан пользователь."
         text = str(args.get("text", "")).strip()
         if not text:
-            return "Ошибка: не указан текст ЛС (text)."
+            return "Ошибка: не указан текст личного сообщения."
         target = bot.get_user(user_id)
         if target is None:
             try:
@@ -1534,7 +1575,7 @@ async def _perform_tool_action(
 
     if name == "ban_user":
         if not user_id:
-            return "Ошибка: не указан user_id"
+            return "Ошибка: не указан пользователь."
         reason = args.get("reason", "Бан от P.OS")
         try:
             await guild.ban(discord.Object(id=user_id), reason=reason)
@@ -1564,7 +1605,7 @@ async def _perform_tool_action(
                 except Exception as exc:
                     return _safe_action_failure("чтение бан-листа", exc)
         if not user_id:
-            return "Ошибка: не указан user_id"
+            return "Ошибка: не указан пользователь."
         try:
             await guild.unban(discord.Object(id=user_id))
             return f"Пользователь {user_id} успешно разбанен."
@@ -1573,7 +1614,7 @@ async def _perform_tool_action(
 
     elif name == "timeout_user":
         if not user_id:
-            return "Ошибка: не указан user_id"
+            return "Ошибка: не указан пользователь."
         try:
             minutes = max(1, min(int(args.get("minutes", 10)), 40320))
         except (ValueError, TypeError):
@@ -1591,7 +1632,7 @@ async def _perform_tool_action(
 
     elif name == "kick_user":
         if not user_id:
-            return "Ошибка: не указан user_id"
+            return "Ошибка: не указан пользователь."
         reason = args.get("reason", "Кик от P.OS")
         member = await _resolve_member(guild, user_id)
         if not member:
@@ -1606,7 +1647,7 @@ async def _perform_tool_action(
 
     elif name == "set_nickname":
         if not user_id:
-            return "Ошибка: не указан user_id"
+            return "Ошибка: не указан пользователь."
         member = await _resolve_member(guild, user_id)
         if not member:
             return f"Ошибка: пользователь {user_id} не найден на сервере."
@@ -1621,7 +1662,7 @@ async def _perform_tool_action(
 
     elif name == "add_role":
         if not user_id:
-            return "Ошибка: не указан user_id"
+            return "Ошибка: не указан пользователь."
         role_ident = str(args.get("role_id_or_name", ""))
         member = await _resolve_member(guild, user_id)
         if not member:
@@ -1639,7 +1680,7 @@ async def _perform_tool_action(
 
     elif name == "remove_role":
         if not user_id:
-            return "Ошибка: не указан user_id"
+            return "Ошибка: не указан пользователь."
         role_ident = str(args.get("role_id_or_name", ""))
         member = await _resolve_member(guild, user_id)
         if not member:
@@ -1658,7 +1699,7 @@ async def _perform_tool_action(
     elif name == "create_role":
         role_name = str(args.get("name", "")).strip()
         if not role_name:
-            return "Ошибка: не указано имя роли (name)."
+            return "Ошибка: не указано имя роли."
         existing = resolve_role_smart(guild, role_name)
         if existing and existing.name.lower() == role_name.lower():
             return f"Роль с именем '{existing.name}' уже существует (ID {existing.id})."
@@ -1743,7 +1784,7 @@ async def _perform_tool_action(
             return "Ошибка: не указано ни одного поля для изменения роли."
         try:
             await role.edit(reason="Изменено P.OS", **kwargs)
-            return f"Роль '{role.name}' обновлена ({', '.join(kwargs.keys())})."
+            return f"Роль '{role.name}' обновлена: {_format_updated_fields(kwargs)}."
         except discord.Forbidden:
             return f"Ошибка: недостаточно прав, чтобы изменить роль '{role.name}'. Проверь иерархию ролей."
         except Exception as exc:
@@ -1752,7 +1793,7 @@ async def _perform_tool_action(
     elif name == "delete_role":
         role_ident = str(args.get("role_id_or_name", ""))
         if not role_ident:
-            return "Ошибка: не указана роль (role_id_or_name)."
+            return "Ошибка: не указано точное имя или Discord ID роли."
         role = resolve_role_smart(guild, role_ident)
         if not role:
             return _role_not_found_hint(guild, role_ident)
@@ -1770,7 +1811,7 @@ async def _perform_tool_action(
     elif name == "create_channel":
         ch_name = str(args.get("name", "")).strip()
         if not ch_name:
-            return "Ошибка: не указано имя канала (name)."
+            return "Ошибка: не указано имя канала."
         ch_type = str(args.get("type", "text")).strip().lower()
         category = None
         cat_ident = str(args.get("category_id_or_name", "")).strip()
@@ -1851,7 +1892,7 @@ async def _perform_tool_action(
             return "Ошибка: не указано ни одного поля для изменения канала."
         try:
             await channel.edit(reason="Изменено P.OS", **kwargs)
-            return f"Канал '{channel.name}' обновлён ({', '.join(kwargs.keys())})."
+            return f"Канал '{channel.name}' обновлён: {_format_updated_fields(kwargs)}."
         except discord.Forbidden:
             return f"Ошибка: недостаточно прав, чтобы изменить канал '{channel.name}'."
         except Exception as exc:
@@ -1943,7 +1984,7 @@ async def _perform_tool_action(
         reason = str(args.get("reason", "")).strip() or "Изменение сервера P.OS"
         try:
             await guild.edit(reason=reason[:512], **kwargs)
-            return f"Сервер '{guild.name}' обновлён ({', '.join(kwargs.keys())})."
+            return f"Сервер '{guild.name}' обновлён: {_format_updated_fields(kwargs)}."
         except discord.Forbidden:
             return "Ошибка: недостаточно прав для изменения сервера (нужно «Управление сервером»)."
         except Exception as exc:
@@ -1956,7 +1997,7 @@ async def _perform_tool_action(
             return f"Ошибка: '{ch_ident}' не является текстовым каналом."
         thread_name = str(args.get("name", "")).strip()
         if not thread_name:
-            return "Ошибка: не указано имя ветки (name)."
+            return "Ошибка: не указано имя ветки."
         reason = str(args.get("reason", "")).strip() or "Создание ветки P.OS"
         message_id_raw = re.sub(r"[^0-9]", "", str(args.get("message_id", "")))
         try:
@@ -1984,7 +2025,7 @@ async def _perform_tool_action(
         reason = str(args.get("reason", "")).strip() or "Настройка ветки P.OS"
         try:
             await thread_channel.edit(reason=reason[:512], **kwargs)
-            return f"Ветка '{thread_channel.name}' обновлена ({', '.join(kwargs.keys())})."
+            return f"Ветка '{thread_channel.name}' обновлена: {_format_updated_fields(kwargs)}."
         except discord.Forbidden:
             return "Ошибка: недостаточно прав для изменения ветки."
         except Exception as exc:
@@ -1992,7 +2033,7 @@ async def _perform_tool_action(
 
     elif name == "voice_action":
         if not user_id:
-            return "Ошибка: не указан user_id"
+            return "Ошибка: не указан пользователь."
         member = await _resolve_member(guild, user_id)
         if not member:
             return f"Ошибка: пользователь {user_id} не найден на сервере."
@@ -2005,7 +2046,7 @@ async def _perform_tool_action(
             if action == "move":
                 target_channel = resolve_channel_smart(guild, str(args.get("channel_id_or_name", "")))
                 if not isinstance(target_channel, (discord.VoiceChannel, discord.StageChannel)):
-                    return "Ошибка: для move укажи голосовой/stage канал назначения."
+                    return "Ошибка: для перемещения укажи точный голосовой или сценический канал."
                 await member.move_to(target_channel, reason=reason[:512])
                 return f"Пользователь {user_id} перемещён в '{target_channel.name}'."
             if action in {"mute", "unmute", "deafen", "undeafen"}:
@@ -2015,8 +2056,17 @@ async def _perform_tool_action(
                 if action in {"deafen", "undeafen"}:
                     kwargs["deafen"] = action == "deafen"
                 await member.edit(reason=reason[:512], **kwargs)
-                return f"Голосовое действие '{action}' применено к пользователю {user_id}."
-            return "Ошибка: action должен быть disconnect, mute, unmute, deafen, undeafen или move."
+                voice_label = {
+                    "mute": "серверное отключение микрофона",
+                    "unmute": "снятие серверного отключения микрофона",
+                    "deafen": "серверное отключение звука",
+                    "undeafen": "снятие серверного отключения звука",
+                }[action]
+                return f"{voice_label.capitalize()} применено к пользователю {user_id}."
+            return (
+                "Ошибка: укажи голосовое действие: отключить, переместить, "
+                "заглушить, снять заглушение, оглушить или снять оглушение."
+            )
         except discord.Forbidden:
             return "Ошибка: недостаточно прав для голосового действия."
         except Exception as exc:
@@ -2076,7 +2126,7 @@ async def _perform_tool_action(
                 f"- {getattr(channel, 'name', '?')} (`{channel.id}`), тип: {channel_type}{category_label}"
             )
         if not lines:
-            return f"На сервере '{guild.name}' нет доступных каналов в bot.guilds."
+            return f"На сервере '{guild.name}' нет доступных P.OS каналов."
         return f"Фактическая структура каналов '{guild.name}' (`{guild.id}`):\n" + "\n".join(lines)
 
     elif name == "list_roles":
@@ -2175,7 +2225,7 @@ async def _perform_tool_action(
 
     elif name == "user_info":
         if not user_id:
-            return "Ошибка: укажи пользователя через user_id или user_identifier."
+            return "Ошибка: укажи Discord ID, mention или точный username/login пользователя."
         member = await _resolve_member(guild, user_id)
         if not member:
             return f"Пользователь `{user_id}` не найден на сервере `{guild.name}`."
@@ -2207,7 +2257,10 @@ async def _perform_tool_action(
         ):
             read_channel = message.channel
         else:
-            return f"Для чтения сообщений на сервере '{guild.name}' укажи канал (channel_id_or_name)."
+            return (
+                f"Для чтения сообщений на сервере '{guild.name}' укажи "
+                "Discord ID или точное имя канала."
+            )
         if not isinstance(read_channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
             return f"Ошибка: текстовый канал '{ch_ident}' не найден на сервере '{guild.name}'."
         query = (str(args.get("query", "")).strip()).lower()
@@ -2362,7 +2415,7 @@ async def _perform_tool_action(
             f"- {g.name} (ID `{g.id}`), участников: {g.member_count or 'неизвестно'}"
             for g in guilds[:50]
         ]
-        return f"Фактический снимок bot.guilds: серверы, где присутствует P.OS ({len(guilds)}):\n" + "\n".join(lines)
+        return f"Фактические серверы, где сейчас присутствует P.OS ({len(guilds)}):\n" + "\n".join(lines)
 
     elif name == "create_invite":
         # Cross-server resolution already happened once at the top of this
@@ -2402,8 +2455,8 @@ async def _perform_tool_action(
         if guild is not message.guild:
             if not ch_ident:
                 return (
-                    f"Для удаления сообщений на сервере '{guild.name}' укажи канал "
-                    f"(channel_id_or_name)."
+                    f"Для удаления сообщений на сервере '{guild.name}' укажи "
+                    "Discord ID или точное имя канала."
                 )
             msg_channel = None
         if ch_ident:
@@ -2419,7 +2472,7 @@ async def _perform_tool_action(
         except (ValueError, TypeError):
             count = 0
         if count < 1:
-            return "Ошибка: укажи количество сообщений (count) от 1 до 100."
+            return "Ошибка: укажи количество сообщений от 1 до 100."
         count = min(count, 100)
         try:
             same_channel = getattr(msg_channel, "id", None) == getattr(message.channel, "id", None)
@@ -2442,7 +2495,7 @@ async def _perform_tool_action(
 
     elif name == "untimeout_user":
         if not user_id:
-            return "Ошибка: не указан user_id"
+            return "Ошибка: не указан пользователь."
         member = await _resolve_member(guild, user_id)
         if not member:
             return f"Ошибка: пользователь {user_id} не найден на сервере."
@@ -2459,7 +2512,7 @@ async def _perform_tool_action(
         ch_ident = str(args.get("channel_id_or_name", ""))
         text = str(args.get("text", "")).strip()
         if not text:
-            return "Ошибка: не указан текст сообщения (text)."
+            return "Ошибка: не указан текст сообщения."
         channel = resolve_channel_smart(guild, ch_ident)
         if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
             return f"Ошибка: текстовый канал '{ch_ident}' не найден на сервере '{guild.name}'."
@@ -2473,7 +2526,7 @@ async def _perform_tool_action(
 
     elif name == "ping_user":
         if not user_id:
-            return "Ошибка: не указан user_id"
+            return "Ошибка: не указан пользователь."
         member = await _resolve_member(guild, user_id)
         if not member:
             return f"Ошибка: пользователь {user_id} не найден на сервере '{guild.name}'."
@@ -2488,7 +2541,10 @@ async def _perform_tool_action(
         else:
             # Кросс-серверный пинг без канала: раньше сообщение уходило в канал
             # ИСХОДНОГО сервера. Требуем явный канал.
-            return f"Для пинга на сервере '{guild.name}' укажи канал (channel_id_or_name)."
+            return (
+                f"Для пинга на сервере '{guild.name}' укажи Discord ID "
+                "или точное имя канала."
+            )
         if not isinstance(ping_channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
             return f"Ошибка: канал для пинга не найден на сервере '{guild.name}'."
         extra = str(args.get("text", "")).strip()
@@ -2506,7 +2562,7 @@ async def _perform_tool_action(
 
     elif name == "lift_restrictions":
         if not user_id:
-            return "Ошибка: не указан user_id"
+            return "Ошибка: не указан пользователь."
         member = await _resolve_member(guild, user_id)
         if not member:
             return f"Ошибка: пользователь {user_id} не найден на сервере '{guild.name}'."
@@ -2569,7 +2625,7 @@ async def _perform_tool_action(
                 if k in args:
                     changes[k] = args[k]
         if not changes:
-            return "Ошибка: не переданы изменения настроек (settings_json)."
+            return "Ошибка: не указано, какие настройки нужно изменить."
         try:
             from guild_config import update_settings as _us
             updated, rejected = await _us(guild.id, changes)
@@ -2605,7 +2661,7 @@ async def _perform_tool_action(
 
     elif name == "mute_ai_for_user":
         if not user_id:
-            return "Ошибка: не указан user_id"
+            return "Ошибка: не указан пользователь."
         try:
             await set_ai_muted_user(user_id, guild.id, True)
             return f"Пользователь {user_id} добавлен в чёрный список."
@@ -2614,7 +2670,7 @@ async def _perform_tool_action(
 
     elif name == "unmute_ai_for_user":
         if not user_id:
-            return "Ошибка: не указан user_id"
+            return "Ошибка: не указан пользователь."
         try:
             await set_ai_muted_user(user_id, guild.id, False)
             return f"Пользователь {user_id} удалён из чёрного списка."
