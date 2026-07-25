@@ -1,3 +1,4 @@
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -515,6 +516,65 @@ class SummaryTests(unittest.TestCase):
     def test_summary_unknown_tool_falls_back_to_name(self):
         s = _summarize_tool_call("some_future_tool", {}, None)
         self.assertIn("some_future_tool", s)
+
+    def test_summary_uses_human_readable_argument_labels(self):
+        summary = _summarize_tool_call(
+            "delete_channel",
+            {
+                "server_id_or_name": "123",
+                "channel_id_or_name": "456",
+            },
+            None,
+        )
+
+        self.assertIn("сервер=123", summary)
+        self.assertIn("канал=456", summary)
+        self.assertNotIn("server_id_or_name", summary)
+        self.assertNotIn("channel_id_or_name", summary)
+
+    def test_event_formatter_hides_legacy_tool_names(self):
+        event = {
+            "id": 1,
+            "ts": 1,
+            "event_type": "pos_tool",
+            "summary": "P.OS tool `delete_channel`: raw",
+            "details": json.dumps({
+                "tool": "delete_channel",
+                "args": {
+                    "server_id_or_name": "123",
+                    "channel_id_or_name": "456",
+                },
+                "result": "Канал удалён.",
+            }),
+            "actor_name": "Pumba",
+        }
+
+        line = pos_ai._format_event_line(event)
+
+        self.assertIn("удаление канала", line)
+        self.assertIn("канал=456", line)
+        self.assertNotIn("tool", line.lower())
+        self.assertNotIn("delete_channel", line)
+        self.assertNotIn("channel_id_or_name", line)
+
+    def test_event_formatter_hides_legacy_discord_log_embed(self):
+        event = {
+            "id": 2,
+            "ts": 1,
+            "event_type": "message",
+            "summary": (
+                "P.OS tool action: Инструмент: `create_channel`; "
+                "server_id_or_name=123, name=test"
+            ),
+        }
+
+        line = pos_ai._format_event_line(event)
+
+        self.assertIn("создание канала", line)
+        self.assertIn("сервер=123", line)
+        self.assertNotIn("tool", line.lower())
+        self.assertNotIn("create_channel", line)
+        self.assertNotIn("server_id_or_name", line)
 
 
 if __name__ == "__main__":

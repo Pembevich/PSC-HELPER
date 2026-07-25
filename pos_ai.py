@@ -577,6 +577,34 @@ _TOOL_ACTION_LABELS = {
     "mute_ai_for_user": "блокировку ответов", "unmute_ai_for_user": "снятие блокировки",
 }
 
+_TOOL_ARGUMENT_LABELS = {
+    "server_id_or_name": "сервер",
+    "role_id_or_name": "роль",
+    "name": "имя",
+    "new_name": "новое имя",
+    "channel_id_or_name": "канал",
+    "target_role_or_user": "цель",
+    "user_identifier": "пользователь",
+    "user_identifiers": "пользователи",
+    "username": "логин",
+    "login": "логин",
+    "nickname": "ник",
+    "reason": "причина",
+    "minutes": "минуты",
+    "count": "количество",
+    "limit": "лимит",
+    "query": "запрос",
+    "event_type": "тип события",
+    "text": "текст",
+    "settings_json": "настройки",
+    "mode": "режим",
+    "action": "действие",
+    "preset": "профиль",
+    "scope": "область",
+    "message_id": "сообщение",
+    "include_roles": "показывать роли",
+}
+
 
 async def _resolve_member(guild: discord.Guild, user_id: int | None):
     if not user_id:
@@ -1116,6 +1144,60 @@ def _format_ts(ts: int | float | None) -> str:
         return str(ts)
 
 
+def _public_event_summary(event: dict) -> str:
+    summary = str(event.get("summary") or event.get("event_type") or "событие P.OS")
+    raw_details = event.get("details")
+    if isinstance(raw_details, dict):
+        details = raw_details
+    elif isinstance(raw_details, str):
+        try:
+            parsed_details = json.loads(raw_details)
+            details = parsed_details if isinstance(parsed_details, dict) else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            details = {}
+    else:
+        details = {}
+
+    operation_name = str(details.get("operation") or details.get("tool") or "").strip()
+    if event.get("event_type") == "pos_tool" and operation_name in _TOOL_ACTION_LABELS:
+        raw_args = details.get("args")
+        args: dict = dict(raw_args) if isinstance(raw_args, dict) else {}
+        result = _redact_secrets(str(details.get("result") or "")).strip()
+        public_summary = f"P.OS: {_summarize_tool_call(operation_name, args, event.get('target_user_id'))}"
+        if result:
+            public_summary += f". Результат: {result[:500]}"
+        return public_summary
+
+    summary = re.sub(
+        r"(?i)\bP\.OS\s+tool\s+action\s*:\s*",
+        "Действие P.OS: ",
+        summary,
+    )
+
+    def replace_operation(match: re.Match[str]) -> str:
+        operation = match.group("operation")
+        return "Операция: " + _TOOL_ACTION_LABELS.get(operation, "действие P.OS")
+
+    summary = re.sub(
+        r"(?i)\bИнструмент\s*:\s*`?(?P<operation>[a-z_][a-z0-9_]*)`?",
+        replace_operation,
+        summary,
+    )
+
+    def replace_pos_operation(match: re.Match[str]) -> str:
+        operation = match.group("operation")
+        return "P.OS: " + _TOOL_ACTION_LABELS.get(operation, "действие")
+
+    summary = re.sub(
+        r"(?i)\bP\.OS\s+tool\s+`?(?P<operation>[a-z_][a-z0-9_]*)`?",
+        replace_pos_operation,
+        summary,
+    )
+    for key, label in _TOOL_ARGUMENT_LABELS.items():
+        summary = re.sub(rf"\b{re.escape(key)}=", f"{label}=", summary)
+    return summary
+
+
 def _format_event_line(event: dict, guild: discord.Guild | None = None) -> str:
     channel_id = event.get("channel_id")
     channel = guild.get_channel(int(channel_id)) if guild and channel_id else None
@@ -1124,7 +1206,7 @@ def _format_event_line(event: dict, guild: discord.Guild | None = None) -> str:
     actor = event.get("actor_name") or (f"ID {event.get('actor_id')}" if event.get("actor_id") else "система")
     return (
         f"- `{event.get('id')}` {_format_ts(event.get('ts'))} {channel_label}{deleted}: "
-        f"{event.get('summary') or event.get('event_type')} (actor: {actor})"
+        f"{_public_event_summary(event)} (actor: {actor})"
     )
 
 
@@ -2556,7 +2638,7 @@ def _summarize_tool_call(name: str, args: dict, user_id: int | None) -> str:
     ):
         val = args.get(key)
         if val:
-            details.append(f"{key}={str(val)[:120]}")
+            details.append(f"{_TOOL_ARGUMENT_LABELS.get(key, key)}={str(val)[:120]}")
     tail = (" — " + ", ".join(details)) if details else ""
     return f"{label}{tail}"
 
@@ -2591,9 +2673,9 @@ async def _log_pos_tool_result(
             target_user_id=user_id,
             channel_id=getattr(message.channel, "id", None),
             message_id=message.id,
-            summary=f"P.OS tool `{name}`: {safe_summary} -> {safe_result[:500]}",
+            summary=f"P.OS: {safe_summary}. Результат: {safe_result[:500]}",
             details={
-                "tool": name,
+                "operation": name,
                 "args": audit_args,
                 "result": safe_result[:8000],
                 "source_guild_id": message.guild.id,
@@ -2611,11 +2693,10 @@ async def _log_pos_tool_result(
         await _sle(
             target_guild,
             "security",
-            "🧠 P.OS tool action",
+            "🧠 Действие P.OS",
             (
-                f"Инструмент: `{name}`\n"
                 f"Инициатор: {message.author.mention} (`{message.author.id}`)\n"
-                f"Действие: {safe_summary}\n"
+                f"Операция: {safe_summary}\n"
                 f"Результат: {safe_result[:700]}"
             ),
             color=discord.Color.blurple(),
