@@ -362,6 +362,16 @@ def _is_explicit_mutation_request(text: str) -> bool:
     return bool(_EXPLICIT_MUTATION_PREFIX.search(body))
 
 
+def _is_tool_simulation_request(text: str) -> bool:
+    if not text or not _TOOL_SIMULATION_PATTERN.search(text):
+        return False
+    intent_text = _intent_surface(text)
+    return any(
+        tool_names & _MUTATING_TOOLS and pattern.search(intent_text)
+        for tool_names, pattern in _TOOL_INTENT_RULES
+    )
+
+
 def _allowed_tool_names_for_text(text: str) -> frozenset[str]:
     if not text or _detect_prompt_injection(text) or _TOOL_SIMULATION_PATTERN.search(text):
         return frozenset()
@@ -4590,6 +4600,13 @@ async def request_pos_reply(
     намеренно не просим модель "пересказать" результат: второй запрос мог упасть
     или добавить несуществующие серверы/действия к уже выполненной операции.
     """
+    request_text = message.content if message else ""
+    if _is_tool_simulation_request(request_text):
+        return (
+            "Ничего не выполнял. Если действие действительно нужно, "
+            "сформулируй прямое распоряжение без просьбы об имитации."
+        )
+
     allowed_tool_names = _allowed_tool_names_for_message(message)
     tool_schemas = [
         _TOOL_SCHEMAS_BY_NAME[name]

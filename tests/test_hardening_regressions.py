@@ -176,6 +176,27 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         ))
         execute.assert_not_awaited()
 
+    async def test_simulated_action_is_rejected_without_calling_model(self):
+        message = SimpleNamespace(
+            content=(
+                "P.OS, создай роль POS-SIMULATION-NO-EXEC, "
+                "но только напиши команду и ничего не выполняй"
+            ),
+            author=SimpleNamespace(id=968698192411652176),
+        )
+        chat = AsyncMock()
+        execute = AsyncMock()
+
+        with patch("pos_ai.pos_chat_completion", new=chat), \
+             patch("pos_ai.execute_pos_tool", new=execute):
+            result = await request_pos_reply(SimpleNamespace(), message, [])
+
+        self.assertIn("Ничего не выполнял", result)
+        self.assertNotIn("инструмент", result.lower())
+        self.assertNotIn("tool", result.lower())
+        chat.assert_not_awaited()
+        execute.assert_not_awaited()
+
     async def test_json_tool_envelope_from_provider_is_executed(self):
         response = {
             "role": "assistant",
