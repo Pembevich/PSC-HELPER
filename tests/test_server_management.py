@@ -286,6 +286,34 @@ class MutatingToolPreflightTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("kick_members", error)
 
+    def test_equal_position_newer_role_is_below_bot_role(self):
+        bot_role = SimpleNamespace(id=100, position=1)
+        target_role = SimpleNamespace(
+            id=200,
+            name="Created by P.OS",
+            position=1,
+            managed=False,
+            is_default=lambda: False,
+        )
+        guild = SimpleNamespace(me=SimpleNamespace(top_role=bot_role))
+
+        self.assertIsNone(pos_ai._role_hierarchy_error(guild, target_role))
+
+    def test_equal_position_older_role_is_not_manageable(self):
+        bot_role = SimpleNamespace(id=200, position=1)
+        target_role = SimpleNamespace(
+            id=100,
+            name="Above P.OS",
+            position=1,
+            managed=False,
+            is_default=lambda: False,
+        )
+        guild = SimpleNamespace(me=SimpleNamespace(top_role=bot_role))
+
+        error = pos_ai._role_hierarchy_error(guild, target_role)
+
+        self.assertIn("не ниже роли P.OS", error)
+
 
 class ToolExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod

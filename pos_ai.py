@@ -784,15 +784,39 @@ def _bot_permission_error(guild: discord.Guild, tool_name: str) -> str | None:
     return None
 
 
+def _role_is_at_or_above(target_role, bot_role) -> bool:
+    """Match Discord's hierarchy ordering, including roles sharing a position."""
+    try:
+        comparison = target_role >= bot_role
+        if isinstance(comparison, bool):
+            return comparison
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+
+    target_position = getattr(target_role, "position", 0)
+    bot_position = getattr(bot_role, "position", -1)
+    if target_position != bot_position:
+        return target_position >= bot_position
+
+    target_id = getattr(target_role, "id", None)
+    bot_id = getattr(bot_role, "id", None)
+    if isinstance(target_id, int) and isinstance(bot_id, int):
+        # discord.py treats the older (smaller-ID) role as higher on a tie.
+        return target_id <= bot_id
+    return True
+
+
 def _member_hierarchy_error(guild: discord.Guild, member: discord.Member) -> str | None:
     if member.id == getattr(guild.owner, "id", None):
         return "нельзя применить это действие к владельцу Discord-сервера"
     bot_member = guild.me
     if bot_member is None:
         return "P.OS не видит свою роль на сервере"
-    bot_top = getattr(getattr(bot_member, "top_role", None), "position", -1)
-    member_top = getattr(getattr(member, "top_role", None), "position", 0)
-    if member_top >= bot_top:
+    bot_top_role = getattr(bot_member, "top_role", None)
+    member_top_role = getattr(member, "top_role", None)
+    if bot_top_role is None or member_top_role is None:
+        return "P.OS не смог определить Discord-иерархию ролей"
+    if _role_is_at_or_above(member_top_role, bot_top_role):
         return "роль цели не ниже роли P.OS в Discord-иерархии"
     return None
 
@@ -868,8 +892,10 @@ def _role_hierarchy_error(guild: discord.Guild, role: discord.Role) -> str | Non
     bot_member = guild.me
     if bot_member is None:
         return "P.OS не видит свою роль на сервере"
-    bot_top = getattr(getattr(bot_member, "top_role", None), "position", -1)
-    if role.position >= bot_top:
+    bot_top_role = getattr(bot_member, "top_role", None)
+    if bot_top_role is None:
+        return "P.OS не смог определить Discord-иерархию ролей"
+    if _role_is_at_or_above(role, bot_top_role):
         return f"роль `{role.name}` не ниже роли P.OS в Discord-иерархии"
     return None
 
