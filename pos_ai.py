@@ -235,7 +235,14 @@ _TOOL_INTENT_RULES: tuple[tuple[frozenset[str], re.Pattern[str]], ...] = (
     (frozenset({"unban_user"}), _intent_pattern(r"\b(?:разбан\w*|сним\w*\s+бан|unban)\b")),
     (frozenset({"timeout_user"}), _intent_pattern(r"\b(?:замут\w*|тайм[\s-]?аут\w*|выда\w*.{0,30}\bмут|timeout\s+(?:user|member|@?\w+))\b")),
     (frozenset({"untimeout_user"}), _intent_pattern(r"\b(?:размут\w*|сним\w*.{0,25}(?:мут|тайм[\s-]?аут)|untimeout)\b")),
-    (frozenset({"kick_user"}), _intent_pattern(r"\b(?:кикн\w*|выгон\w*.{0,25}(?:сервер|участник)|kick\s+(?:user|member|@?\w+))\b")),
+    (
+        frozenset({"kick_user"}),
+        _intent_pattern(
+            r"\b(?:кикн\w*|выгон\w*.{0,30}(?:сервер|участник|пользовател\w*|бот\w*)|"
+            r"(?:убер\w*|удал\w*).{0,35}(?:бот\w*|пользовател\w*|участник\w*).{0,35}"
+            r"(?:с\s+)?сервер\w*|kick\s+(?:user|member|@?\w+))\b"
+        ),
+    ),
     (frozenset({"set_nickname"}), _intent_pattern(r"\b(?:смен\w*|измен\w*|сброс\w*).{0,35}(?:ник|nickname)\b")),
     (frozenset({"add_role"}), _intent_pattern(r"\b(?:выда\w*|добав\w*|назнач\w*).{0,40}\bроль\b|\badd\s+role\b")),
     (frozenset({"remove_role"}), _intent_pattern(r"\b(?:сним\w*|убер\w*|отбер\w*).{0,40}\bроль\b|\bremove\s+role\b")),
@@ -244,15 +251,17 @@ _TOOL_INTENT_RULES: tuple[tuple[frozenset[str], re.Pattern[str]], ...] = (
     (
         frozenset({"edit_role"}),
         _intent_pattern(
-            r"\b(?:измен\w*|переимен\w*|настро\w*).{0,35}\bроль\b|"
-            r"\b(?:выда\w*|добав\w*|убер\w*|сним\w*|запрет\w*|разреш\w*).{0,45}"
-            r"(?:прав\w*|permission\w*).{0,35}\bрол\w*|\bedit\s+role\b"
+            r"\b(?:измен\w*|поменя\w*|переимен\w*|настро\w*|отредакт\w*|обнов\w*)"
+            r".{0,45}\bрол\w*|"
+            r"\b(?:выда\w*|добав\w*|убер\w*|сним\w*|запрет\w*|разреш\w*|"
+            r"включ\w*|выключ\w*|поменя\w*|измен\w*|назнач\w*).{0,55}"
+            r"(?:прав\w*|permission\w*).{0,40}\bрол\w*|\bedit\s+role\b"
         ),
     ),
     (frozenset({"create_channel"}), _intent_pattern(r"\b(?:созда\w*|сдела\w*).{0,35}\b(?:канал|категори\w*)\b|\bcreate\s+channel\b")),
     (frozenset({"delete_channel"}), _intent_pattern(r"\b(?:удал\w*|уничтож\w*).{0,35}\b(?:канал|категори\w*)\b|\bdelete\s+channel\b")),
     (frozenset({"edit_channel"}), _intent_pattern(r"\b(?:измен\w*|переимен\w*|настро\w*).{0,35}\bканал\b|\bedit\s+channel\b")),
-    (frozenset({"set_channel_permission"}), _intent_pattern(r"\b(?:выда\w*|запрет\w*|разреш\w*|настро\w*|измен\w*).{0,55}(?:прав\w*|доступ).{0,35}\bканал\b|\bchannel\s+permissions?\b")),
+    (frozenset({"set_channel_permission"}), _intent_pattern(r"\b(?:выда\w*|запрет\w*|разреш\w*|настро\w*|измен\w*).{0,55}(?:прав\w*|доступ).{0,35}\bканал\w*|\bchannel\s+permissions?\b")),
     (frozenset({"lock_channel"}), _intent_pattern(r"\b(?:закр\w*|заблокир\w*|залоч\w*).{0,35}\bканал\b|\block\s+channel\b")),
     (frozenset({"unlock_channel"}), _intent_pattern(r"\b(?:откр\w*|разблокир\w*|разлоч\w*).{0,35}\bканал\b|\bunlock\s+channel\b")),
     (frozenset({"delete_messages"}), _intent_pattern(r"\b(?:удал\w*|очист\w*).{0,45}(?:сообщен\w*|чат|переписк\w*)\b|\b(?:delete|purge)\s+messages?\b")),
@@ -265,7 +274,15 @@ _TOOL_INTENT_RULES: tuple[tuple[frozenset[str], re.Pattern[str]], ...] = (
     (frozenset({"dm_user"}), _intent_pattern(r"\b(?:напиш\w*|отправ\w*).{0,45}(?:\bлс\b|личн\w*\s+сообщен\w*|\bdm\b)")),
     (frozenset({"lift_restrictions"}), _intent_pattern(r"\b(?:сним\w*|убер\w*).{0,45}(?:ограничен\w*|карантин\w*)\b")),
     (frozenset({"deactivate_raid_mode"}), _intent_pattern(r"\b(?:выключ\w*|сним\w*|деактивир\w*).{0,35}(?:рейд[\s-]?режим|режим\s+рейд\w*)\b")),
-    (frozenset({"edit_server"}), _intent_pattern(r"\b(?:измен\w*|переимен\w*|настро\w*).{0,45}\bсервер\b.{0,35}(?:назван\w*|описан\w*|уведомлен\w*|проверк\w*|фильтр\w*)|\bedit\s+server\b")),
+    (
+        frozenset({"edit_server"}),
+        _intent_pattern(
+            r"\b(?:измен\w*|поменя\w*|переимен\w*|настро\w*).{0,45}"
+            r"(?:\bсервер\w*.{0,35}(?:назван\w*|описан\w*|уведомлен\w*|проверк\w*|фильтр\w*)|"
+            r"(?:назван\w*|описан\w*|уведомлен\w*|проверк\w*|фильтр\w*).{0,35}\bсервер\w*)|"
+            r"\bedit\s+server\b"
+        ),
+    ),
     (frozenset({"voice_action"}), _intent_pattern(r"\b(?:отключ\w*|перемест\w*|замут\w*|размут\w*|оглуш\w*).{0,55}(?:голос\w*|войс\w*|voice)\b")),
     (frozenset({"set_security_preset"}), _intent_pattern(r"\b(?:включ\w*|примен\w*|установ\w*|смен\w*).{0,45}(?:профил\w*|режим\w*).{0,25}(?:безопасност\w*|strict|raid|normal)\b")),
     (frozenset({"update_settings"}), _intent_pattern(r"\b(?:измен\w*|обнов\w*|установ\w*|включ\w*|выключ\w*).{0,45}(?:настройк\w*|автомод\w*|модерац\w*|фильтр\w*)\b|\bupdate\s+settings\b")),
@@ -293,17 +310,86 @@ _NEGATED_MUTATION_PATTERN = _intent_pattern(
     r"созда\w*|измен\w*|отправ\w*|пинг\w*|выда\w*|сним\w*|выключ\w*)"
 )
 
+_TOOL_SIMULATION_PATTERN = _intent_pattern(
+    r"\b(?:не\s+(?:выполняй|делай|запускай|вызывай)|"
+    r"только\s+(?:напиши|покажи|выведи|сгенерируй)|"
+    r"(?:напиши|покажи|выведи)\s+(?:только\s+)?(?:команд\w*|вызов\w*|tool[_\s-]?call)|"
+    r"сымитируй\s+(?:действие|вызов|команду)|"
+    r"do\s+not\s+(?:execute|run|call)|don't\s+(?:execute|run|call)|"
+    r"just\s+(?:print|write|show)|pretend\s+to\s+(?:execute|run|call))\b"
+)
+
+_EXPLICIT_MUTATION_PREFIX = _intent_pattern(
+    r"^(?:(?:пожалуйста|прошу)[,:\s]+|"
+    r"(?:можешь|сможешь)(?:\s+ли)?(?:\s+ты)?[,:\s]+|"
+    r"(?:нужно|надо|следует|давай|хочу\s*,?\s*чтобы)[,:\s]+)*"
+    r"(?:не\s+отвеча\w*|(?:снова|начни)\s+отвеча\w*|"
+    r"забан\w*|разбан\w*|бан\w*|кик\w*|выгон\w*|замут\w*|размут\w*|"
+    r"выда\w*|добав\w*|назнач\w*|сним\w*|убер\w*|отбер\w*|"
+    r"созда\w*|сдела\w*|удал\w*|уничтож\w*|измен\w*|поменя\w*|смен\w*|сброс\w*|"
+    r"переимен\w*|настро\w*|разреш\w*|запрет\w*|включ\w*|выключ\w*|"
+    r"откр\w*|закр\w*|заблокир\w*|разблокир\w*|очист\w*|архивир\w*|"
+    r"разархивир\w*|отправ\w*|напиш\w*|пошл\w*|пинган\w*|пингн\w*|"
+    r"упомян\w*|примен\w*|установ\w*|покин\w*|выйд\w*|отключ\w*|"
+    r"перемест\w*|запуст\w*|выполн\w*|останов\w*|заверш\w*|массов\w*|"
+    r"ban\b|unban\b|kick\b|timeout\b|create\b|delete\b|edit\b|send\b|"
+    r"lock\b|unlock\b|archive\b|run\b|execute\b)"
+)
+
+
+def _mutation_request_body(text: str) -> str:
+    body = unicodedata.normalize("NFKC", text or "")
+    body = re.sub(r"^\s*<@!?\d+>\s*", "", body)
+    body = re.sub(
+        r"^\s*(?:p[\s.\-_]*o[\s.\-_]*s|п[\s.\-_]*о[\s.\-_]*с)\b[\s,.:;!—-]*",
+        "",
+        body,
+        flags=re.IGNORECASE,
+    )
+    return body.strip()
+
+
+def _is_explicit_mutation_request(text: str) -> bool:
+    if not text or _TOOL_SIMULATION_PATTERN.search(text):
+        return False
+    body = _mutation_request_body(_intent_surface(text))
+    if not body:
+        return False
+    if re.match(r"^не\s+отвеча\w*\b", body, flags=re.IGNORECASE):
+        return True
+    if re.match(r"^(?:не|don't|do\s+not)\b", body, flags=re.IGNORECASE):
+        return False
+    return bool(_EXPLICIT_MUTATION_PREFIX.search(body))
+
 
 def _allowed_tool_names_for_text(text: str) -> frozenset[str]:
-    if not text or _detect_prompt_injection(text):
+    if not text or _detect_prompt_injection(text) or _TOOL_SIMULATION_PATTERN.search(text):
         return frozenset()
     intent_text = _intent_surface(text)
     allowed: set[str] = set()
     for tool_names, pattern in _TOOL_INTENT_RULES:
         if pattern.search(intent_text):
             allowed.update(tool_names)
+    if "untimeout_user" in allowed:
+        allowed.discard("timeout_user")
+    if "unmute_ai_for_user" in allowed:
+        allowed.discard("mute_ai_for_user")
+    if "user_info" in allowed:
+        allowed.discard("list_members")
+    if "bulk_user_action" in allowed:
+        allowed.difference_update({
+            "ban_user",
+            "kick_user",
+            "timeout_user",
+            "untimeout_user",
+            "add_role",
+            "remove_role",
+            "lift_restrictions",
+        })
     if _NEGATED_MUTATION_PATTERN.search(intent_text):
         allowed.intersection_update(_READ_ONLY_TOOLS)
+    elif not _is_explicit_mutation_request(text):
+        allowed.difference_update(_MUTATING_TOOLS)
     return frozenset(allowed)
 
 
@@ -773,7 +859,7 @@ async def _resolve_permission_target(guild: discord.Guild, ident: str):
 
 def _role_hierarchy_error(guild: discord.Guild, role: discord.Role) -> str | None:
     if role.is_default():
-        return "роль @everyone нельзя изменять этим инструментом"
+        return "роль @everyone нельзя изменять этим способом"
     if role.managed:
         return (
             f"роль `{role.name}` управляется интеграцией, и Discord API запрещает менять её напрямую; "
@@ -1287,7 +1373,7 @@ async def _perform_tool_action(
         return await _perform_shutdown(bot, args)
 
     if guild is None:
-        return "Ошибка: инструмент можно использовать только на сервере."
+        return "Ошибка: эту операцию можно выполнить только на сервере."
 
     if name in _USER_TARGET_TOOLS and not user_id:
         user_id, resolve_error = await _resolve_user_id_from_args(guild, args, user_id)
@@ -2417,7 +2503,7 @@ async def _perform_tool_action(
         except Exception as exc:
             return _safe_action_failure("снятие AI-мута в БД", exc)
 
-    return f"Неизвестный инструмент: {name}"
+    return "Ошибка: управляющая операция не поддерживается."
 
 
 def _summarize_tool_call(name: str, args: dict, user_id: int | None) -> str:
@@ -2566,17 +2652,17 @@ async def execute_pos_tool(
     allowed_tool_names: frozenset[str] | None = None,
 ) -> str:
     if not message or not message.guild:
-        return "Ошибка: инструмент можно использовать только на сервере."
+        return "Ошибка: эту операцию можно выполнить только на сервере."
 
     func = tool_call.get("function", {})
     name = str(func.get("name") or "").strip()
     if name not in _TOOL_SCHEMAS_BY_NAME:
-        return f"Отказано: неизвестный инструмент `{name or 'без имени'}`."
+        return "Отказано: получена неизвестная управляющая операция."
 
     allowed = allowed_tool_names if allowed_tool_names is not None else _allowed_tool_names_for_message(message)
     if name not in allowed:
         return (
-            f"Отказано: `{name}` не соответствует явной команде в текущем сообщении. "
+            "Отказано: операция не соответствует явной команде в текущем сообщении. "
             "Сформулируй действие прямо; история и вложения не дают полномочий."
         )
 
@@ -2586,9 +2672,9 @@ async def execute_pos_tool(
     except Exception:
         return "Ошибка: P.OS получил некорректные параметры действия; ничего не выполнено."
     if not isinstance(args, dict):
-        return "Ошибка: аргументы инструмента должны быть JSON-объектом; действие не выполнено."
+        return "Ошибка: параметры операции повреждены; действие не выполнено."
     if len(json.dumps(args, ensure_ascii=False, default=str)) > 20_000:
-        return "Отказано: аргументы инструмента слишком велики; разбей запрос на части."
+        return "Отказано: параметры операции слишком велики; разбей запрос на части."
     validated_args, validation_error = _validate_tool_arguments(name, args)
     if validated_args is None:
         return (
@@ -2741,7 +2827,7 @@ async def execute_pos_tool(
         return "Не удалось найти владельца для подтверждения. Действие не выполнено."
 
     if name in _OWNER_ONLY_TOOLS and not is_owner:
-        return "Отказано: этот инструмент доступен только Пумбе по подтверждённому Discord ID."
+        return "Отказано: эта операция доступна только Пумбе по подтверждённому Discord ID."
 
     # Проверенные операции чтения Пумбы выполняются напрямую.
     result = await _perform_tool_action(bot, message, name, args, user_id)
@@ -3544,7 +3630,7 @@ def _guard_model_output(text: str, request_text: str = "") -> str:
             "Внутренняя конфигурация P.OS не публикуется. "
             "Могу объяснить доступные функции и фактические правила работы без служебных данных."
         )
-    if _TEXTUAL_TOOL_CALL_MARKER.search(cleaned):
+    if _contains_internal_tool_syntax(cleaned, request_text):
         return (
             "Действие не выполнено: служебный вызов не прошёл проверяемый интерфейс P.OS. "
             "Повтори команду одним сообщением."
@@ -4059,17 +4145,214 @@ def _strip_address_prefix_from_reply(reply: str) -> str:
 
 
 _TEXTUAL_TOOL_CALL_MARKER = re.compile(
-    r"(?im)^[ \t]*(?:[-*][ \t]+)?(?:tool_call|function_call)[ \t]*:",
+    r"(?im)(?:"
+    r"^[ \t]*(?:[-*][ \t]+)?(?:tool[_\s-]?call|function[_\s-]?call)[ \t]*:|"
+    r"<[ \t]*/?[ \t]*(?:tool[_\s-]?call|function[_\s-]?call)\b|"
+    r"\bassistant[ \t]+to[ \t]*=[ \t]*(?:functions?\.)?[a-z_][a-z0-9_]*|"
+    r"^[ \t]*(?:```(?:json|python)?[ \t]*)?\{[ \t]*"
+    r"\"(?:tool_calls?|function_call)\"[ \t]*:"
+    r")",
 )
 _TEXTUAL_TOOL_CALL_LINE = re.compile(
-    r"(?im)^[ \t]*(?:[-*][ \t]+)?(?:tool_call|function_call)[ \t]*:[ \t]*"
+    r"(?im)^[ \t]*(?:[-*][ \t]+)?(?:tool[_\s-]?call|function[_\s-]?call)[ \t]*:[ \t]*"
     r"(?P<expression>[^\r\n]{1,4000})$",
 )
+_TEXTUAL_TOOL_BLOCK = re.compile(
+    r"(?is)<[ \t]*(?:tool[_\s-]?call|function[_\s-]?call)\b[^>]*>"
+    r"(?P<body>.*?)"
+    r"<[ \t]*/[ \t]*(?:tool[_\s-]?call|function[_\s-]?call)[ \t]*>"
+)
+_FENCED_TOOL_BLOCK = re.compile(
+    r"(?is)```(?:json|python)?[ \t]*\r?\n?(?P<body>.*?)```"
+)
+_ASSISTANT_TO_FUNCTION = re.compile(
+    r"(?is)\bassistant[ \t]+to[ \t]*=[ \t]*(?:functions?\.)?"
+    r"(?P<name>[a-z_][a-z0-9_]*)\b(?P<tail>.{0,20000})"
+)
+_TOOL_NAME_EXPRESSION = re.compile(
+    r"(?is)^(?P<name>[a-z_][a-z0-9_]*)[ \t]*\((?P<arguments>.*)\)[ \t]*[.;]?$"
+)
+_INTERNAL_ADMIN_COMMAND = re.compile(
+    r"(?im)^[ \t]*(?:[`>*-][ \t]*)?(?:p[.!]|[!/])"
+    r"(?:ban|unban|kick|mute|timeout|role|channel|purge|clear|lock|unlock)\b"
+)
+_INTERNAL_TOOL_FUNCTION = re.compile(
+    r"(?i)\b(?:"
+    + "|".join(re.escape(name) for name in sorted(_TOOL_SCHEMAS_BY_NAME, key=len, reverse=True))
+    + r")[ \t]*\("
+)
+
+
+def _contains_internal_tool_syntax(text: str, request_text: str = "") -> bool:
+    if not text:
+        return False
+    if _TEXTUAL_TOOL_CALL_MARKER.search(text) or _INTERNAL_ADMIN_COMMAND.search(text):
+        return True
+    return bool(
+        _allowed_tool_names_for_text(request_text)
+        and _INTERNAL_TOOL_FUNCTION.search(text)
+    )
+
+
+def _response_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict):
+            value = item.get("text") or item.get("content")
+            if isinstance(value, str):
+                parts.append(value)
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _encode_textual_tool_call(
+    name: Any,
+    arguments: Any,
+    allowed_tool_names: frozenset[str],
+    index: int,
+) -> dict[str, Any] | None:
+    normalized_name = str(name or "").strip()
+    if (
+        normalized_name not in allowed_tool_names
+        or normalized_name not in _TOOL_SCHEMAS_BY_NAME
+    ):
+        return None
+    if arguments in (None, ""):
+        parsed_args: dict[str, Any] = {}
+    elif isinstance(arguments, dict):
+        parsed_args = arguments
+    elif isinstance(arguments, str):
+        try:
+            parsed_args = json.loads(arguments)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(parsed_args, dict):
+            return None
+    else:
+        return None
+    try:
+        encoded_args = json.dumps(parsed_args, ensure_ascii=False)
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return None
+    if len(encoded_args) > 20_000:
+        return None
+    return {
+        "id": f"text-tool-{index}",
+        "type": "function",
+        "function": {"name": normalized_name, "arguments": encoded_args},
+    }
+
+
+def _tool_calls_from_json_envelope(
+    value: Any,
+    allowed_tool_names: frozenset[str],
+    *,
+    start_index: int,
+) -> list[dict[str, Any]]:
+    candidates: list[Any]
+    if isinstance(value, list):
+        candidates = value
+    elif not isinstance(value, dict):
+        return []
+    elif isinstance(value.get("tool_calls"), list):
+        candidates = value["tool_calls"]
+    elif "tool_call" in value:
+        candidates = [value["tool_call"]]
+    elif "function_call" in value:
+        candidates = [value["function_call"]]
+    else:
+        candidates = [value]
+
+    calls: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        function = candidate.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+            arguments = function.get("arguments", function.get("args"))
+        else:
+            name = candidate.get("name") or candidate.get("tool_name")
+            arguments = candidate.get(
+                "arguments",
+                candidate.get("args", candidate.get("parameters")),
+            )
+        call = _encode_textual_tool_call(
+            name,
+            arguments,
+            allowed_tool_names,
+            start_index + len(calls),
+        )
+        if call:
+            calls.append(call)
+        if len(calls) >= _MAX_TOOL_CALLS_PER_TURN:
+            break
+    return calls
+
+
+def _decode_json_values(text: str) -> list[Any]:
+    if not text or len(text) > 25_000:
+        return []
+    decoder = json.JSONDecoder()
+    values: list[Any] = []
+    cursor = 0
+    while cursor < len(text):
+        match = re.search(r"[\[{]", text[cursor:])
+        if not match:
+            break
+        start = cursor + match.start()
+        try:
+            value, end = decoder.raw_decode(text[start:])
+        except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+            cursor = start + 1
+            continue
+        values.append(value)
+        if len(values) >= _MAX_TOOL_CALLS_PER_TURN:
+            break
+        cursor = start + max(end, 1)
+    return values
+
+
+def _deduplicate_textual_tool_calls(
+    calls: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for call in calls:
+        function = call.get("function", {})
+        name = str(function.get("name") or "")
+        arguments = function.get("arguments", "{}")
+        try:
+            parsed = arguments if isinstance(arguments, dict) else json.loads(arguments)
+            canonical = json.dumps(
+                parsed,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except Exception:
+            canonical = str(arguments)
+        key = (name, canonical)
+        if key in seen:
+            continue
+        seen.add(key)
+        call["id"] = f"text-tool-{len(unique) + 1}"
+        unique.append(call)
+        if len(unique) >= _MAX_TOOL_CALLS_PER_TURN:
+            break
+    return unique
 
 
 def _extract_textual_tool_calls(
     text: str,
     allowed_tool_names: frozenset[str],
+    *,
+    allow_bare: bool = False,
 ) -> list[dict[str, Any]]:
     """Разобрать безопасный fallback вида ``tool_call: name(key='value')``.
 
@@ -4081,6 +4364,46 @@ def _extract_textual_tool_calls(
         return []
 
     calls: list[dict[str, Any]] = []
+
+    marker_present = bool(_TEXTUAL_TOOL_CALL_MARKER.search(text))
+    stripped = text.strip()
+    json_sources: list[str] = []
+    if marker_present:
+        json_sources.append(text)
+        json_sources.extend(match.group("body") for match in _TEXTUAL_TOOL_BLOCK.finditer(text))
+        json_sources.extend(match.group("body") for match in _FENCED_TOOL_BLOCK.finditer(text))
+    elif allow_bare and (
+        (stripped.startswith("{") and stripped.endswith("}"))
+        or (stripped.startswith("[") and stripped.endswith("]"))
+        or (stripped.startswith("```") and stripped.endswith("```"))
+    ):
+        json_sources.append(stripped)
+
+    for source in json_sources:
+        for value in _decode_json_values(source):
+            parsed = _tool_calls_from_json_envelope(
+                value,
+                allowed_tool_names,
+                start_index=len(calls) + 1,
+            )
+            calls.extend(parsed)
+            if len(calls) >= _MAX_TOOL_CALLS_PER_TURN:
+                return _deduplicate_textual_tool_calls(calls)
+
+    assistant_match = _ASSISTANT_TO_FUNCTION.search(text)
+    if assistant_match:
+        name = assistant_match.group("name")
+        for value in _decode_json_values(assistant_match.group("tail")):
+            call = _encode_textual_tool_call(
+                name,
+                value,
+                allowed_tool_names,
+                len(calls) + 1,
+            )
+            if call:
+                calls.append(call)
+                break
+
     for match in _TEXTUAL_TOOL_CALL_LINE.finditer(text):
         raw_expression = match.group("expression").strip().strip("`").strip()
         expression: ast.AST | None = None
@@ -4123,22 +4446,104 @@ def _extract_textual_tool_calls(
             if not valid:
                 continue
 
-        try:
-            encoded_args = json.dumps(parsed_args, ensure_ascii=False)
-        except (TypeError, ValueError, OverflowError, RecursionError):
-            continue
-        if len(encoded_args) > 20_000:
-            continue
-        calls.append(
-            {
-                "id": f"text-tool-{len(calls) + 1}",
-                "type": "function",
-                "function": {"name": name, "arguments": encoded_args},
-            }
+        call = _encode_textual_tool_call(
+            name,
+            parsed_args,
+            allowed_tool_names,
+            len(calls) + 1,
         )
+        if call:
+            calls.append(call)
         if len(calls) >= _MAX_TOOL_CALLS_PER_TURN:
             break
-    return calls
+
+    if not calls and allow_bare:
+        bare = stripped
+        fenced = _FENCED_TOOL_BLOCK.fullmatch(bare)
+        if fenced:
+            bare = fenced.group("body").strip()
+        expression_match = _TOOL_NAME_EXPRESSION.fullmatch(bare)
+        if expression_match:
+            synthetic = f"tool_call: {bare}"
+            return _extract_textual_tool_calls(
+                synthetic,
+                allowed_tool_names,
+                allow_bare=False,
+            )
+    return _deduplicate_textual_tool_calls(calls)
+
+
+def _tool_call_required(
+    message: discord.Message | None,
+    allowed_tool_names: frozenset[str],
+) -> bool:
+    if not message or not allowed_tool_names:
+        return False
+    if allowed_tool_names <= _READ_ONLY_TOOLS:
+        return True
+    return bool(
+        allowed_tool_names & _MUTATING_TOOLS
+        and _is_explicit_mutation_request(message.content or "")
+    )
+
+
+def _extract_response_tool_calls(
+    response_msg: dict[str, Any],
+    allowed_tool_names: frozenset[str],
+    *,
+    allow_bare_text: bool,
+) -> tuple[list[dict[str, Any]], str]:
+    raw_tool_calls = response_msg.get("tool_calls") or []
+    candidates = (
+        [call for call in raw_tool_calls if isinstance(call, dict)]
+        if isinstance(raw_tool_calls, list)
+        else []
+    )
+    legacy_call = response_msg.get("function_call")
+    if not candidates and isinstance(legacy_call, dict):
+        candidates = [{"id": "legacy-function-call", "function": legacy_call}]
+    if not candidates and response_msg.get("type") == "function_call":
+        candidates = [response_msg]
+
+    tool_calls: list[dict[str, Any]] = []
+    for index, candidate in enumerate(candidates, start=1):
+        function = candidate.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+            arguments = function.get("arguments", function.get("args", "{}"))
+        else:
+            name = candidate.get("name")
+            arguments = candidate.get(
+                "arguments",
+                candidate.get("args", candidate.get("parameters", "{}")),
+            )
+        if isinstance(arguments, dict):
+            normalized_arguments: Any = arguments
+        elif isinstance(arguments, str):
+            normalized_arguments = arguments
+        else:
+            try:
+                normalized_arguments = json.dumps(arguments, ensure_ascii=False)
+            except (TypeError, ValueError, OverflowError, RecursionError):
+                normalized_arguments = "{}"
+        tool_calls.append(
+            {
+                "id": str(candidate.get("id") or candidate.get("call_id") or f"call-{index}"),
+                "type": "function",
+                "function": {
+                    "name": str(name or ""),
+                    "arguments": normalized_arguments,
+                },
+            }
+        )
+    content = _response_content_text(response_msg.get("content"))
+    if not tool_calls and content:
+        tool_calls = _extract_textual_tool_calls(
+            content,
+            allowed_tool_names,
+            allow_bare=allow_bare_text,
+        )
+    return tool_calls, content
 
 
 async def request_pos_reply(
@@ -4165,9 +4570,11 @@ async def request_pos_reply(
         for name in sorted(allowed_tool_names)
         if name in _TOOL_SCHEMAS_BY_NAME
     ]
+    require_tool_call = _tool_call_required(message, allowed_tool_names)
     response_msg = await pos_chat_completion(
         messages,
         tools=tool_schemas or None,
+        tool_choice="required" if require_tool_call else None,
         max_tokens=POS_AI_MAX_TOKENS,
         temperature=POS_AI_TEMPERATURE,
         top_p=POS_AI_TOP_P,
@@ -4177,27 +4584,44 @@ async def request_pos_reply(
     if not response_msg:
         return None
 
-    raw_tool_calls = response_msg.get("tool_calls") or []
-    tool_calls = (
-        [call for call in raw_tool_calls if isinstance(call, dict)]
-        if isinstance(raw_tool_calls, list)
-        else []
+    tool_calls, response_content = _extract_response_tool_calls(
+        response_msg,
+        allowed_tool_names,
+        allow_bare_text=require_tool_call,
     )
-    if not tool_calls and isinstance(response_msg.get("function_call"), dict):
-        tool_calls = [
+    if require_tool_call and not tool_calls:
+        repair_messages = [
+            *messages,
             {
-                "id": "legacy-function-call",
-                "type": "function",
-                "function": response_msg["function_call"],
-            }
+                "role": "system",
+                "content": (
+                    "УПРАВЛЯЮЩИЙ КОНТУР: верни только структурированный вызов одного "
+                    "из переданных инструментов. Не пиши команду, JSON или пояснение в content."
+                ),
+            },
         ]
-    if not tool_calls and isinstance(response_msg.get("content"), str):
-        tool_calls = _extract_textual_tool_calls(
-            response_msg["content"],
-            allowed_tool_names,
+        repaired_msg = await pos_chat_completion(
+            repair_messages,
+            tools=tool_schemas or None,
+            tool_choice="required",
+            max_tokens=POS_AI_MAX_TOKENS,
+            temperature=0.0,
+            top_p=POS_AI_TOP_P,
+            timeout=POS_AI_TIMEOUT_SECONDS,
         )
+        if repaired_msg:
+            tool_calls, response_content = _extract_response_tool_calls(
+                repaired_msg,
+                allowed_tool_names,
+                allow_bare_text=True,
+            )
     if not tool_calls:
-        reply = response_msg.get("content")
+        if require_tool_call:
+            return (
+                "Действие не выполнено: управляющий контур не вернул проверяемый "
+                "вызов Discord API. Никакая команда не запускалась; повтори запрос."
+            )
+        reply = response_content
         if reply:
             reply = _strip_address_prefix_from_reply(reply)
             reply = _guard_model_output(
@@ -4241,24 +4665,25 @@ async def request_pos_reply(
                 allowed_tool_names=allowed_tool_names,
             )
         except Exception as exc:
-            result = _safe_action_failure(f"выполнение инструмента {name}", exc)
+            label = _TOOL_ACTION_LABELS.get(name, "серверное действие")
+            result = _safe_action_failure(f"выполнение операции «{label}»", exc)
         results.append((name, _redact_secrets(str(result))))
 
     if len(tool_calls) > _MAX_TOOL_CALLS_PER_TURN:
         results.append(
             (
                 "security_limit",
-                f"Ещё {len(tool_calls) - _MAX_TOOL_CALLS_PER_TURN} вызовов отклонено: "
+                f"Ещё {len(tool_calls) - _MAX_TOOL_CALLS_PER_TURN} операций отклонено: "
                 "превышен лимит действий за одно сообщение.",
             )
         )
 
     if not results:
-        return "Запрос на действие не содержит валидного вызова. Ничего не выполнено."
+        return "Запрос не содержит проверяемой операции. Ничего не выполнено."
     if len(results) == 1:
         return results[0][1]
-    return "Результаты проверенных действий P.OS:\n" + "\n".join(
-        f"{index}. `{name}`: {result}"
+    return "Результаты действий P.OS:\n" + "\n".join(
+        f"{index}. {_TOOL_ACTION_LABELS.get(name, 'Серверная операция').capitalize()}: {result}"
         for index, (name, result) in enumerate(results, start=1)
     )
 
@@ -4480,7 +4905,7 @@ def _format_owner_help(bot: discord.Client) -> str:
         "`P.OS удали из базы 12` — удалить запись.\n\n"
         "Управление сервером (роли, каналы, права, кики, ники, инвайты) — просто скажи мне словами, "
         "например «P.OS создай роль Ветеран синего цвета», «P.OS выдай роль Арбайтер @user», "
-        "«P.OS создай голосовой канал Переговоры», «P.OS дай инвайт». Я выполню это через свои инструменты.\n"
+        "«P.OS создай голосовой канал Переговоры», «P.OS дай инвайт». Я выполню действие и сообщу фактический результат.\n"
         "Безопасность и полный контроль: «P.OS проведи аудит безопасности», «P.OS включи строгую защиту», "
         "«P.OS закрой канал #general», «P.OS создай ветку Инцидент», «P.OS отключи @user от войса», "
         "«P.OS переименуй сервер ...».\n"

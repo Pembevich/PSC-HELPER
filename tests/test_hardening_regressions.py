@@ -52,6 +52,51 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
             [],
         )
 
+    def test_textual_tool_parser_normalizes_provider_formats(self):
+        samples = [
+            (
+                "tool_call:\n```json\n"
+                '{"name":"kick_user","arguments":{"user_id":"1351879409832951893"}}'
+                "\n```"
+            ),
+            (
+                "<tool_call>"
+                '{"name":"kick_user","arguments":{"user_id":"1351879409832951893"}}'
+                "</tool_call>"
+            ),
+            (
+                "assistant to=functions.kick_user\n"
+                '{"user_id":"1351879409832951893"}'
+            ),
+            (
+                '{"tool_call":{"name":"kick_user","arguments":'
+                '{"user_id":"1351879409832951893"}}}'
+            ),
+            "kick_user(user_id='1351879409832951893')",
+        ]
+
+        for sample in samples:
+            with self.subTest(sample=sample):
+                calls = _extract_textual_tool_calls(
+                    sample,
+                    frozenset({"kick_user"}),
+                    allow_bare=True,
+                )
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]["function"]["name"], "kick_user")
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"])["user_id"],
+                    "1351879409832951893",
+                )
+
+        self.assertEqual(
+            _extract_textual_tool_calls(
+                "kick_user(user_id='1351879409832951893')",
+                frozenset({"kick_user"}),
+            ),
+            [],
+        )
+
     async def test_only_intended_schema_is_exposed_and_duplicate_call_is_skipped(self):
         tool_call = {
             "id": "call-1",
@@ -75,24 +120,103 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         schemas = chat.await_args.kwargs["tools"]
         self.assertEqual([schema["function"]["name"] for schema in schemas], ["ban_user"])
+        self.assertEqual(chat.await_args.kwargs["tool_choice"], "required")
         self.assertEqual(chat.await_count, 1)
         self.assertEqual(execute.await_count, 1)
         self.assertTrue(state["tools_executed"])
         self.assertIn("Повторный идентичный вызов пропущен", result)
 
     async def test_non_owner_gets_only_mutating_schema_for_owner_approval(self):
+        tool_call = {
+            "id": "call-approval",
+            "function": {
+                "name": "ban_user",
+                "arguments": json.dumps({"user_identifier": "test", "reason": "request"}),
+            },
+        }
         message = SimpleNamespace(
             content="P.OS, забань пользователя test",
             author=SimpleNamespace(id=123),
         )
-        chat = AsyncMock(return_value={"role": "assistant", "content": "Нет доступа."})
+        chat = AsyncMock(return_value={"role": "assistant", "tool_calls": [tool_call]})
+        execute = AsyncMock(return_value="Запрос отправлен Пумбе на подтверждение.")
 
-        with patch("pos_ai.pos_chat_completion", new=chat):
+        with patch("pos_ai.pos_chat_completion", new=chat), \
+             patch("pos_ai.execute_pos_tool", new=execute):
             result = await request_pos_reply(SimpleNamespace(), message, [])
 
-        self.assertEqual(result, "Нет доступа.")
+        self.assertEqual(result, "Запрос отправлен Пумбе на подтверждение.")
         schemas = chat.await_args.kwargs["tools"]
         self.assertEqual([schema["function"]["name"] for schema in schemas], ["ban_user"])
+        self.assertEqual(chat.await_args.kwargs["tool_choice"], "required")
+
+    async def test_unstructured_action_response_is_retried_then_rejected_truthfully(self):
+        message = SimpleNamespace(
+            content="P.OS, кикни пользователя test",
+            author=SimpleNamespace(id=968698192411652176),
+        )
+        chat = AsyncMock(
+            side_effect=[
+                {"role": "assistant", "content": "Принято. Запускаю p.kick test"},
+                {"role": "assistant", "content": "Выполняю команду p.kick test"},
+            ]
+        )
+        execute = AsyncMock()
+
+        with patch("pos_ai.pos_chat_completion", new=chat), \
+             patch("pos_ai.execute_pos_tool", new=execute):
+            result = await request_pos_reply(SimpleNamespace(), message, [])
+
+        self.assertIn("Никакая команда не запускалась", result)
+        self.assertNotIn("p.kick", result)
+        self.assertEqual(chat.await_count, 2)
+        self.assertTrue(all(
+            await_call.kwargs["tool_choice"] == "required"
+            for await_call in chat.await_args_list
+        ))
+        execute.assert_not_awaited()
+
+    async def test_json_tool_envelope_from_provider_is_executed(self):
+        response = {
+            "role": "assistant",
+            "content": (
+                "tool_call:\n```json\n"
+                '{"name":"kick_user","arguments":{"user_id":"1351879409832951893",'
+                '"reason":"По приказу владельца"}}\n```'
+            ),
+        }
+        message = SimpleNamespace(
+            content="кикни бота джунипера с сервера",
+            author=SimpleNamespace(id=968698192411652176),
+        )
+        execute = AsyncMock(return_value="JuniperBot кикнут с сервера.")
+
+        with patch("pos_ai.pos_chat_completion", new=AsyncMock(return_value=response)), \
+             patch("pos_ai.execute_pos_tool", new=execute):
+            result = await request_pos_reply(SimpleNamespace(), message, [])
+
+        self.assertEqual(result, "JuniperBot кикнут с сервера.")
+        execute.assert_awaited_once()
+
+    async def test_malformed_native_tool_call_is_safely_rejected(self):
+        response = {
+            "role": "assistant",
+            "tool_calls": [{"id": "broken", "function": "not-an-object"}],
+        }
+        message = SimpleNamespace(
+            content="P.OS, кикни пользователя test",
+            author=SimpleNamespace(id=968698192411652176),
+        )
+        execute = AsyncMock(return_value="Отказано: получена неизвестная управляющая операция.")
+
+        with patch("pos_ai.pos_chat_completion", new=AsyncMock(return_value=response)), \
+             patch("pos_ai.execute_pos_tool", new=execute):
+            result = await request_pos_reply(SimpleNamespace(), message, [])
+
+        self.assertEqual(result, "Отказано: получена неизвестная управляющая операция.")
+        normalized_call = execute.await_args.args[2]
+        self.assertEqual(normalized_call["function"]["name"], "")
+        self.assertEqual(normalized_call["function"]["arguments"], "{}")
 
     async def test_textual_tool_call_from_provider_is_executed(self):
         response = {

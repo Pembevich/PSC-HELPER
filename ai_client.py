@@ -46,6 +46,7 @@ _provider_cursor = 0
 _provider_backoff_until: dict[int, float] = {}
 _MAX_UPSTREAM_RESPONSE_BYTES = 4 * 1024 * 1024
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_SUPPORTED_TOOL_CHOICES = frozenset({"auto", "required", "none"})
 
 
 class _AIQueueTimeout(Exception):
@@ -360,6 +361,7 @@ async def pos_chat_completion(
     messages: list[dict[str, Any]],
     *,
     tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
     max_tokens: int = POS_AI_MAX_TOKENS,
     temperature: float = POS_AI_TEMPERATURE,
     top_p: float = POS_AI_TOP_P,
@@ -373,6 +375,11 @@ async def pos_chat_completion(
     request_temperature = _bounded_float(temperature, POS_AI_TEMPERATURE, 0.0, 2.0)
     request_top_p = _bounded_float(top_p, POS_AI_TOP_P, 0.0, 1.0)
     request_timeout = _bounded_int(timeout, POS_AI_TIMEOUT_SECONDS, 5, 300)
+    request_tool_choice = (
+        tool_choice
+        if isinstance(tool_choice, str) and tool_choice in _SUPPORTED_TOOL_CHOICES
+        else None
+    )
     max_attempts = len(_AI_PROVIDER_POOL)
 
     for attempt in range(max_attempts):
@@ -412,6 +419,8 @@ async def pos_chat_completion(
                     payload["presence_penalty"] = 0.2
                 if tools:
                     payload["tools"] = tools
+                    if request_tool_choice:
+                        payload["tool_choice"] = request_tool_choice
                 headers = {
                     "Authorization": f"Bearer {provider['api_key']}",
                     "Content-Type": "application/json",

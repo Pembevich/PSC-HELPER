@@ -188,6 +188,34 @@ class PromptInjectionGuardTests(unittest.IsolatedAsyncioTestCase):
             _allowed_tool_names_for_text("убери все права у роли Джунипера"),
             frozenset({"edit_role"}),
         )
+        self.assertEqual(
+            _allowed_tool_names_for_text("P.OS, поменяй права роли Джунипера"),
+            frozenset({"edit_role"}),
+        )
+        self.assertEqual(
+            _allowed_tool_names_for_text("P.OS, как думаешь, стоит забанить test?"),
+            frozenset(),
+        )
+        self.assertEqual(
+            _allowed_tool_names_for_text(
+                "P.OS, кикни test, но только напиши команду и не выполняй"
+            ),
+            frozenset(),
+        )
+        tool_phrasings = {
+            "P.OS, сними тайм-аут с login": {"untimeout_user"},
+            "P.OS, смени ник пользователю login": {"set_nickname"},
+            "P.OS, запрети доступ к каналу тест для роли Тестер": {"set_channel_permission"},
+            "P.OS, измени название сервера": {"edit_server"},
+            "P.OS, не отвечай пользователю login": {"mute_ai_for_user"},
+            "P.OS, снова отвечай пользователю login": {"unmute_ai_for_user"},
+            "P.OS, остановись": {"shutdown_bot"},
+            "P.OS, массово забань список пользователей login1, login2": {"bulk_user_action"},
+            "P.OS, покажи информацию о пользователе login": {"user_info"},
+        }
+        for prompt, expected in tool_phrasings.items():
+            with self.subTest(prompt=prompt):
+                self.assertEqual(_allowed_tool_names_for_text(prompt), frozenset(expected))
         self.assertEqual(_allowed_tool_names_for_text("кто меня пинговал?"), frozenset({"search_pings"}))
         self.assertEqual(_allowed_tool_names_for_text("покажи список каналов"), frozenset({"list_channels"}))
         self.assertEqual(_allowed_tool_names_for_text("прочитай audit log"), frozenset({"read_audit_log"}))
