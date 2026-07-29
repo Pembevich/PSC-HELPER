@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
 import math
+import re
+import ssl
 import time
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import aiohttp
+import certifi
 
 from config import (
     GITHUB_MODELS_API_VERSION,
@@ -45,6 +49,8 @@ _ai_last_backoff_log_at = 0.0
 _provider_cursor = 0
 _provider_backoff_until: dict[int, float] = {}
 _MAX_UPSTREAM_RESPONSE_BYTES = 4 * 1024 * 1024
+_MAX_INLINE_MEDIA_BYTES = 14 * 1024 * 1024
+_SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _SUPPORTED_TOOL_CHOICES = frozenset({"auto", "required", "none"})
 
@@ -224,6 +230,31 @@ async def _reserve_provider_index(provider_type: str | None = None) -> int | Non
         return idx
 
 
+async def _reserve_exact_provider_index(provider_type: str) -> int | None:
+    """Reserve only the requested provider kind.
+
+    Native provider APIs are not wire-compatible with the OpenAI-compatible
+    fallback pool, so they must never silently spill over to another provider.
+    """
+    global _provider_cursor
+    async with _provider_lock:
+        if not _AI_PROVIDER_POOL:
+            return None
+        total = len(_AI_PROVIDER_POOL)
+        start = _provider_cursor % total
+        for offset in range(total):
+            idx = (start + offset) % total
+            provider = _AI_PROVIDER_POOL[idx]
+            if (
+                provider.get("provider") == provider_type
+                and provider.get("api_key")
+                and _provider_cooldown_remaining(idx) <= 0
+            ):
+                _provider_cursor = (idx + 1) % total
+                return idx
+        return None
+
+
 async def _mark_provider_backoff(index: int, seconds: float) -> None:
     """#14: Атомарно продлить кулдаун провайдера под локом."""
     async with _provider_lock:
@@ -357,6 +388,208 @@ def _upstream_body_fingerprint(body: str) -> str:
     return hashlib.sha256((body or "").encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
+def _gemini_generate_content_url(provider: Mapping[str, str]) -> str | None:
+    """Build a native Gemini generateContent URL from a configured pool entry."""
+    api_url = provider.get("api_url", "")
+    model = provider.get("model", "").strip()
+    try:
+        parsed = urlsplit(api_url)
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not (host == "googleapis.com" or host.endswith(".googleapis.com")):
+        return None
+    if parsed.scheme != "https" or not model:
+        return None
+
+    if model.startswith("models/"):
+        model = model[len("models/"):]
+    if model.startswith("google/"):
+        model = model[len("google/"):]
+    if not model or len(model) > 160:
+        return None
+
+    path_parts = [part for part in parsed.path.split("/") if part]
+    api_version = next(
+        (part for part in path_parts if re.fullmatch(r"v\d+(?:alpha|beta)?", part)),
+        "v1beta",
+    )
+    netloc = parsed.netloc
+    return (
+        f"https://{netloc}/{api_version}/models/"
+        f"{quote(model, safe='._-')}:generateContent"
+    )
+
+
+def _extract_gemini_text(data: Mapping[str, Any]) -> str | None:
+    candidates = data.get("candidates")
+    if not isinstance(candidates, list):
+        return None
+    parts: list[str] = []
+    for candidate in candidates[:1]:
+        if not isinstance(candidate, Mapping):
+            continue
+        content = candidate.get("content")
+        if not isinstance(content, Mapping):
+            continue
+        raw_parts = content.get("parts")
+        if not isinstance(raw_parts, list):
+            continue
+        for part in raw_parts:
+            if isinstance(part, Mapping) and isinstance(part.get("text"), str):
+                text = str(part["text"]).strip()
+                if text:
+                    parts.append(text)
+    combined = "\n".join(parts).strip()
+    return combined or None
+
+
+async def pos_gemini_media_analysis(
+    media_bytes: bytes,
+    mime_type: str,
+    *,
+    prompt: str,
+    max_tokens: int = 1800,
+    timeout: int = 90,
+) -> str | None:
+    """Analyze one bounded audio/video payload through Gemini's native API.
+
+    The OpenAI-compatible endpoint used by regular chat cannot reliably carry
+    audio and video across providers. This path intentionally selects Gemini
+    entries only and never falls back to an incompatible provider.
+    """
+    if (
+        not isinstance(media_bytes, bytes)
+        or not media_bytes
+        or len(media_bytes) > _MAX_INLINE_MEDIA_BYTES
+    ):
+        return None
+    normalized_mime = (mime_type or "").strip().lower().split(";", 1)[0]
+    if not normalized_mime.startswith(("audio/", "video/")):
+        return None
+    clean_prompt = (prompt or "").strip()
+    if not clean_prompt:
+        return None
+
+    encoded = await asyncio.to_thread(base64.b64encode, media_bytes)
+    encoded_text = encoded.decode("ascii")
+    request_timeout = _bounded_int(timeout, 90, 10, 180)
+    request_max_tokens = _bounded_int(max_tokens, 1800, 64, 8192)
+    gemini_count = sum(
+        1
+        for provider in _AI_PROVIDER_POOL
+        if provider.get("provider") == "gemini" and provider.get("api_key")
+    )
+    if gemini_count == 0:
+        return None
+
+    attempted: set[int] = set()
+    for _attempt in range(gemini_count):
+        provider_index: int | None = None
+        provider: dict[str, str] | None = None
+        response_text = ""
+        try:
+            async with _request_slot(request_timeout):
+                provider_index = await _reserve_exact_provider_index("gemini")
+                if provider_index is None or provider_index in attempted:
+                    return None
+                attempted.add(provider_index)
+                provider = _AI_PROVIDER_POOL[provider_index]
+                endpoint = _gemini_generate_content_url(provider)
+                if endpoint is None:
+                    await _mark_provider_backoff(provider_index, 300.0)
+                    continue
+
+                payload = {
+                    "contents": [
+                        {
+                            "role": "user",
+                            "parts": [
+                                {
+                                    "inline_data": {
+                                        "mime_type": normalized_mime,
+                                        "data": encoded_text,
+                                    }
+                                },
+                                {"text": clean_prompt},
+                            ],
+                        }
+                    ],
+                    "generation_config": {
+                        "temperature": 0.1,
+                        "max_output_tokens": request_max_tokens,
+                    },
+                }
+                headers = {
+                    "x-goog-api-key": provider["api_key"],
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                }
+                timeout_config = aiohttp.ClientTimeout(total=request_timeout)
+                connector = aiohttp.TCPConnector(ssl=_SSL_CONTEXT)
+                async with aiohttp.ClientSession(
+                    timeout=timeout_config,
+                    connector=connector,
+                    trust_env=False,
+                ) as session:
+                    async with session.post(
+                        endpoint,
+                        headers=headers,
+                        json=payload,
+                        allow_redirects=False,
+                    ) as resp:
+                        response_text = await _read_bounded_response(resp)
+                        if _looks_like_rate_limit(resp.status, response_text, resp.headers):
+                            retry_after = (
+                                _parse_retry_after(resp.headers)
+                                or POS_AI_RATE_LIMIT_FALLBACK_SECONDS
+                            )
+                            await _mark_provider_backoff(provider_index, retry_after)
+                            continue
+                        if resp.status >= 500:
+                            await _mark_provider_backoff(provider_index, 15.0)
+                            continue
+                        if 300 <= resp.status < 400:
+                            await _mark_provider_backoff(provider_index, 300.0)
+                            continue
+                        if resp.status >= 400:
+                            if resp.status in {401, 403}:
+                                await _mark_provider_backoff(provider_index, 3600.0)
+                            elif resp.status == 404:
+                                await _mark_provider_backoff(provider_index, 300.0)
+                            logger.warning(
+                                "P.OS Gemini media API error %s (%s), body_sha256=%s",
+                                resp.status,
+                                provider["name"],
+                                _upstream_body_fingerprint(response_text),
+                            )
+                            continue
+        except _AIQueueTimeout:
+            return None
+        except (asyncio.TimeoutError, TimeoutError):
+            if provider_index is not None:
+                await _mark_provider_backoff(provider_index, 15.0)
+            continue
+        except Exception as exc:
+            if provider_index is not None:
+                await _mark_provider_backoff(provider_index, 60.0)
+            logger.warning(
+                "P.OS Gemini media request failed (%s): %s",
+                provider["name"] if provider else "unknown",
+                type(exc).__name__,
+            )
+            continue
+
+        try:
+            data = json.loads(response_text)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        result = _extract_gemini_text(data)
+        if result:
+            return result
+    return None
+
+
 async def pos_chat_completion(
     messages: list[dict[str, Any]],
     *,
@@ -430,7 +663,12 @@ async def pos_chat_completion(
                     headers["X-GitHub-Api-Version"] = GITHUB_MODELS_API_VERSION
 
                 timeout_config = aiohttp.ClientTimeout(total=request_timeout)
-                async with aiohttp.ClientSession(timeout=timeout_config) as session:
+                connector = aiohttp.TCPConnector(ssl=_SSL_CONTEXT)
+                async with aiohttp.ClientSession(
+                    timeout=timeout_config,
+                    connector=connector,
+                    trust_env=False,
+                ) as session:
                     async with session.post(
                         provider["api_url"],
                         headers=headers,

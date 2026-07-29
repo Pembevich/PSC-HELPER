@@ -3,6 +3,8 @@ import unittest
 from ai_client import (
     _bounded_float,
     _bounded_int,
+    _extract_gemini_text,
+    _gemini_generate_content_url,
     _is_safe_provider_url,
     _parse_retry_after,
     extract_json_block,
@@ -50,6 +52,41 @@ class AIClientBoundaryTests(unittest.TestCase):
     def test_retry_after_is_finite_and_capped(self):
         self.assertEqual(_parse_retry_after({"Retry-After": "nan"}), None)
         self.assertEqual(_parse_retry_after({"Retry-After": "999999"}), 3600.0)
+
+    def test_native_gemini_url_is_derived_without_putting_key_in_url(self):
+        provider = {
+            "api_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            "model": "google/gemini-3.5-flash",
+            "api_key": "secret",
+        }
+
+        endpoint = _gemini_generate_content_url(provider)
+
+        self.assertEqual(
+            endpoint,
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-3.5-flash:generateContent",
+        )
+        self.assertNotIn("secret", endpoint)
+
+    def test_native_gemini_text_parser_joins_text_parts(self):
+        payload = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"text": "Первая часть."},
+                            {"text": "Вторая часть."},
+                        ]
+                    }
+                }
+            ]
+        }
+
+        self.assertEqual(
+            _extract_gemini_text(payload),
+            "Первая часть.\nВторая часть.",
+        )
 
 
 if __name__ == "__main__":

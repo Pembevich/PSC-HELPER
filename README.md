@@ -26,12 +26,13 @@ The project is free to self-host on Railway or other infrastructure; operators p
 ## Core features
 
 - **Automated moderation** — canonical URL screening with Google Safe Browsing/VirusTotal support, attachment magic/archive checks, normalized spam detection, AI-assisted review, mass-mention protection, and persistent anti-raid state
-- **P.OS AI assistant** — responds to mentions and replies, keeps conversational context, supports vision inputs
+- **P.OS AI assistant** — responds to mentions and replies, keeps conversational context, understands images and representative GIF/video frames, and can transcribe supported audio/video through Gemini
 - **Owner-gated tools** — factual server inspection plus bans, timeouts, roles, channels, settings, and cross-server actions; owner commands execute directly, third-party requests require approval
 - **Application workflows** — interactive forms for applications, reports, and staff review
 - **Continuous security posture** — an initial audit plus persisted baselines for Discord MFA, verification/media filters, privileged roles, channel overwrites, bot permissions, webhooks, and AutoMod rules, with owner alerts on dangerous changes
 - **Audit logging** — structured server event journals and a persistent, redacted history of P.OS tool activity and AI security detections
 - **Media utilities** — adaptive `p.gif` conversion that preserves animation timing and searches for the best quality that fits the server upload limit
+- **Grounded web research** — owner-only public HTTPS reading with DNS pinning, SSRF/redirect/content limits, optional Brave Search, and a Wikipedia fallback
 
 ## Security model (important)
 
@@ -41,7 +42,7 @@ The only direct privileged operator is Pumba, identified by the immutable Discor
 
 AI moderation findings are advisory unless a deterministic signal or independently confirmed visual signal reaches the required confidence threshold. URL and file reputation also require corroborated verdicts before automatic punishment. This prevents a model response, one outlier scanner, or prompt-injected message from becoming an automatic punishment by itself.
 
-Link reputation is optional and layered: local canonicalization and deception checks always run; Google Safe Browsing and VirusTotal run only when their keys are configured. Their caches are independent, and network/API failures are never stored as a safe verdict. P.OS never follows a user-supplied URL, which keeps the link scanner outside the server's private network boundary.
+Link reputation is optional and layered: local canonicalization and deception checks always run; Google Safe Browsing and VirusTotal run only when their keys are configured. Their caches are independent, and network/API failures are never stored as a safe verdict. Owner-requested web reading is isolated behind a separate public-HTTPS fetcher that rejects credentials, private/link-local/reserved IPs, revalidates every DNS answer and redirect, and bounds response types and sizes.
 
 P.OS treats prompt injection as an expected hostile input, not as an authentication mechanism. Tools remain unavailable unless the current Discord message expresses a matching intent; authorization is bound to the immutable Discord ID in code. Injection detections are stored as hashes and reason labels without retaining the adversarial payload.
 
@@ -74,7 +75,7 @@ Configure environment variables in Railway. A local `.env` is for development on
 | --- | --- |
 | `DISCORD_TOKEN` | Discord bot token |
 
-### P.OS / AI (GitHub Models configuration)
+### P.OS / AI (single-provider fallback)
 
 | Variable | Description |
 | --- | --- |
@@ -93,13 +94,18 @@ Legacy-compatible variables still work: `POS_AI_API_KEY`, `POS_AI_API_URL`, `POS
 | `POS_AI_PROVIDER_URLS` | CSV of endpoints (index-aligned) |
 | `POS_AI_PROVIDER_MODELS` | CSV of model names (index-aligned) |
 
-Example:
+Gemini-first example with a GitHub Models fallback:
 
 ```env
-POS_AI_PROVIDER_KEYS=gh_key_1,gh_key_2
-POS_AI_PROVIDER_URLS=https://models.github.ai/inference/chat/completions,https://models.github.ai/inference/chat/completions
-POS_AI_PROVIDER_MODELS=openai/gpt-4.1,openai/gpt-4.1
+POS_AI_PROVIDER_KEYS=gemini_key,github_models_token
+POS_AI_PROVIDER_URLS=https://generativelanguage.googleapis.com/v1beta/openai/chat/completions,https://models.github.ai/inference/chat/completions
+POS_AI_PROVIDER_MODELS=gemini-3.5-flash,openai/gpt-4.1
 ```
+
+An entry whose endpoint is on `googleapis.com` is treated as Gemini. P.OS uses
+that entry first and can send bounded audio/video to Gemini's native
+`generateContent` API; image/GIF/video-frame understanding still works when the
+native media analysis is unavailable.
 
 ### Other useful settings
 
@@ -108,6 +114,7 @@ POS_AI_PROVIDER_MODELS=openai/gpt-4.1,openai/gpt-4.1
 - `PRIMARY_LOG_CHANNEL_ID`, `UPDATE_LOG_CHANNEL_ID`, `LOG_CATEGORY_ID`, `LOG_CATEGORY_NAME`
 - `DB_BACKUP_CHANNEL_ID` — private Discord channel for gzip-compressed, integrity-checked SQLite backups (recommended on Railway)
 - `GOOGLE_SAFEBROWSING_KEY`, `VIRUSTOTAL_KEY` — optional independent URL/file reputation sources
+- `BRAVE_SEARCH_API_KEY` — optional full-web search; without it, `research_web` transparently limits discovery to Wikipedia
 - `SECURITY_MONITOR_INTERVAL_SECONDS` — continuous Discord posture scan interval, clamped to 120-3600 seconds (default: 900)
 
 See `.env.example` for the full list.
@@ -130,6 +137,8 @@ See `.env.example` for the full list.
 | `security_monitor.py` | Persisted Discord security posture snapshots and deterministic diffs |
 | `pos_ai.py` | P.OS orchestration, context, tool execution policy |
 | `ai_client.py` | OpenAI-compatible client with provider pooling |
+| `media_intelligence.py` | Bounded image/GIF/video sampling and Gemini audio/video understanding |
+| `web_research.py` | SSRF-safe public page reading and grounded owner-only research |
 | `commands.py` | Генерация GIF для единственной пользовательской команды `p.gif` |
 | `forms.py` | Application/report UI (views, modals) |
 | `storage.py` | Serialized async SQLite persistence and backward-compatible gzip Discord backup/restore |

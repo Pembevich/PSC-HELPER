@@ -5,7 +5,6 @@ import base64
 import datetime
 import difflib
 import hashlib
-import io
 import json
 import logging
 import random as _random
@@ -17,7 +16,6 @@ from collections import defaultdict, deque
 from typing import Any, List, Optional, cast
 
 import discord
-from PIL import Image, ImageOps
 from discord.utils import escape_markdown, escape_mentions
 
 from ai_client import (
@@ -47,6 +45,7 @@ from commands import (
     parse_gif_options_from_text,
 )
 from logging_utils import is_log_channel, setup_guild_logging
+from media_intelligence import MAX_ANALYSIS_CHARS, MAX_VISUAL_INPUTS, extract_media_context
 from storage import (
     add_ai_event,
     add_entry,
@@ -59,10 +58,8 @@ from storage import (
     set_ai_muted_user,
 )
 from cogs.ai_tools import POS_AI_TOOLS
-
-# #4: Защита от декомпрессионных бомб (см. moderation.py).
-Image.MAX_IMAGE_PIXELS = 24_000_000
-
+from web_research import read_web_page as safe_read_web_page
+from web_research import research_web as safe_research_web
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +101,7 @@ _OWNER_ONLY_TOOLS = frozenset({
     "ping_user", "dm_user", "lift_restrictions", "deactivate_raid_mode",
     "leave_server", "shutdown_bot",
     "mute_ai_for_user", "unmute_ai_for_user",
+    "research_web", "read_web_page",
 })
 
 # Tools that only read verified Discord/SQLite state and cannot mutate it.
@@ -111,6 +109,7 @@ _READ_ONLY_TOOLS = frozenset({
     "list_servers", "get_settings", "list_members", "user_info", "read_messages",
     "search_logs", "search_pings", "security_scan", "list_channels", "list_roles",
     "read_audit_log",
+    "research_web", "read_web_page",
 })
 
 # Owner-only information tools: non-owners are denied without disclosing data.
@@ -302,6 +301,24 @@ _TOOL_INTENT_RULES: tuple[tuple[frozenset[str], re.Pattern[str]], ...] = (
     (frozenset({"search_logs"}), _intent_pattern(r"\b(?:найди|поищ\w*|покаж\w*|кто|что).{0,55}(?:в\s+)?(?:журнал\w*|лог\w*|событи\w*|действи\w*)\b|\bsearch\s+logs\b")),
     (frozenset({"search_pings"}), _intent_pattern(r"\b(?:кто|найди|покаж\w*|поищ\w*).{0,45}(?:пинг\w*|упомин\w*).{0,40}(?:меня|роль|пользовател\w*|@\w+)?\b|\bsearch\s+pings\b")),
     (frozenset({"security_scan"}), _intent_pattern(r"\b(?:провед\w*|сдела\w*|выполн\w*|запуст\w*|проверь).{0,40}(?:аудит|скан\w*|проверк\w*).{0,35}(?:безопасност\w*|сервер\w*)\b|\bsecurity\s+(?:scan|audit)\b")),
+    (
+        frozenset({"read_web_page"}),
+        _intent_pattern(
+            r"\b(?:прочита\w*|откр\w*|изуч\w*|разбер\w*|проанализир\w*|зайд\w*|"
+            r"посмотр\w*|проверь).{0,55}(?:страниц\w*|сайт\w*|ссылк\w*|url\b)|"
+            r"\b(?:прочита\w*|откр\w*|изуч\w*|посмотр\w*|проверь).{0,40}https://|"
+            r"\b(?:что|информац\w*).{0,35}(?:на|по)\s+(?:этой\s+)?(?:страниц\w*|"
+            r"ссылк\w*|сайт\w*)|\bread\s+(?:this\s+)?(?:web\s+)?page\b"
+        ),
+    ),
+    (
+        frozenset({"research_web"}),
+        _intent_pattern(
+            r"\b(?:найд\w*|поищ\w*|узна\w*|проверь|исслед\w*)\b.{0,70}"
+            r"\b(?:в\s+интернет\w*|в\s+сети|онлайн|веб\w*|web\b)|"
+            r"\b(?:internet|web)\s+(?:search|research)\b|\bsearch\s+(?:the\s+)?web\b"
+        ),
+    ),
 )
 
 _NEGATED_MUTATION_PATTERN = _intent_pattern(
@@ -575,6 +592,8 @@ _TOOL_ACTION_LABELS = {
     "leave_server": "выход с сервера",
     "shutdown_bot": "полную остановку P.OS",
     "mute_ai_for_user": "блокировку ответов", "unmute_ai_for_user": "снятие блокировки",
+    "research_web": "исследование в интернете",
+    "read_web_page": "чтение веб-страницы",
 }
 
 _TOOL_ARGUMENT_LABELS = {
@@ -603,6 +622,9 @@ _TOOL_ARGUMENT_LABELS = {
     "scope": "область",
     "message_id": "сообщение",
     "include_roles": "показывать роли",
+    "max_sources": "источники",
+    "url": "адрес",
+    "question": "вопрос",
 }
 
 _UPDATED_FIELD_LABELS = {
@@ -1530,6 +1552,17 @@ async def _perform_tool_action(
     # Инструменты, которым НЕ нужен сервер-контекст, обрабатываются раньше.
     if name == "shutdown_bot":
         return await _perform_shutdown(bot, args)
+    if name == "research_web":
+        query = str(args.get("query", "")).strip()
+        try:
+            max_sources = int(args.get("max_sources", 3) or 3)
+        except (TypeError, ValueError, OverflowError):
+            max_sources = 3
+        return await safe_research_web(query, max(1, min(max_sources, 4)))
+    if name == "read_web_page":
+        url = str(args.get("url", "")).strip()
+        question = str(args.get("question", "")).strip()
+        return await safe_read_web_page(url, question)
 
     if guild is None:
         return "Ошибка: эту операцию можно выполнить только на сервере."
@@ -2691,6 +2724,7 @@ def _summarize_tool_call(name: str, args: dict, user_id: int | None) -> str:
         "target_role_or_user", "user_identifier", "user_identifiers", "username", "login",
         "nickname", "reason", "minutes", "count", "limit", "query", "event_type", "text",
         "settings_json", "mode", "action", "preset", "scope", "message_id", "include_roles",
+        "max_sources", "url", "question",
     ):
         val = args.get(key)
         if val:
@@ -3020,10 +3054,6 @@ AI_CHANNEL_TTL_SECONDS = 8 * 60
 AI_HISTORY_SCAN_LIMIT = 120
 AI_MEMORY_MAX_MESSAGES = 500
 AI_MEMORY_CONTEXT_MESSAGES = 45
-AI_VISUAL_MAX_BYTES = 12 * 1024 * 1024
-AI_VISUAL_MAX_SIDE = 1024
-AI_GIF_MAX_FRAMES = 3
-AI_SAFE_PIL_FORMATS = {"JPEG", "PNG", "WEBP", "BMP", "GIF"}
 
 SYSTEM_INSTRUCTION = POS_AI_SYSTEM_PROMPT
 
@@ -3424,14 +3454,18 @@ def _redact_forced_reply_payloads(text: str) -> str:
 
 
 def _guard_prompt_injection_for_ai(text: str, *, max_len: int = 1800) -> str:
-    if not text or _PROMPT_GUARD_MARKER in text:
+    if not text:
         return text or ""
 
-    reasons = _detect_prompt_injection(text)
+    prepared = text.replace(
+        _PROMPT_GUARD_MARKER,
+        "[user supplied security marker]",
+    )
+    reasons = _detect_prompt_injection(prepared)
     if not reasons:
-        return text
+        return prepared
 
-    cleaned = _ZERO_WIDTH_AND_BIDI.sub("", text)
+    cleaned = _ZERO_WIDTH_AND_BIDI.sub("", prepared)
     cleaned = _redact_forced_reply_payloads(cleaned).replace("```", "'''")
     if len(cleaned) > max_len:
         cleaned = cleaned[:max_len] + "..."
@@ -3448,11 +3482,23 @@ def _guard_prompt_injection_for_ai(text: str, *, max_len: int = 1800) -> str:
 
 
 def _sanitize_prompt_injection_for_memory(text: str) -> str:
-    if not text or _PROMPT_MEMORY_MARKER in text:
+    if not text:
         return text or ""
-    reasons = _detect_prompt_injection(text)
-    if not reasons:
+    if (
+        text.startswith(_PROMPT_MEMORY_MARKER)
+        and "исходный текст не сохранён как факт" in text
+        and not _detect_prompt_injection(
+            text.replace(_PROMPT_MEMORY_MARKER, "[stored security event]", 1)
+        )
+    ):
         return text
+    prepared = text.replace(
+        _PROMPT_MEMORY_MARKER,
+        "[user supplied memory marker]",
+    )
+    reasons = _detect_prompt_injection(prepared)
+    if not reasons:
+        return prepared
     reason_text = ", ".join(reasons[:4])
     return (
         f"{_PROMPT_MEMORY_MARKER} {reason_text}; "
@@ -3536,99 +3582,6 @@ def _strip_address_prefix(text: str, bot: discord.Client) -> str:
     # Снимаем ведущее имя бота (P.OS / П.ОС в разных написаниях) + разделители.
     body = re.sub(r"^\s*(?:p[\s.\-_]*o[\s.\-_]*s|п[\s.\-_]*о[\s.\-_]*с)\b[\s,.:;!—-]*", "", body, flags=re.IGNORECASE)
     return body.strip()
-
-
-def _is_image_attachment(att: discord.Attachment) -> bool:
-    ctype = (att.content_type or "").lower()
-    if ctype.startswith("image/"):
-        return True
-    name = (att.filename or "").lower()
-    return name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"))
-
-
-def _extract_image_urls(message: Optional[discord.Message]) -> list[str]:
-    if not message:
-        return []
-    return [a.url for a in message.attachments if _is_image_attachment(a)]
-
-
-def _image_to_data_url(image: Image.Image) -> str | None:
-    try:
-        frame = ImageOps.exif_transpose(image)
-        if frame.mode not in ("RGB", "RGBA"):
-            frame = frame.convert("RGBA")
-        if max(frame.size) > AI_VISUAL_MAX_SIDE:
-            frame.thumbnail((AI_VISUAL_MAX_SIDE, AI_VISUAL_MAX_SIDE), Image.Resampling.LANCZOS)
-
-        output = io.BytesIO()
-        if frame.mode == "RGBA":
-            frame.save(output, format="PNG", optimize=True)
-            mime = "image/png"
-        else:
-            frame.convert("RGB").save(output, format="JPEG", quality=86, optimize=True)
-            mime = "image/jpeg"
-        encoded = base64.b64encode(output.getvalue()).decode("ascii")
-        return f"data:{mime};base64,{encoded}"
-    except Exception:
-        return None
-
-
-def _image_bytes_to_data_urls(data: bytes) -> list[str]:
-    try:
-        with Image.open(io.BytesIO(data)) as image:
-            if (image.format or "").upper() not in AI_SAFE_PIL_FORMATS:
-                return []
-            width, height = image.size
-            if width <= 0 or height <= 0 or width * height > int(Image.MAX_IMAGE_PIXELS or 0):
-                return []
-            if not getattr(image, "is_animated", False):
-                data_url = _image_to_data_url(image)
-                return [data_url] if data_url else []
-
-            frame_count = max(int(getattr(image, "n_frames", 1) or 1), 1)
-            if frame_count <= AI_GIF_MAX_FRAMES:
-                frame_indices = list(range(frame_count))
-            else:
-                frame_indices = sorted({0, frame_count // 2, frame_count - 1})
-
-            frames: list[str] = []
-            for frame_index in frame_indices[:AI_GIF_MAX_FRAMES]:
-                try:
-                    image.seek(frame_index)
-                    data_url = _image_to_data_url(image.copy())
-                    if data_url:
-                        frames.append(data_url)
-                except Exception:
-                    continue
-            return frames
-    except Exception:
-        return []
-
-
-async def _attachment_to_visual_inputs(att: discord.Attachment) -> list[str]:
-    if not _is_image_attachment(att):
-        return []
-    if att.size and att.size > AI_VISUAL_MAX_BYTES:
-        return []
-    try:
-        data = await att.read(use_cached=True)
-    except Exception:
-        return []
-    if len(data) > AI_VISUAL_MAX_BYTES:
-        return []
-    return await asyncio.to_thread(_image_bytes_to_data_urls, data)
-
-
-async def _extract_visual_inputs(message: Optional[discord.Message]) -> list[str]:
-    if not message:
-        return []
-    visual_inputs: list[str] = []
-    for attachment in message.attachments[:4]:
-        for data_url in await _attachment_to_visual_inputs(attachment):
-            visual_inputs.append(data_url)
-            if len(visual_inputs) >= 6:
-                return visual_inputs
-    return visual_inputs
 
 
 def _chunk_text(text: str, limit: int = AI_MAX_RESPONSE_CHARS) -> List[str]:
@@ -4243,9 +4196,17 @@ def _should_send_rate_limit_notice(channel_id: int, window_seconds: int = 20) ->
 def build_pos_user_content(
     text: str,
     image_urls: list[str] | None = None,
+    untrusted_media_text: str = "",
 ) -> str | list[dict[str, Any]]:
     cleaned_text = _sanitize_text(_guard_prompt_injection_for_ai(text or ""))
-    urls = [url for url in (image_urls or []) if url][:4]
+    media_text = _sanitize_text(
+        _guard_prompt_injection_for_ai(untrusted_media_text or "", max_len=MAX_ANALYSIS_CHARS)
+    )
+    if media_text:
+        cleaned_text = (
+            f"{cleaned_text}\n\n{media_text}" if cleaned_text else media_text
+        )
+    urls = [url for url in (image_urls or []) if url][:MAX_VISUAL_INPUTS]
     if not urls:
         return cleaned_text or "Да, я на связи. Что нужно?"
 
@@ -5353,14 +5314,29 @@ async def _build_messages(
     raw_text = _resolve_mentions_text(message.content or "", message, bot_id)
     if bot_id:
         raw_text = _strip_bot_mention(raw_text, bot_id)
-    text = _sanitize_text(_guard_prompt_injection_for_ai(raw_text))
+    text = raw_text
     image_urls: list[str] = []
+    untrusted_media_text = ""
     if not mutating_request:
-        image_urls = await _extract_visual_inputs(message)
+        media_attachments: list[Any] = []
+        seen_media: set[Any] = set()
+        media_sources = [message]
         if ref_msg:
-            for url in await _extract_visual_inputs(ref_msg):
-                if url not in image_urls:
-                    image_urls.append(url)
+            media_sources.append(ref_msg)
+        for source in media_sources:
+            for attachment in getattr(source, "attachments", []) or []:
+                marker = (
+                    getattr(attachment, "id", None)
+                    or getattr(attachment, "url", None)
+                    or id(attachment)
+                )
+                if marker in seen_media:
+                    continue
+                seen_media.add(marker)
+                media_attachments.append(attachment)
+        media_context = await extract_media_context(media_attachments)
+        image_urls = media_context.visual_inputs
+        untrusted_media_text = media_context.as_untrusted_text()
 
     # Явный контекст ответа: если текущее сообщение — это reply на чью-то реплику
     # (не на P.OS), показываем, на что именно отвечает пользователь, чтобы P.OS
@@ -5380,7 +5356,7 @@ async def _build_messages(
             )
         else:
             snippet_raw = _resolve_mentions_text((ref_msg.content or "")[:200], ref_msg, bot_id)
-            snippet = _sanitize_text(_guard_prompt_injection_for_ai(snippet_raw))
+            snippet = snippet_raw.strip()
             if snippet:
                 reply_note = (
                     f"[В ответ на сообщение {ref_msg.author.display_name} "
@@ -5391,7 +5367,11 @@ async def _build_messages(
     messages.append({
         "role": "user",
         "name": f"user_{message.author.id}",
-        "content": build_pos_user_content(reply_note + prefix + text, image_urls)
+        "content": build_pos_user_content(
+            reply_note + prefix + text,
+            image_urls,
+            untrusted_media_text,
+        )
     })
 
     return messages

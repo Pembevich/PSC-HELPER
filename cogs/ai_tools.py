@@ -822,6 +822,60 @@ POS_AI_TOOLS.extend([
     },
 ])
 
+POS_AI_TOOLS.extend([
+    {
+        "type": "function",
+        "function": {
+            "name": "research_web",
+            "description": (
+                "Ищет актуальную информацию в публичном интернете, безопасно читает "
+                "несколько источников и возвращает ответ только с фактическими ссылками. "
+                "При отсутствии Brave Search использует ограниченный Wikipedia fallback. "
+                "ТОЛЬКО для владельца."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Что именно найти или проверить в интернете.",
+                    },
+                    "max_sources": {
+                        "type": "string",
+                        "description": "Необязательно. Число источников от 1 до 4.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_web_page",
+            "description": (
+                "Безопасно читает указанную публичную HTTPS-страницу, защищаясь от "
+                "SSRF, опасных перенаправлений и prompt injection в содержимом. "
+                "Возвращает фактический ответ со ссылкой. ТОЛЬКО для владельца."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Полный публичный HTTPS URL страницы.",
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "Необязательно. Что именно узнать со страницы.",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
+])
+
 
 # 0.8: кросс-серверность. Владелец может выполнять управляющие действия на любом
 # сервере, где есть P.OS, не находясь на нём. Добавляем необязательный параметр
@@ -899,6 +953,9 @@ _TOOL_FIELD_MAX_LENGTHS = {
     "new_name": 100,
     "nickname": 32,
     "query": 500,
+    "question": 500,
+    "url": 2048,
+    "max_sources": 2,
     "settings_json": 8000,
     "user_identifiers": 5000,
 }

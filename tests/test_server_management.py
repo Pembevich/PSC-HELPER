@@ -31,6 +31,7 @@ class ToolSchemaTests(unittest.TestCase):
             "archive_thread", "voice_action", "security_scan", "set_security_preset",
             "list_members", "user_info", "read_messages", "search_logs", "search_pings",
             "bulk_user_action", "list_channels", "list_roles", "read_audit_log",
+            "research_web", "read_web_page",
         ]:
             self.assertIn(expected, names, f"tool {expected} отсутствует в схеме")
 
@@ -41,7 +42,7 @@ class ToolSchemaTests(unittest.TestCase):
                      "edit_server", "lock_channel", "unlock_channel", "create_thread",
                      "archive_thread", "voice_action", "security_scan", "set_security_preset",
                      "list_members", "user_info", "read_messages", "search_logs", "search_pings",
-                     "bulk_user_action"]:
+                     "bulk_user_action", "research_web", "read_web_page"]:
             self.assertIn(name, _OWNER_ONLY_TOOLS)
 
     def test_every_ai_tool_is_owner_only_in_current_beta(self):
@@ -102,6 +103,8 @@ class ToolSchemaTests(unittest.TestCase):
             "list_channels",
             "list_roles",
             "read_audit_log",
+            "research_web",
+            "read_web_page",
         ]:
             self.assertIn(name, _OWNER_INFO_TOOLS)
 
