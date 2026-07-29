@@ -3137,15 +3137,32 @@ _user_memory: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=20
 # --- #4: Максимальные размеры кэшей для предотвращения утечки памяти ---
 _MAX_CACHE_SIZE = 5000
 AI_NAME_PATTERN = re.compile(r"(?<!\w)(?:p[\s.\-_]*o[\s.\-_]*s|п[\s.\-_]*о[\s.\-_]*с)(?!\w)", re.IGNORECASE)
-# Генерация GIF запускается ТОЛЬКО по глаголу-запросу («сделай гифку»). Раньше
-# срабатывало голое слово «гиф» — «P.OS, видел эту гифку?» приводил к сборке GIF
-# из последних сообщений канала вместо ответа. Голое упоминание GIF допускается
-# только когда к сообщению приложены вложения (см. _is_gif_request).
+# Генерация GIF запускается только по явному действию («сделай гифку»).
+# Вопросы и просьбы описать уже приложенный GIF должны идти в media intelligence.
 GIF_INTENT_PATTERN = re.compile(
-    r"\b(сдела\w+|созда\w+|собер\w+|сгенерир\w+|convert|make)\b[^\n]*\b(gif|гифк?\w*)\b",
+    r"(?:"
+    r"\b(?:сдела\w*|созда\w*|собер\w*|сгенерир\w*|преврат\w*|"
+    r"конвертир\w*|convert\w*|make|build)\b[^\n]{0,160}"
+    r"\b(?:gif|гифк?\w*)\b"
+    r"|"
+    r"\b(?:gif|гифк?\w*)\b[^\n]{0,80}"
+    r"\b(?:сдела\w*|созда\w*|собер\w*|сгенерир\w*|преврат\w*|"
+    r"конвертир\w*|convert\w*|make|build)\b"
+    r")",
     re.IGNORECASE,
 )
-GIF_WORD_PATTERN = re.compile(r"\b(gif|гифк?\w*)\b", re.IGNORECASE)
+GIF_ANALYSIS_PATTERN = re.compile(
+    r"(?:"
+    r"\b(?:опиш\w*|описан\w*|анализ\w*|проанализир\w*|расскаж\w*|"
+    r"объясн\w*|распозна\w*|прочита\w*|что\s+меня\w*|что\s+на)\b"
+    r"[^\n]{0,140}\b(?:gif|гифк?\w*)\b"
+    r"|"
+    r"\b(?:gif|гифк?\w*)\b[^\n]{0,140}"
+    r"\b(?:опиш\w*|описан\w*|анализ\w*|проанализир\w*|расскаж\w*|"
+    r"объясн\w*|распозна\w*|прочита\w*|меня\w*)\b"
+    r")",
+    re.IGNORECASE,
+)
 MUTE_PATTERN = re.compile(r"(не\s*отвечай|не\s*пиши|игнорируй\s*меня|молчи\s*со\s*мной)", re.IGNORECASE)
 UNMUTE_PATTERN = re.compile(r"(можешь\s*отвечать|снова\s*отвечай|вернись\s*в\s*диалог|разрешаю\s*отвечать)", re.IGNORECASE)
 HELP_PATTERN = re.compile(r"\b(help|хелп|помощь|команды|список\s+команд)\b", re.IGNORECASE)
@@ -4206,10 +4223,9 @@ def _build_rate_limit_reply() -> str:
 
 def _is_gif_request(text: str, has_attachments: bool = False) -> bool:
     stripped = (text or "").strip()
-    if GIF_INTENT_PATTERN.search(stripped):
-        return True
-    # Голое «гиф»/«gif» считаем запросом только при приложенных вложениях.
-    return has_attachments and bool(GIF_WORD_PATTERN.search(stripped))
+    if not stripped or GIF_ANALYSIS_PATTERN.search(stripped):
+        return False
+    return bool(GIF_INTENT_PATTERN.search(stripped))
 
 
 def _collect_media_attachments(message: discord.Message, ref_msg: Optional[discord.Message]) -> list[discord.Attachment]:
