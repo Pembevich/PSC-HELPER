@@ -9,7 +9,6 @@ from discord import Embed
 from config import (
     VIRUSTOTAL_KEY,
     GOOGLE_SAFEBROWSING_KEY,
-    DEEPSEEK_API_KEY,
     POS_AI_API_KEY,
     POS_AI_PROVIDER_KEYS,
     GITHUB_MODELS_TOKEN,
@@ -22,7 +21,6 @@ def collect_runtime_health() -> dict:
         "DISCORD_TOKEN": bool(os.getenv("DISCORD_TOKEN")),
         "VIRUSTOTAL_KEY": bool(VIRUSTOTAL_KEY),
         "GOOGLE_SAFEBROWSING_KEY": bool(GOOGLE_SAFEBROWSING_KEY),
-        "DEEPSEEK_API_KEY": bool(DEEPSEEK_API_KEY),
         "GITHUB_MODELS_TOKEN": bool(GITHUB_MODELS_TOKEN),
         "POS_AI_API_KEY": bool(POS_AI_API_KEY),
         "POS_AI_PROVIDER_KEYS": bool(POS_AI_PROVIDER_KEYS),

@@ -2,10 +2,32 @@ import asyncio
 import logging
 import os
 import signal
+import sys
 
-import discord
-from dotenv import load_dotenv
-from discord.ext import commands
+
+class _BelowErrorFilter(logging.Filter):
+    """Keep Railway stream severity aligned with the Python log level."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < logging.ERROR
+
+
+_stdout_handler = logging.StreamHandler(sys.stdout)
+_stdout_handler.setLevel(logging.INFO)
+_stdout_handler.addFilter(_BelowErrorFilter())
+
+_stderr_handler = logging.StreamHandler(sys.stderr)
+_stderr_handler.setLevel(logging.ERROR)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[_stdout_handler, _stderr_handler],
+)
+
+import discord  # noqa: E402
+from dotenv import load_dotenv  # noqa: E402
+from discord.ext import commands  # noqa: E402
 
 # Config modules read env vars at import time, so local .env must be loaded
 # before importing config/storage.
@@ -14,11 +36,6 @@ load_dotenv()
 from config import BOT_COMMAND_PREFIX, POS_AI_MODEL, POS_AI_PROVIDER  # noqa: E402
 from storage import close_all_connections, init_db  # noqa: E402
 from utils import sanitize_discord_token  # noqa: E402
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 
 logger = logging.getLogger(__name__)
 
