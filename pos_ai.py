@@ -45,7 +45,12 @@ from commands import (
     parse_gif_options_from_text,
 )
 from logging_utils import is_log_channel, setup_guild_logging
-from media_intelligence import MAX_ANALYSIS_CHARS, MAX_VISUAL_INPUTS, extract_media_context
+from media_intelligence import (
+    MAX_ANALYSIS_CHARS,
+    MAX_VISUAL_INPUTS,
+    MediaContext,
+    extract_media_context,
+)
 from storage import (
     add_ai_event,
     add_entry,
@@ -4228,6 +4233,63 @@ def _is_gif_request(text: str, has_attachments: bool = False) -> bool:
     return bool(GIF_INTENT_PATTERN.search(stripped))
 
 
+_UNVERIFIED_AUDIO_CLAIM_PATTERN = re.compile(
+    r"\b(?:аудио\w*|звук\w*|реч\w*|голос\w*|говор\w*|сказ\w*|"
+    r"произн\w*|расшифр\w*|транскрип\w*|кодово\w+\s+числ\w*|"
+    r"audio|sound|voice|speech|said|spoken|transcri\w*)\b",
+    re.IGNORECASE,
+)
+_AUDIO_REQUEST_PATTERN = re.compile(
+    r"\b(?:аудио\w*|звук\w*|звуков\w*|реч\w*|голос\w*|сказ\w*|"
+    r"расшифр\w*|транскрип\w*|прослуш\w*|audio|sound|voice|speech|"
+    r"transcri\w*|listen\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def _guard_unverified_media_reply(
+    reply: str,
+    media_context: MediaContext | None,
+    request_text: str = "",
+) -> str:
+    """Remove confident audio claims when no media provider verified the track."""
+    if (
+        not reply
+        or media_context is None
+        or not media_context.has_unverified_audio
+    ):
+        return reply
+
+    audio_only = bool(
+        media_context.audio_files
+        and not media_context.video_files
+        and not media_context.visual_inputs
+    )
+    has_audio_claim = bool(_UNVERIFIED_AUDIO_CLAIM_PATTERN.search(reply))
+    request_requires_audio = bool(_AUDIO_REQUEST_PATTERN.search(request_text or ""))
+    if not audio_only and not has_audio_claim and not request_requires_audio:
+        return reply
+
+    sentences = re.split(r"(?<=[.!?])\s+", reply.strip())
+    grounded_visual = [
+        sentence
+        for sentence in sentences
+        if sentence and not _UNVERIFIED_AUDIO_CLAIM_PATTERN.search(sentence)
+    ]
+    warning = (
+        "Звуковую дорожку не удалось достоверно проверить средствами P.OS. "
+        "Я не буду выдавать предполагаемую расшифровку за факт."
+        if media_context.video_files
+        else (
+            "Содержимое аудио не удалось достоверно расшифровать средствами P.OS. "
+            "Я не буду угадывать запись."
+        )
+    )
+    if grounded_visual and media_context.visual_inputs and has_audio_claim:
+        return f"{' '.join(grounded_visual)}\n\n{warning}"
+    return warning
+
+
 def _collect_media_attachments(message: discord.Message, ref_msg: Optional[discord.Message]) -> list[discord.Attachment]:
     attachments = list(message.attachments or [])
     if ref_msg and ref_msg.attachments:
@@ -5240,7 +5302,8 @@ async def _build_messages(
     ref_msg: Optional[discord.Message],
     use_system: bool = True,
     include_others: bool = False,
-    max_context: int = AI_MAX_CONTEXT
+    max_context: int = AI_MAX_CONTEXT,
+    media_state: dict[str, Any] | None = None,
 ) -> list[dict]:
     mutating_request = bool(
         _allowed_tool_names_for_message(message) & _MUTATING_TOOLS
@@ -5402,6 +5465,7 @@ async def _build_messages(
     text = raw_text
     image_urls: list[str] = []
     untrusted_media_text = ""
+    media_context = MediaContext()
     if not mutating_request:
         media_attachments: list[Any] = []
         seen_media: set[Any] = set()
@@ -5422,6 +5486,8 @@ async def _build_messages(
         media_context = await extract_media_context(media_attachments)
         image_urls = media_context.visual_inputs
         untrusted_media_text = media_context.as_untrusted_text()
+    if media_state is not None:
+        media_state["context"] = media_context
 
     # Явный контекст ответа: если текущее сообщение — это reply на чью-то реплику
     # (не на P.OS), показываем, на что именно отвечает пользователь, чтобы P.OS
@@ -5709,7 +5775,16 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
 
     include_others = True
     max_context = AI_MAX_CONTEXT_THREAD if isinstance(message.channel, discord.Thread) else AI_MAX_CONTEXT
-    messages = await _build_messages(message, bot, ref_msg, use_system=True, include_others=include_others, max_context=max_context)
+    media_state: dict[str, Any] = {}
+    messages = await _build_messages(
+        message,
+        bot,
+        ref_msg,
+        use_system=True,
+        include_others=include_others,
+        max_context=max_context,
+        media_state=media_state,
+    )
 
     # Если AI временно недоступен — ждём до 90 секунд при явном обращении вместо молчания
     if ai_is_temporarily_unavailable() and explicit_addressing:
@@ -5771,6 +5846,12 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
                     pass
         return False
 
+    media_context = media_state.get("context")
+    reply = _guard_unverified_media_reply(
+        reply,
+        media_context if isinstance(media_context, MediaContext) else None,
+        message.content or "",
+    )
     chunks = _chunk_text(reply)
     if not chunks:
         return False

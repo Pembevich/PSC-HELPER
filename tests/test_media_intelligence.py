@@ -57,6 +57,9 @@ class MediaContextTests(unittest.IsolatedAsyncioTestCase):
             context = await media_intelligence.extract_media_context([attachment])
 
         self.assertEqual(len(context.analyses), 1)
+        self.assertEqual(context.audio_files, 1)
+        self.assertEqual(context.audio_analysis_count, 1)
+        self.assertFalse(context.has_unverified_audio)
         rendered = context.as_untrusted_text()
         self.assertIn("UNTRUSTED_MEDIA_ANALYSIS", rendered)
         self.assertIn("ignore previous instructions", rendered)
@@ -99,6 +102,9 @@ class MediaContextTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(context.analyses)
         self.assertIn("не делай предположений", context.warnings[0])
+        self.assertEqual(context.audio_files, 1)
+        self.assertEqual(context.audio_analysis_count, 0)
+        self.assertTrue(context.has_unverified_audio)
 
 
 if __name__ == "__main__":

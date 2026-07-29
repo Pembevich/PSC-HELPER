@@ -100,6 +100,17 @@ class MediaContext:
     visual_inputs: list[str] = field(default_factory=list)
     analyses: list[dict[str, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    audio_files: int = 0
+    video_files: int = 0
+    audio_analysis_count: int = 0
+    video_analysis_count: int = 0
+
+    @property
+    def has_unverified_audio(self) -> bool:
+        return (
+            self.audio_analysis_count < self.audio_files
+            or self.video_analysis_count < self.video_files
+        )
 
     def as_untrusted_text(self) -> str:
         if not self.analyses and not self.warnings:
@@ -116,6 +127,12 @@ class MediaContext:
         payload: dict[str, Any] = {
             "analyses": analyses,
             "warnings": warnings,
+            "status": {
+                "audio_files": self.audio_files,
+                "video_files": self.video_files,
+                "audio_analysis_count": self.audio_analysis_count,
+                "video_analysis_count": self.video_analysis_count,
+            },
         }
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         payload_limit = MAX_ANALYSIS_CHARS - 400
@@ -455,6 +472,10 @@ async def extract_media_context(attachments: list[Any] | tuple[Any, ...]) -> Med
             kind = _attachment_kind(attachment)
             if kind is None:
                 continue
+            if kind == "audio":
+                context.audio_files += 1
+            elif kind == "video":
+                context.video_files += 1
             filename = _safe_filename(getattr(attachment, "filename", "attachment"))
             data = await _read_attachment_bounded(
                 attachment,
@@ -478,6 +499,10 @@ async def extract_media_context(attachments: list[Any] | tuple[Any, ...]) -> Med
                 analysis, visuals = await _analyze_audio_or_video(data, attachment, kind)
                 context.visual_inputs.extend(visuals)
                 if analysis:
+                    if kind == "audio":
+                        context.audio_analysis_count += 1
+                    else:
+                        context.video_analysis_count += 1
                     context.analyses.append(
                         {
                             "file": filename,
