@@ -32,6 +32,13 @@ class ToolSchemaTests(unittest.TestCase):
             "list_members", "user_info", "read_messages", "search_logs", "search_pings",
             "bulk_user_action", "list_channels", "list_roles", "read_audit_log",
             "research_web", "read_web_page", "runtime_status",
+            "manage_message", "manage_reaction", "list_invites", "revoke_invite",
+            "list_webhooks", "delete_webhook", "list_automod_rules",
+            "manage_automod_rule", "list_scheduled_events",
+            "manage_scheduled_event", "create_forum_post", "set_server_safety",
+            "list_emojis", "manage_emoji", "list_stickers", "manage_sticker",
+            "remember_fact", "list_memory_entries", "delete_memory_entry",
+            "refresh_server_memory",
         ]:
             self.assertIn(expected, names, f"tool {expected} отсутствует в схеме")
 
@@ -139,6 +146,28 @@ class ToolSchemaTests(unittest.TestCase):
             pos_ai._allowed_tool_names_for_text("Расскажи про разные версии Discord"),
             frozenset(),
         )
+
+    def test_extended_discord_intents_are_narrowly_exposed(self):
+        cases = {
+            "P.OS закрепи сообщение 123456789012345678 в канале general": {
+                "manage_message"
+            },
+            "P.OS отзови приглашение abc": {"revoke_invite"},
+            "P.OS создай правило AutoMod против mention spam": {
+                "manage_automod_rule"
+            },
+            "P.OS покажи все webhook": {"list_webhooks"},
+            "P.OS создай событие Тест завтра": {"manage_scheduled_event"},
+            "P.OS создай эмодзи из вложения": {"manage_emoji"},
+            "P.OS запомни Протокол: тест": {"remember_fact"},
+            "P.OS обнови контекст сервера": {"refresh_server_memory"},
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(
+                    pos_ai._allowed_tool_names_for_text(text),
+                    frozenset(expected),
+                )
 
 
 class ChannelResolverTests(unittest.TestCase):

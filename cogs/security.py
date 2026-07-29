@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 
 import discord
 from discord import Color
@@ -45,7 +44,6 @@ class SecurityCog(commands.Cog):
         self.bot = bot
         self._persisted_raid_until: dict[int, float] = {}
         self._posture_locks: dict[int, asyncio.Lock] = {}
-        self._owner_posture_alert_at: dict[int, float] = {}
         self._posture_tasks: dict[int, asyncio.Task[None]] = {}
         self._posture_sources: dict[int, set[str]] = {}
         self._posture_guilds: dict[int, discord.Guild] = {}
@@ -172,15 +170,6 @@ class SecurityCog(commands.Cog):
                         )
                     except Exception as exc:
                         logger.warning("Не удалось записать baseline security alert: %s", exc)
-                    if any(
-                        alert["severity"] in {"critical", "high"}
-                        for alert in baseline_alerts
-                    ):
-                        await self._alert_owner(
-                            guild,
-                            f"🛡️ P.OS обнаружил слабые настройки на **{guild.name}**:\n"
-                            + details_text[:1600],
-                        )
                 return
             if not alerts:
                 await set_security_posture(guild.id, current)
@@ -209,18 +198,6 @@ class SecurityCog(commands.Cog):
                 )
             except Exception as exc:
                 logger.warning("Не удалось записать security posture alert: %s", exc)
-
-            if not any(alert["severity"] in {"critical", "high"} for alert in alerts):
-                return
-            now = time.monotonic()
-            if now - self._owner_posture_alert_at.get(guild.id, 0.0) < 60.0:
-                return
-            self._owner_posture_alert_at[guild.id] = now
-            await self._alert_owner(
-                guild,
-                f"🛡️ P.OS обнаружил изменение безопасности на **{guild.name}**:\n"
-                + details_text[:1600],
-            )
 
     @tasks.loop(seconds=SECURITY_MONITOR_INTERVAL_SECONDS)
     async def security_monitor(self) -> None:
@@ -287,6 +264,74 @@ class SecurityCog(commands.Cog):
     @commands.Cog.listener()
     async def on_automod_rule_delete(self, rule: discord.AutoModRule) -> None:
         self._queue_security_posture_check(rule.guild, "automod_rule_delete")
+
+    @commands.Cog.listener()
+    async def on_automod_action(self, execution: discord.AutoModAction) -> None:
+        guild = execution.guild
+        member = execution.member
+        member_label = (
+            f"{member} (`{member.id}`)"
+            if member is not None
+            else f"`{execution.user_id}`"
+        )
+        channel_label = (
+            f"#{execution.channel.name} (`{execution.channel_id}`)"
+            if execution.channel is not None
+            else f"`{execution.channel_id or 'нет'}`"
+        )
+        action_type = str(getattr(execution.action, "type", "unknown"))
+        matched = (
+            execution.matched_keyword
+            or execution.matched_content
+            or "Discord не передал совпавший фрагмент"
+        )
+        try:
+            await add_ai_event(
+                guild_id=guild.id,
+                event_type="security:discord_automod_action",
+                actor_id=execution.user_id,
+                actor_name=str(member) if member is not None else None,
+                target_user_id=execution.user_id,
+                channel_id=execution.channel_id,
+                message_id=execution.message_id,
+                summary=(
+                    f"Discord AutoMod применил {action_type} по правилу "
+                    f"{execution.rule_id}"
+                ),
+                details={
+                    "rule_id": execution.rule_id,
+                    "trigger_type": str(execution.rule_trigger_type),
+                    "action_type": action_type,
+                    "matched": str(matched)[:500],
+                    "alert_system_message_id": execution.alert_system_message_id,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось сохранить AutoMod action на сервере %s.",
+                guild.id,
+            )
+        try:
+            await send_log_embed(
+                guild,
+                "security",
+                "Discord AutoMod: правило сработало",
+                (
+                    f"Участник: {member_label}\n"
+                    f"Канал: {channel_label}\n"
+                    f"Правило: `{execution.rule_id}`\n"
+                    f"Действие: `{action_type}`"
+                ),
+                color=Color.orange(),
+                fields=[
+                    ("Совпадение", str(matched)[:1024], False),
+                ],
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось записать AutoMod action в security-канал %s.",
+                guild.id,
+            )
 
     @commands.Cog.listener()
     async def on_guild_update(self, before: discord.Guild, after: discord.Guild) -> None:

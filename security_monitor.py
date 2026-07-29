@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from typing import Any
 
 import discord
@@ -88,6 +89,15 @@ def _mapping(value: object) -> dict[str, Any]:
 
 def _items(value: object) -> list[Any]:
     return value if isinstance(value, list) else []
+
+
+def _datetime_iso(value: object) -> str | None:
+    if not isinstance(value, datetime):
+        return None
+    try:
+        return value.isoformat()
+    except (TypeError, ValueError):
+        return None
 
 
 def _string_set(value: object) -> set[str]:
@@ -209,8 +219,13 @@ async def collect_security_snapshot(guild: discord.Guild) -> dict[str, Any]:
             }
 
     default_permissions = getattr(guild.default_role, "permissions", discord.Permissions.none())
+    safety_alerts_channel = getattr(guild, "safety_alerts_channel", None)
+    raid_detected_at = _datetime_iso(getattr(guild, "raid_detected_at", None))
+    dm_spam_detected_at = _datetime_iso(
+        getattr(guild, "dm_spam_detected_at", None)
+    )
     return {
-        "schema": 3,
+        "schema": 4,
         "guild_id": int(guild.id),
         "guild_name": str(guild.name)[:100],
         "mfa_level": _enum_level(getattr(guild, "mfa_level", -1)),
@@ -224,6 +239,21 @@ async def collect_security_snapshot(guild: discord.Guild) -> dict[str, Any]:
         "admin_bots": admin_bots,
         "webhooks": webhook_state,
         "automod": automod_state,
+        "native_safety": {
+            "raid_detected_at": raid_detected_at,
+            "dm_spam_detected_at": dm_spam_detected_at,
+            "invites_paused_until": _datetime_iso(
+                getattr(guild, "invites_paused_until", None)
+            ),
+            "dms_paused_until": _datetime_iso(
+                getattr(guild, "dms_paused_until", None)
+            ),
+            "safety_alerts_channel_id": (
+                int(safety_alerts_channel.id)
+                if safety_alerts_channel is not None
+                else None
+            ),
+        },
     }
 
 
@@ -343,6 +373,26 @@ def assess_security_snapshot(snapshot: dict[str, Any]) -> list[dict[str, str]]:
             "severity": "medium",
             "title": "На сервере есть webhook",
             "detail": f"Количество: {len(webhook_items)}; проверь владельцев и каналы",
+        })
+
+    native_safety = _mapping(snapshot.get("native_safety"))
+    if native_safety.get("raid_detected_at"):
+        alerts.append({
+            "severity": "critical",
+            "title": "Discord обнаружил возможный рейд",
+            "detail": f"detected_at={native_safety['raid_detected_at']}",
+        })
+    if native_safety.get("dm_spam_detected_at"):
+        alerts.append({
+            "severity": "high",
+            "title": "Discord обнаружил волну DM-спама",
+            "detail": f"detected_at={native_safety['dm_spam_detected_at']}",
+        })
+    if native_safety and native_safety.get("safety_alerts_channel_id") is None:
+        alerts.append({
+            "severity": "medium",
+            "title": "Не настроен канал нативных safety-уведомлений Discord",
+            "detail": "safety_alerts_channel отсутствует",
         })
     return alerts
 
@@ -548,6 +598,45 @@ def diff_security_snapshots(
                         "title": "Изменены условия Discord AutoMod",
                         "detail": f"{old_rule.get('name', 'правило')} (`{rule_id}`)",
                     })
+
+    old_native_safety = _mapping(previous.get("native_safety"))
+    new_native_safety = _mapping(current.get("native_safety"))
+    if (
+        not old_native_safety.get("raid_detected_at")
+        and new_native_safety.get("raid_detected_at")
+    ):
+        alerts.append({
+            "severity": "critical",
+            "title": "Discord обнаружил новый возможный рейд",
+            "detail": f"detected_at={new_native_safety['raid_detected_at']}",
+        })
+    if (
+        not old_native_safety.get("dm_spam_detected_at")
+        and new_native_safety.get("dm_spam_detected_at")
+    ):
+        alerts.append({
+            "severity": "high",
+            "title": "Discord обнаружил новую волну DM-спама",
+            "detail": f"detected_at={new_native_safety['dm_spam_detected_at']}",
+        })
+    old_safety_channel = old_native_safety.get("safety_alerts_channel_id")
+    new_safety_channel = new_native_safety.get("safety_alerts_channel_id")
+    if old_safety_channel and not new_safety_channel:
+        alerts.append({
+            "severity": "high",
+            "title": "Отключён канал нативных safety-уведомлений Discord",
+            "detail": f"channel_id={old_safety_channel}",
+        })
+    elif (
+        old_safety_channel
+        and new_safety_channel
+        and old_safety_channel != new_safety_channel
+    ):
+        alerts.append({
+            "severity": "medium",
+            "title": "Изменён канал нативных safety-уведомлений Discord",
+            "detail": f"{old_safety_channel} -> {new_safety_channel}",
+        })
     return alerts
 
 
@@ -567,6 +656,7 @@ def summarize_security_snapshot(snapshot: dict[str, Any]) -> str:
     admin_bots = _items(snapshot.get("admin_bots"))
     webhook_items = _items(webhooks.get("items"))
     automod_items = _items(automod.get("items"))
+    native_safety = _mapping(snapshot.get("native_safety"))
     return (
         f"2FA={snapshot.get('mfa_level')}; verification={snapshot.get('verification_level')}; "
         f"content_filter={snapshot.get('explicit_content_filter')}; "
@@ -574,5 +664,8 @@ def summarize_security_snapshot(snapshot: dict[str, Any]) -> str:
         f"опасных channel-overwrite={len(risky_channels)}; "
         f"привилегированных ролей={len(risky_roles)}; admin-ботов={len(admin_bots)}; "
         f"webhooks={len(webhook_items) if webhooks.get('available') else 'нет доступа'}; "
-        f"AutoMod={len(automod_items) if automod.get('available') else 'нет доступа'}"
+        f"AutoMod={len(automod_items) if automod.get('available') else 'нет доступа'}; "
+        f"Discord raid={bool(native_safety.get('raid_detected_at'))}; "
+        f"DM-spam={bool(native_safety.get('dm_spam_detected_at'))}; "
+        f"safety-channel={native_safety.get('safety_alerts_channel_id') or 'не настроен'}"
     )

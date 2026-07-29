@@ -202,7 +202,7 @@ POS_AI_TOOLS = [
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Название нового канала."},
-                    "type": {"type": "string", "description": "Тип канала: 'text', 'voice' или 'category'. По умолчанию 'text'."},
+                    "type": {"type": "string", "description": "Тип канала: text|announcement|voice|stage|category|forum|media. По умолчанию text."},
                     "category_id_or_name": {"type": "string", "description": "Необязательно. Точный ID или полное имя категории из запроса пользователя; не сокращай имя до общего слова вроде 'каналы'."},
                     "topic": {"type": "string", "description": "Необязательно. Описание (topic) для текстового канала."}
                 },
@@ -892,6 +892,301 @@ POS_AI_TOOLS.extend([
     },
 ])
 
+POS_AI_TOOLS.extend([
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_message",
+            "description": "Редактирует собственное сообщение P.OS, удаляет, закрепляет, открепляет, публикует announcement или завершает poll по фактическому ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "edit|delete|pin|unpin|publish|end_poll."},
+                    "channel_id_or_name": {"type": "string", "description": "Точный канал сообщения."},
+                    "message_id": {"type": "string", "description": "Discord ID сообщения."},
+                    "text": {"type": "string", "description": "Новый текст для edit."},
+                    "reason": {"type": "string", "description": "Необязательно. Причина."},
+                },
+                "required": ["action", "channel_id_or_name", "message_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_reaction",
+            "description": "Добавляет реакцию P.OS либо очищает выбранную/все реакции конкретного сообщения.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "add|remove_pos|clear|clear_all."},
+                    "channel_id_or_name": {"type": "string", "description": "Точный канал сообщения."},
+                    "message_id": {"type": "string", "description": "Discord ID сообщения."},
+                    "emoji": {"type": "string", "description": "Unicode emoji или Discord custom emoji."},
+                    "reason": {"type": "string", "description": "Необязательно. Причина."},
+                },
+                "required": ["action", "channel_id_or_name", "message_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_invites",
+            "description": "Читает фактический список активных приглашений сервера.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "revoke_invite",
+            "description": "Отзывает существующее приглашение по коду или URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "invite_code_or_url": {"type": "string", "description": "Код либо полный Discord invite URL."},
+                    "reason": {"type": "string", "description": "Необязательно. Причина."},
+                },
+                "required": ["invite_code_or_url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_webhooks",
+            "description": "Читает фактические webhook сервера без раскрытия токенов.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_webhook",
+            "description": "Удаляет webhook по точному ID или имени.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "webhook_id_or_name": {"type": "string", "description": "Точный ID или уникальное имя webhook."},
+                    "reason": {"type": "string", "description": "Необязательно. Причина."},
+                },
+                "required": ["webhook_id_or_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_automod_rules",
+            "description": "Читает фактические правила Discord AutoMod и их статус.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_automod_rule",
+            "description": "Создаёт keyword/mention-spam правило Discord AutoMod, включает, отключает, переименовывает или удаляет его.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "create_keyword|create_mention_spam|enable|disable|rename|delete."},
+                    "rule_id_or_name": {"type": "string", "description": "Для существующего правила: точный ID или имя."},
+                    "name": {"type": "string", "description": "Имя нового правила либо новое имя."},
+                    "keywords": {"type": "string", "description": "Ключевые слова через запятую или новую строку."},
+                    "regex_patterns": {"type": "string", "description": "Необязательно. Regex-паттерны через новую строку."},
+                    "allow_list": {"type": "string", "description": "Необязательно. Исключения через запятую."},
+                    "mention_limit": {"type": "string", "description": "Для mention-spam: лимит упоминаний 1-50."},
+                    "mention_raid_protection": {"type": "string", "description": "true/false."},
+                    "enabled": {"type": "string", "description": "true/false; по умолчанию true."},
+                    "alert_channel_id_or_name": {"type": "string", "description": "Необязательно. Канал системных оповещений."},
+                    "timeout_minutes": {"type": "string", "description": "Необязательно. Тайм-аут нарушителя."},
+                    "custom_message": {"type": "string", "description": "Необязательно. Сообщение блокировки."},
+                    "reason": {"type": "string", "description": "Необязательно. Причина."},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_scheduled_events",
+            "description": "Читает фактические запланированные события сервера.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_scheduled_event",
+            "description": "Создаёт, изменяет, запускает, завершает, отменяет или удаляет Discord Scheduled Event.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "create|edit|start|complete|cancel|delete."},
+                    "event_id_or_name": {"type": "string", "description": "Для существующего события: ID или точное имя."},
+                    "name": {"type": "string", "description": "Название события."},
+                    "description": {"type": "string", "description": "Необязательно. Описание."},
+                    "start_time": {"type": "string", "description": "ISO 8601 с часовым поясом."},
+                    "end_time": {"type": "string", "description": "Необязательно. ISO 8601."},
+                    "event_type": {"type": "string", "description": "external|voice|stage."},
+                    "location": {"type": "string", "description": "Место для external."},
+                    "channel_id_or_name": {"type": "string", "description": "Voice/stage канал."},
+                    "reason": {"type": "string", "description": "Необязательно. Причина."},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_forum_post",
+            "description": "Создаёт новый пост в Discord ForumChannel.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id_or_name": {"type": "string", "description": "Точный форумный канал."},
+                    "name": {"type": "string", "description": "Заголовок поста."},
+                    "text": {"type": "string", "description": "Первое сообщение поста."},
+                    "reason": {"type": "string", "description": "Необязательно. Причина."},
+                },
+                "required": ["channel_id_or_name", "name", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_server_safety",
+            "description": "Управляет нативной защитой Discord: паузой инвайтов/ЛС, raid alerts и safety alerts channel.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "invites_disabled": {"type": "string", "description": "true/false — отключить обычные инвайты."},
+                    "invites_disabled_minutes": {"type": "string", "description": "Временно отключить инвайты на 1-1440 минут."},
+                    "dms_disabled_minutes": {"type": "string", "description": "Временно отключить DMs на 1-1440 минут."},
+                    "raid_alerts_enabled": {"type": "string", "description": "true/false — включены ли Discord raid alerts."},
+                    "safety_alerts_channel_id_or_name": {"type": "string", "description": "Канал нативных safety-уведомлений."},
+                    "reason": {"type": "string", "description": "Необязательно. Причина."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_emojis",
+            "description": "Читает фактический список пользовательских эмодзи сервера.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_emoji",
+            "description": "Создаёт эмодзи из вложения текущего сообщения, переименовывает или удаляет его.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "create|rename|delete."},
+                    "emoji_id_or_name": {"type": "string", "description": "Для rename/delete: ID или точное имя."},
+                    "name": {"type": "string", "description": "Имя нового/переименованного эмодзи."},
+                    "attachment_index": {"type": "string", "description": "Для create: индекс вложения текущего сообщения, начиная с 0."},
+                    "reason": {"type": "string", "description": "Необязательно. Причина."},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_stickers",
+            "description": "Читает фактический список стикеров сервера.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_sticker",
+            "description": "Создаёт стикер из вложения текущего сообщения, изменяет или удаляет его.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "create|edit|delete."},
+                    "sticker_id_or_name": {"type": "string", "description": "Для edit/delete: ID или точное имя."},
+                    "name": {"type": "string", "description": "Имя стикера."},
+                    "description": {"type": "string", "description": "Описание стикера."},
+                    "emoji": {"type": "string", "description": "Связанный Unicode emoji/tag."},
+                    "attachment_index": {"type": "string", "description": "Для create: индекс вложения текущего сообщения, начиная с 0."},
+                    "reason": {"type": "string", "description": "Необязательно. Причина."},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember_fact",
+            "description": "Сохраняет предоставленный владельцем факт или рабочую запись в постоянной базе P.OS.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Короткий заголовок записи."},
+                    "text": {"type": "string", "description": "Точный текст записи без домыслов."},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_memory_entries",
+            "description": "Читает фактические записи постоянной базы P.OS.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "string", "description": "Количество записей, 1-50."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_memory_entry",
+            "description": "Удаляет точную запись постоянной базы P.OS по ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entry_id": {"type": "string", "description": "Числовой ID записи."},
+                },
+                "required": ["entry_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "refresh_server_memory",
+            "description": "Собирает свежий контекст из доступной истории каналов выбранного сервера в память P.OS.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+])
+
 
 # 0.8: кросс-серверность. Владелец может выполнять управляющие действия на любом
 # сервере, где есть P.OS, не находясь на нём. Добавляем необязательный параметр
@@ -908,6 +1203,12 @@ _CROSS_SERVER_TOOLS = {
     "list_members", "user_info", "read_messages", "search_logs", "search_pings", "bulk_user_action",
     "list_channels", "list_roles", "read_audit_log",
     "ping_user", "lift_restrictions", "deactivate_raid_mode",
+    "manage_message", "manage_reaction", "list_invites", "revoke_invite",
+    "list_webhooks", "delete_webhook", "list_automod_rules", "manage_automod_rule",
+    "list_scheduled_events", "manage_scheduled_event", "create_forum_post",
+    "set_server_safety", "list_emojis", "manage_emoji", "list_stickers",
+    "manage_sticker",
+    "refresh_server_memory",
 }
 
 _USER_IDENTIFIER_TOOLS = {

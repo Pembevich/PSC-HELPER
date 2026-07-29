@@ -101,6 +101,21 @@ LOG_TYPE_LABELS = {
     "forms": "Формы",
     "errors": "Ошибки",
 }
+LOG_TYPE_COLORS = {
+    "moderation": Color(0xF2C94C),
+    "security": Color(0xF04444),
+    "messages": Color(0x29B6D1),
+    "message_edits": Color(0x8D9AA8),
+    "message_deletes": Color(0xF2994A),
+    "members": Color(0x42C97A),
+    "voice": Color(0x56CCF2),
+    "roles": Color(0xA6B1BE),
+    "channels": Color(0x56CCF2),
+    "server": Color(0x8D9AA8),
+    "commands": Color(0x29B6D1),
+    "forms": Color(0x42C97A),
+    "errors": Color(0xF04444),
+}
 
 
 def _safe_lower(value: str | None) -> str:
@@ -375,9 +390,17 @@ def _build_log_embed(
 ) -> Embed:
     """Build an embed that always respects Discord's per-part and 6000-char limits."""
     label = LOG_TYPE_LABELS.get(log_type, "Логи")
-    author_text = _truncate_log_text(f"P.S.C Logs • {label}", 256, "P.S.C Logs")
+    author_text = _truncate_log_text(
+        f"P.OS // {label.upper()}",
+        256,
+        "P.OS // LOG",
+    )
     title_text = _truncate_log_text(title, 256, "Журнал P.OS")
-    footer_text = _truncate_log_text(footer or label, 2048, label)
+    footer_text = _truncate_log_text(
+        footer or f"P.OS • {label}",
+        2048,
+        f"P.OS • {label}",
+    )
     total_budget = 6000 - len(author_text) - len(title_text) - len(footer_text)
 
     description_limit = 3500 if fields else 4096
@@ -415,7 +438,7 @@ async def send_log_embed(
     title: str,
     description: str,
     *,
-    color: Color = Color.orange(),
+    color: Color | None = None,
     fields: list[tuple[str, str, bool]] | None = None,
     files: list[discord.File] | None = None,
     footer: str | None = None
@@ -447,7 +470,11 @@ async def send_log_embed(
         log_type,
         title,
         description,
-        color=color,
+        color=(
+            color
+            if color is not None
+            else LOG_TYPE_COLORS.get(log_type, Color(0x8D9AA8))
+        ),
         fields=fields,
         footer=footer,
     )

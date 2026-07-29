@@ -50,6 +50,8 @@ from config import (
 )
 from guild_config import get_settings as get_guild_settings
 from logging_utils import get_log_channel, send_log_embed
+from media_intelligence import extract_media_context
+from safe_browsing import lookup_url as safe_browsing_lookup_url
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +79,10 @@ AI_IMAGE_MAX_SIDE = 1280
 AI_VIDEO_FRAME_COUNT = 3
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm", ".avi", ".mkv")
+AUDIO_EXTENSIONS = (
+    ".aac", ".aif", ".aiff", ".flac", ".m4a", ".mp3", ".oga", ".ogg",
+    ".opus", ".wav",
+)
 SAFE_PIL_FORMATS = {"JPEG", "PNG", "WEBP", "BMP", "GIF"}
 DANGEROUS_ATTACHMENT_EXTENSIONS = {
     ".exe", ".scr", ".com", ".bat", ".cmd", ".ps1", ".psm1", ".vbs",
@@ -126,6 +132,7 @@ _MACHO_MAGICS = {
 
 _vt_cache: dict[str, tuple[bool, float]] = {}
 _gsb_cache: dict[str, tuple[bool, float]] = {}
+_gsb_cache_duration_hint: dict[str, float] = {}
 _vt_file_cache: dict[str, tuple[bool, float]] = {}
 _ai_url_cache: dict[str, tuple[str, str, float]] = {}
 
@@ -413,6 +420,12 @@ def _is_video_attachment(att: discord.Attachment) -> bool:
     return content_type.startswith("video/") or name.endswith(VIDEO_EXTENSIONS)
 
 
+def _is_audio_attachment(att: discord.Attachment) -> bool:
+    content_type = (att.content_type or "").lower()
+    name = (att.filename or "").lower()
+    return content_type.startswith("audio/") or name.endswith(AUDIO_EXTENSIONS)
+
+
 def _extract_path_keywords(path_text: str) -> list[str]:
     text = path_text.lower()
     matched = [keyword for keyword in SUSPICIOUS_PATH_KEYWORDS if keyword in text]
@@ -581,36 +594,15 @@ async def check_google_safe_browsing(
 ) -> bool | None:
     if not GOOGLE_SAFEBROWSING_KEY:
         return None
-
-    endpoint = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={GOOGLE_SAFEBROWSING_KEY}"
-    payload = {
-        "client": {"clientId": "discord-bot", "clientVersion": "1.0"},
-        "threatInfo": {
-            "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
-            "platformTypes": ["ANY_PLATFORM"],
-            "threatEntryTypes": ["URL"],
-            "threatEntries": [{"url": url}],
-        },
-    }
-    try:
-        async with session.post(
-            endpoint,
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=10),
-            allow_redirects=False,
-        ) as response:
-            if response.status != 200:
-                return None
-            payload = await response.json()
-            return "matches" in payload and bool(payload["matches"])
-    except Exception as exc:
-        url_hash = hashlib.sha256(url.encode("utf-8", errors="replace")).hexdigest()[:16]
-        logger.warning(
-            "Google Safe Browsing error for url_sha256=%s (%s)",
-            url_hash,
-            type(exc).__name__,
-        )
+    verdict = await safe_browsing_lookup_url(
+        session,
+        url,
+        api_key=GOOGLE_SAFEBROWSING_KEY,
+    )
+    if not verdict.checked:
         return None
+    _gsb_cache_duration_hint[url] = verdict.cache_seconds
+    return verdict.matched
 
 
 def _virustotal_stats_confirm_malicious(stats: object) -> bool | None:
@@ -983,7 +975,15 @@ async def _classify_media_with_ai(
     if not ai_has_configured_provider() or ai_is_temporarily_unavailable():
         return {}
 
-    media = [attachment for attachment in attachments if _is_image_attachment(attachment) or _is_video_attachment(attachment)]
+    media = [
+        attachment
+        for attachment in attachments
+        if (
+            _is_image_attachment(attachment)
+            or _is_video_attachment(attachment)
+            or _is_audio_attachment(attachment)
+        )
+    ]
     media = media[:AI_MEDIA_MAX_ATTACHMENTS]
     if not media:
         return {}
@@ -1048,12 +1048,21 @@ async def _classify_media_with_ai(
             item_map[item_token] = (id(attachment), attachment.filename)
             continue
 
-        if _is_video_attachment(attachment):
-            frame_urls = await _attachment_video_to_data_urls(attachment)
-            if not frame_urls:
+        if _is_video_attachment(attachment) or _is_audio_attachment(attachment):
+            media_context = await extract_media_context([attachment])
+            frame_urls = media_context.visual_inputs
+            analysis_text = media_context.as_untrusted_text()
+            if not frame_urls and not analysis_text:
                 continue
             for frame_url in frame_urls:
                 content_items.append({"type": "image_url", "image_url": {"url": frame_url}})
+            if analysis_text:
+                content_items.append(
+                    {
+                        "type": "text",
+                        "text": analysis_text,
+                    }
+                )
             content_items.append(
                 {
                     "type": "text",
@@ -1200,14 +1209,20 @@ async def check_and_handle_urls(
             gsb_bad: bool | None = None
             if GOOGLE_SAFEBROWSING_KEY:
                 gsb_cached = _gsb_cache.get(normalized_url)
-                if gsb_cached:
-                    gsb_ttl = _VT_CACHE_TTL if gsb_cached[0] else _GSB_SAFE_CACHE_TTL
-                    if now - gsb_cached[1] < gsb_ttl:
-                        gsb_bad = gsb_cached[0]
+                if gsb_cached and now < gsb_cached[1]:
+                    gsb_bad = gsb_cached[0]
                 if gsb_bad is None:
                     gsb_bad = await check_google_safe_browsing(session, normalized_url)
                     if gsb_bad is not None:
-                        _gsb_cache[normalized_url] = (gsb_bad, now)
+                        default_ttl = _VT_CACHE_TTL if gsb_bad else _GSB_SAFE_CACHE_TTL
+                        cache_ttl = _gsb_cache_duration_hint.pop(
+                            normalized_url,
+                            default_ttl,
+                        )
+                        _gsb_cache[normalized_url] = (
+                            gsb_bad,
+                            now + max(1.0, min(cache_ttl, 24 * 60 * 60)),
+                        )
                 if gsb_bad:
                     suspicious.append((url, "GoogleSafeBrowsing"))
                     continue
@@ -1255,6 +1270,13 @@ async def check_and_handle_urls(
     evidence = suspicious + [(url, f"AI-review: {reason}") for url, reason in corroborating_ai]
     reason_text = "\n".join(f"{url} -> {why}" for url, why in evidence)
     reasons = [f"Подозрительная ссылка: {url} ({why})" for url, why in evidence]
+    google_advisory = any(why == "GoogleSafeBrowsing" for _, why in evidence)
+    if google_advisory:
+        reasons.append(
+            "Google Safe Browsing: ресурс может быть опасным; возможны ложные "
+            "срабатывания. Advisory provided by Google: "
+            "https://developers.google.com/safe-browsing/v4/advisory"
+        )
 
     try:
         await message.delete()
@@ -1270,7 +1292,7 @@ async def check_and_handle_urls(
         dm = Embed(
             title="⚠️ Ссылка заблокирована",
             description=(
-                "Сообщение удалено: ссылка выглядит опасной или слишком подозрительной."
+                "Сообщение удалено: ссылка выглядит потенциально опасной или слишком подозрительной."
                 + (" Выдано ограничение голоса." if timed_out else "")
             ),
             color=Color.red(),
@@ -1706,7 +1728,11 @@ async def detect_attachment_violations(
         check_ads=check_ads,
     )
     should_run_ai_review = any(
-        _is_image_attachment(attachment) or _is_video_attachment(attachment)
+        (
+            _is_image_attachment(attachment)
+            or _is_video_attachment(attachment)
+            or _is_audio_attachment(attachment)
+        )
         for attachment in attachment_list
     )
     ai_verdicts = (

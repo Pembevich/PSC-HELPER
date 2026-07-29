@@ -3,7 +3,7 @@ import copy
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import security_monitor
 import storage
@@ -12,7 +12,7 @@ from cogs.security import SecurityCog
 
 def _snapshot():
     return {
-        "schema": 3,
+        "schema": 4,
         "guild_id": 42,
         "guild_name": "Test",
         "mfa_level": 1,
@@ -57,6 +57,13 @@ def _snapshot():
                     "exempt_channel_ids": [],
                 }
             ],
+        },
+        "native_safety": {
+            "raid_detected_at": None,
+            "dm_spam_detected_at": None,
+            "invites_paused_until": None,
+            "dms_paused_until": None,
+            "safety_alerts_channel_id": 20,
         },
     }
 
@@ -140,6 +147,22 @@ class SecurityPostureDiffTests(unittest.TestCase):
         titles = {alert["title"] for alert in alerts}
         self.assertIn("Канал стал доступен @everyone: staff", titles)
         self.assertIn("@everyone получил опасные права в канале: staff", titles)
+
+    def test_native_discord_raid_and_safety_channel_changes_are_reported(self):
+        previous = _snapshot()
+        current = copy.deepcopy(previous)
+        current["native_safety"]["raid_detected_at"] = "2026-07-29T10:00:00+00:00"
+        current["native_safety"]["dm_spam_detected_at"] = "2026-07-29T10:01:00+00:00"
+        current["native_safety"]["safety_alerts_channel_id"] = None
+
+        alerts = security_monitor.diff_security_snapshots(previous, current)
+        titles = {alert["title"] for alert in alerts}
+        self.assertIn("Discord обнаружил новый возможный рейд", titles)
+        self.assertIn("Discord обнаружил новую волну DM-спама", titles)
+        self.assertIn(
+            "Отключён канал нативных safety-уведомлений Discord",
+            titles,
+        )
 
     def test_schema_one_baseline_does_not_report_existing_channels_as_new(self):
         previous = _snapshot()
@@ -233,6 +256,34 @@ class SecurityPostureQueueTests(unittest.IsolatedAsyncioTestCase):
         source = cog._check_security_posture.await_args.kwargs["source"]
         self.assertEqual(source, "channel_update+role_update+webhooks_update")
         await cog.cog_unload()
+
+    async def test_posture_audit_uses_guild_security_log_without_owner_dm(self):
+        bot = SimpleNamespace()
+        cog = SecurityCog(bot)
+        guild = SimpleNamespace(id=42, name="Test")
+        insecure = _snapshot()
+        insecure["mfa_level"] = 0
+        insecure["verification_level"] = 0
+        cog._alert_owner = AsyncMock()
+        method_globals = SecurityCog._check_security_posture.__globals__
+
+        send_log = AsyncMock()
+        with patch.dict(
+            method_globals,
+            {
+                "collect_security_snapshot": AsyncMock(return_value=insecure),
+                "get_security_posture": AsyncMock(return_value=None),
+                "set_security_posture": AsyncMock(),
+                "add_ai_event": AsyncMock(),
+                "send_log_embed": send_log,
+            },
+        ):
+            await cog._check_security_posture(guild, source="periodic")
+
+        send_log.assert_awaited_once()
+        self.assertIs(send_log.await_args.args[0], guild)
+        self.assertEqual(send_log.await_args.args[1], "security")
+        cog._alert_owner.assert_not_awaited()
 
 
 if __name__ == "__main__":

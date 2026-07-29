@@ -27,11 +27,11 @@ MAX_ATTACHMENTS = 4
 MAX_ATTACHMENT_BYTES = 24 * 1024 * 1024
 MAX_TOTAL_BYTES = 36 * 1024 * 1024
 MAX_INLINE_MEDIA_BYTES = 14 * 1024 * 1024
-MAX_VISUAL_INPUTS = 6
+MAX_VISUAL_INPUTS = 10
 MAX_IMAGE_SIDE = 1024
-MAX_GIF_FRAMES = 5
-MAX_GIF_SOURCE_FRAMES = 600
-MAX_VIDEO_FRAMES = 5
+MAX_GIF_FRAMES = 8
+MAX_GIF_SOURCE_FRAMES = 1200
+MAX_VIDEO_FRAMES = 8
 MAX_ANALYSIS_CHARS = 6000
 MAX_VISUAL_FILE_BYTES = 1_500_000
 MAX_VISUAL_TOTAL_CHARS = 8 * 1024 * 1024
@@ -49,28 +49,30 @@ _GEMINI_AUDIO_MIME_MAP = {
     "audio/aac": "audio/aac",
     "audio/aiff": "audio/aiff",
     "audio/flac": "audio/flac",
+    "audio/m4a": "audio/m4a",
     "audio/mp3": "audio/mp3",
+    "audio/mp4": "audio/m4a",
     "audio/mpeg": "audio/mp3",
     "audio/ogg": "audio/ogg",
+    "audio/opus": "audio/opus",
     "audio/wav": "audio/wav",
     "audio/x-wav": "audio/wav",
+    "audio/x-m4a": "audio/m4a",
 }
-_GEMINI_VIDEO_MIMES = frozenset(
-    {
-        "video/3gpp",
-        "video/avi",
-        "video/mp4",
-        "video/mpeg",
-        "video/quicktime",
-        "video/webm",
-        "video/wmv",
-        "video/x-flv",
-        "video/x-matroska",
-        "video/x-ms-asf",
-        "video/x-ms-wmv",
-        "video/x-msvideo",
-    }
-)
+_GEMINI_VIDEO_MIME_MAP = {
+    "video/3gpp": "video/3gpp",
+    "video/avi": "video/avi",
+    "video/mp4": "video/mp4",
+    "video/mov": "video/mov",
+    "video/mpeg": "video/mpeg",
+    "video/mpg": "video/mpg",
+    "video/quicktime": "video/mov",
+    "video/webm": "video/webm",
+    "video/wmv": "video/wmv",
+    "video/x-flv": "video/x-flv",
+    "video/x-ms-wmv": "video/wmv",
+    "video/x-msvideo": "video/avi",
+}
 _ZERO_WIDTH_AND_BIDI = re.compile(
     r"[\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]"
 )
@@ -185,6 +187,47 @@ def _attachment_kind(attachment: Any) -> str | None:
         return "audio"
     if mime.startswith("video/") or suffix in _VIDEO_EXTENSIONS:
         return "video"
+    return None
+
+
+def _sniff_media_kind(data: bytes, declared_kind: str | None) -> str | None:
+    """Verify the media family from bytes before sending it to any model."""
+    if not data:
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if (image.format or "").upper() in _SAFE_IMAGE_FORMATS:
+                return "image"
+    except Exception:
+        pass
+
+    head = data[:64]
+    if head.startswith(
+        (
+            b"MZ",
+            b"\x7fELF",
+            b"PK\x03\x04",
+            b"%PDF-",
+            b"#!",
+        )
+    ):
+        return None
+    if (
+        head.startswith((b"fLaC", b"ID3"))
+        or head[:4] in {b"RIFF"} and head[8:12] == b"WAVE"
+        or len(head) >= 2 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0
+    ):
+        return "audio"
+    if head[:4] == b"RIFF" and head[8:12] == b"AVI ":
+        return "video"
+    if head.startswith((b"\x00\x00\x01\xba", b"\x00\x00\x01\xb3")):
+        return "video"
+    if head.startswith(b"OggS"):
+        return declared_kind if declared_kind in {"audio", "video"} else "audio"
+    if head.startswith(b"\x1a\x45\xdf\xa3"):
+        return declared_kind if declared_kind in {"audio", "video"} else "video"
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        return declared_kind if declared_kind in {"audio", "video"} else "video"
     return None
 
 
@@ -314,7 +357,7 @@ def _run_process(command: list[str], timeout: float) -> subprocess.CompletedProc
 def _probe_duration(path: Path) -> float | None:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     result = _run_process(
-        [ffmpeg, "-hide_banner", "-i", str(path)],
+        [ffmpeg, "-nostdin", "-hide_banner", "-i", str(path)],
         timeout=8,
     )
     if result is None:
@@ -335,7 +378,13 @@ def _video_timestamps(duration: float | None) -> list[float]:
         return [0.0]
     if duration < 0.4:
         return [0.0]
-    fractions = (0.04, 0.25, 0.5, 0.75, 0.96)
+    if MAX_VIDEO_FRAMES <= 1:
+        fractions = (0.5,)
+    else:
+        fractions = tuple(
+            0.04 + (0.92 * index / (MAX_VIDEO_FRAMES - 1))
+            for index in range(MAX_VIDEO_FRAMES)
+        )
     return sorted({max(0.0, min(duration - 0.05, duration * part)) for part in fractions})
 
 
@@ -349,6 +398,7 @@ def _extract_video_frames(path: Path) -> list[str]:
             result = _run_process(
                 [
                     ffmpeg,
+                    "-nostdin",
                     "-hide_banner",
                     "-loglevel",
                     "error",
@@ -384,6 +434,7 @@ def _normalize_audio(path: Path, output: Path) -> bytes | None:
     result = _run_process(
         [
             ffmpeg,
+            "-nostdin",
             "-hide_banner",
             "-loglevel",
             "error",
@@ -426,9 +477,11 @@ async def _analyze_audio_or_video(
     kind: str,
 ) -> tuple[str | None, list[str]]:
     mime = _normalized_mime(attachment)
-    native_mime = _GEMINI_AUDIO_MIME_MAP.get(mime) if kind == "audio" else mime
-    if kind == "video" and native_mime not in _GEMINI_VIDEO_MIMES:
-        native_mime = None
+    native_mime = (
+        _GEMINI_AUDIO_MIME_MAP.get(mime)
+        if kind == "audio"
+        else _GEMINI_VIDEO_MIME_MAP.get(mime)
+    )
 
     analysis: str | None = None
     visuals: list[str] = []
@@ -469,13 +522,9 @@ async def extract_media_context(attachments: list[Any] | tuple[Any, ...]) -> Med
     consumed = 0
     async with _MEDIA_SEMAPHORE:
         for attachment in list(attachments)[:MAX_ATTACHMENTS]:
-            kind = _attachment_kind(attachment)
-            if kind is None:
+            declared_kind = _attachment_kind(attachment)
+            if declared_kind is None:
                 continue
-            if kind == "audio":
-                context.audio_files += 1
-            elif kind == "video":
-                context.video_files += 1
             filename = _safe_filename(getattr(attachment, "filename", "attachment"))
             data = await _read_attachment_bounded(
                 attachment,
@@ -487,6 +536,25 @@ async def extract_media_context(attachments: list[Any] | tuple[Any, ...]) -> Med
                 )
                 continue
             consumed += len(data)
+            kind = await asyncio.to_thread(
+                _sniff_media_kind,
+                data,
+                declared_kind,
+            )
+            if kind is None:
+                context.warnings.append(
+                    f"{filename}: заявленный тип файла не подтверждён его содержимым."
+                )
+                continue
+            if kind != declared_kind:
+                context.warnings.append(
+                    f"{filename}: фактический тип `{kind}` отличается от заявленного "
+                    f"`{declared_kind}`; использован фактический тип."
+                )
+            if kind == "audio":
+                context.audio_files += 1
+            elif kind == "video":
+                context.video_files += 1
 
             if kind == "image":
                 visuals = await asyncio.to_thread(image_bytes_to_data_urls, data)

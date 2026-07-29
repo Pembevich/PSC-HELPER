@@ -430,6 +430,26 @@ def _gemini_generate_content_url(provider: Mapping[str, str]) -> str | None:
     )
 
 
+def _gemini_interactions_url(provider: Mapping[str, str]) -> str | None:
+    """Build the current Gemini Interactions endpoint for a Gemini provider."""
+    api_url = provider.get("api_url", "")
+    try:
+        parsed = urlsplit(api_url)
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme != "https" or not (
+        host == "googleapis.com" or host.endswith(".googleapis.com")
+    ):
+        return None
+    path_parts = [part for part in parsed.path.split("/") if part]
+    api_version = next(
+        (part for part in path_parts if re.fullmatch(r"v\d+(?:alpha|beta)?", part)),
+        "v1beta",
+    )
+    return f"https://{parsed.netloc}/{api_version}/interactions"
+
+
 def _extract_gemini_text(data: Mapping[str, Any]) -> str | None:
     candidates = data.get("candidates")
     if not isinstance(candidates, list):
@@ -447,6 +467,33 @@ def _extract_gemini_text(data: Mapping[str, Any]) -> str | None:
         for part in raw_parts:
             if isinstance(part, Mapping) and isinstance(part.get("text"), str):
                 text = str(part["text"]).strip()
+                if text:
+                    parts.append(text)
+    combined = "\n".join(parts).strip()
+    return combined or None
+
+
+def _extract_interaction_text(data: Mapping[str, Any]) -> str | None:
+    output_text = data.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+    steps = data.get("steps")
+    if not isinstance(steps, list):
+        return None
+    parts: list[str] = []
+    for step in steps:
+        if not isinstance(step, Mapping) or step.get("type") != "model_output":
+            continue
+        content = step.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if (
+                isinstance(item, Mapping)
+                and item.get("type") == "text"
+                and isinstance(item.get("text"), str)
+            ):
+                text = str(item["text"]).strip()
                 if text:
                     parts.append(text)
     combined = "\n".join(parts).strip()
@@ -502,7 +549,6 @@ async def pos_gemini_media_analysis(
     for _attempt in range(gemini_count):
         provider_index: int | None = None
         provider: dict[str, str] | None = None
-        response_text = ""
         try:
             async with _request_slot(request_timeout):
                 provider_index = await _reserve_exact_provider_index("gemini")
@@ -510,12 +556,12 @@ async def pos_gemini_media_analysis(
                     return None
                 attempted.add(provider_index)
                 provider = _AI_PROVIDER_POOL[provider_index]
-                endpoint = _gemini_generate_content_url(provider)
-                if endpoint is None:
+                generate_endpoint = _gemini_generate_content_url(provider)
+                if generate_endpoint is None:
                     await _mark_provider_backoff(provider_index, 300.0)
                     continue
 
-                payload = {
+                generate_payload = {
                     "contents": [
                         {
                             "role": "user",
@@ -535,6 +581,47 @@ async def pos_gemini_media_analysis(
                         "max_output_tokens": request_max_tokens,
                     },
                 }
+                request_variants: list[tuple[str, str, dict[str, Any]]] = []
+                interactions_endpoint = _gemini_interactions_url(provider)
+                if interactions_endpoint is not None:
+                    model = provider["model"].strip()
+                    if model.startswith("models/"):
+                        model = model[len("models/"):]
+                    if model.startswith("google/"):
+                        model = model[len("google/"):]
+                    media_type = (
+                        "audio"
+                        if normalized_mime.startswith("audio/")
+                        else "video"
+                    )
+                    request_variants.append(
+                        (
+                            "interactions",
+                            interactions_endpoint,
+                            {
+                                "model": model,
+                                "input": [
+                                    {
+                                        "type": media_type,
+                                        "data": encoded_text,
+                                        "mime_type": normalized_mime,
+                                    },
+                                    {
+                                        "type": "text",
+                                        "text": clean_prompt,
+                                    },
+                                ],
+                                "store": False,
+                                "generation_config": {
+                                    "max_output_tokens": request_max_tokens,
+                                    "thinking_level": "low",
+                                },
+                            },
+                        )
+                    )
+                request_variants.append(
+                    ("generateContent", generate_endpoint, generate_payload)
+                )
                 headers = {
                     "x-goog-api-key": provider["api_key"],
                     "Content-Type": "application/json",
@@ -547,38 +634,76 @@ async def pos_gemini_media_analysis(
                     connector=connector,
                     trust_env=False,
                 ) as session:
-                    async with session.post(
-                        endpoint,
-                        headers=headers,
-                        json=payload,
-                        allow_redirects=False,
-                    ) as resp:
-                        response_text = await _read_bounded_response(resp)
-                        if _looks_like_rate_limit(resp.status, response_text, resp.headers):
-                            retry_after = (
-                                _parse_retry_after(resp.headers)
-                                or POS_AI_RATE_LIMIT_FALLBACK_SECONDS
-                            )
-                            await _mark_provider_backoff(provider_index, retry_after)
-                            continue
-                        if resp.status >= 500:
-                            await _mark_provider_backoff(provider_index, 15.0)
-                            continue
-                        if 300 <= resp.status < 400:
-                            await _mark_provider_backoff(provider_index, 300.0)
-                            continue
-                        if resp.status >= 400:
+                    for api_kind, endpoint, payload in request_variants:
+                        async with session.post(
+                            endpoint,
+                            headers=headers,
+                            json=payload,
+                            allow_redirects=False,
+                        ) as resp:
+                            response_text = await _read_bounded_response(resp)
+                            if 200 <= resp.status < 300:
+                                try:
+                                    data = json.loads(response_text)
+                                except (TypeError, json.JSONDecodeError):
+                                    continue
+                                result = (
+                                    _extract_interaction_text(data)
+                                    if api_kind == "interactions"
+                                    else _extract_gemini_text(data)
+                                )
+                                if result:
+                                    return result
+                                continue
+
+                            # Interactions is the preferred modern audio path,
+                            # but older models/accounts may not expose it yet.
+                            # A compatibility rejection falls through to the
+                            # existing generateContent request on the same key.
+                            if (
+                                api_kind == "interactions"
+                                and resp.status in {400, 404, 405, 422}
+                            ):
+                                continue
+                            if _looks_like_rate_limit(
+                                resp.status,
+                                response_text,
+                                resp.headers,
+                            ):
+                                retry_after = (
+                                    _parse_retry_after(resp.headers)
+                                    or POS_AI_RATE_LIMIT_FALLBACK_SECONDS
+                                )
+                                await _mark_provider_backoff(
+                                    provider_index,
+                                    retry_after,
+                                )
+                                break
+                            if resp.status >= 500:
+                                await _mark_provider_backoff(
+                                    provider_index,
+                                    15.0,
+                                )
+                                break
+                            if 300 <= resp.status < 400:
+                                await _mark_provider_backoff(
+                                    provider_index,
+                                    300.0,
+                                )
+                                break
                             if resp.status in {401, 403}:
-                                await _mark_provider_backoff(provider_index, 3600.0)
-                            elif resp.status == 404:
-                                await _mark_provider_backoff(provider_index, 300.0)
+                                await _mark_provider_backoff(
+                                    provider_index,
+                                    3600.0,
+                                )
                             logger.warning(
-                                "P.OS Gemini media API error %s (%s), body_sha256=%s",
+                                "P.OS Gemini media API error %s/%s (%s), body_sha256=%s",
+                                api_kind,
                                 resp.status,
                                 provider["name"],
                                 _upstream_body_fingerprint(response_text),
                             )
-                            continue
+                            break
         except _AIQueueTimeout:
             return None
         except (asyncio.TimeoutError, TimeoutError):
@@ -595,13 +720,6 @@ async def pos_gemini_media_analysis(
             )
             continue
 
-        try:
-            data = json.loads(response_text)
-        except (TypeError, json.JSONDecodeError):
-            continue
-        result = _extract_gemini_text(data)
-        if result:
-            return result
     return None
 
 

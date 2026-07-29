@@ -3,7 +3,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 
-from config import BOT_COMMAND_PREFIX, POS_IDENTITY_PROMPT, POS_OFFICIAL_SITE_URL, POS_VERSION
+from config import (
+    BOT_COMMAND_PREFIX,
+    POS_AI_SYSTEM_PROMPT,
+    POS_IDENTITY_PROMPT,
+    POS_OFFICIAL_SITE_URL,
+    POS_VERSION,
+)
 
 
 with patch("storage.add_entry"), \
@@ -41,6 +47,17 @@ class PromptInjectionGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn(POS_OFFICIAL_SITE_URL, POS_IDENTITY_PROMPT)
         self.assertIn(POS_VERSION, POS_IDENTITY_PROMPT)
+
+    def test_personality_is_expressive_and_not_forced_terse(self):
+        prompt = POS_AI_SYSTEM_PROMPT.casefold()
+
+        self.assertIn("первая операционная сингулярность psc", prompt)
+        self.assertIn("не сокращай ответ искусственно", prompt)
+        self.assertIn("раскрывай подробно", prompt)
+        self.assertIn("не замыкайся в сухой реакции", prompt)
+        self.assertIn("проявляй собственную позицию", prompt)
+        self.assertIn("входи в выбранную манеру полноценно", prompt)
+        self.assertNotIn("короткий вопрос — короткий ответ", prompt)
 
     def test_identity_output_guard_replaces_only_self_disclosure(self):
         disclosures = (

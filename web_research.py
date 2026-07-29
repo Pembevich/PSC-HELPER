@@ -19,6 +19,7 @@ from aiohttp.abc import AbstractResolver, ResolveResult
 
 from ai_client import pos_chat_completion
 from config import BRAVE_SEARCH_API_KEY, GOOGLE_SAFEBROWSING_KEY
+from safe_browsing import lookup_url as safe_browsing_lookup_url
 
 
 logger = logging.getLogger(__name__)
@@ -81,10 +82,16 @@ class _VisibleTextParser(HTMLParser):
     _BLOCKED_TAGS = frozenset(
         {"script", "style", "noscript", "svg", "template", "canvas", "iframe"}
     )
+    _VOID_TAGS = frozenset(
+        {
+            "area", "base", "br", "col", "embed", "hr", "img", "input",
+            "link", "meta", "param", "source", "track", "wbr",
+        }
+    )
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self._blocked_depth = 0
+        self._blocked_stack: list[str] = []
         self._in_title = False
         self.title_parts: list[str] = []
         self.text_parts: list[str] = []
@@ -96,27 +103,45 @@ class _VisibleTextParser(HTMLParser):
         attrs: list[tuple[str, str | None]],
     ) -> None:
         lowered = tag.lower()
-        if lowered in self._BLOCKED_TAGS:
-            self._blocked_depth += 1
+        values = {str(key).lower(): str(value or "") for key, value in attrs}
+        style = values.get("style", "").replace(" ", "").lower()
+        hidden = (
+            lowered in self._BLOCKED_TAGS
+            or "hidden" in values
+            or values.get("aria-hidden", "").lower() == "true"
+            or "inert" in values
+            or "display:none" in style
+            or "visibility:hidden" in style
+        )
+        if self._blocked_stack:
+            if lowered not in self._VOID_TAGS:
+                self._blocked_stack.append(lowered)
+            return
+        if hidden:
+            if lowered not in self._VOID_TAGS:
+                self._blocked_stack.append(lowered)
             return
         if lowered == "title":
             self._in_title = True
         if lowered == "meta" and not self.description:
-            values = {str(key).lower(): str(value or "") for key, value in attrs}
             marker = (values.get("name") or values.get("property") or "").lower()
             if marker in {"description", "og:description"}:
                 self.description = values.get("content", "")[:1000]
 
     def handle_endtag(self, tag: str) -> None:
         lowered = tag.lower()
-        if lowered in self._BLOCKED_TAGS and self._blocked_depth:
-            self._blocked_depth -= 1
+        if self._blocked_stack:
+            if lowered in self._blocked_stack:
+                while self._blocked_stack:
+                    opened = self._blocked_stack.pop()
+                    if opened == lowered:
+                        break
             return
         if lowered == "title":
             self._in_title = False
 
     def handle_data(self, data: str) -> None:
-        if self._blocked_depth:
+        if self._blocked_stack:
             return
         clean = re.sub(r"\s+", " ", data or "").strip()
         if not clean:
@@ -248,39 +273,12 @@ async def _safe_browsing_blocks(
 ) -> bool:
     if not GOOGLE_SAFEBROWSING_KEY:
         return False
-    endpoint = (
-        "https://safebrowsing.googleapis.com/v4/"
-        f"threatMatches:find?key={quote(GOOGLE_SAFEBROWSING_KEY, safe='')}"
+    verdict = await safe_browsing_lookup_url(
+        session,
+        url,
+        api_key=GOOGLE_SAFEBROWSING_KEY,
     )
-    payload = {
-        "client": {"clientId": "p-os", "clientVersion": "0.8"},
-        "threatInfo": {
-            "threatTypes": [
-                "MALWARE",
-                "SOCIAL_ENGINEERING",
-                "UNWANTED_SOFTWARE",
-                "POTENTIALLY_HARMFUL_APPLICATION",
-            ],
-            "platformTypes": ["ANY_PLATFORM"],
-            "threatEntryTypes": ["URL"],
-            "threatEntries": [{"url": url}],
-        },
-    }
-    try:
-        async with session.post(
-            endpoint,
-            json=payload,
-            allow_redirects=False,
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as response:
-            if response.status != 200:
-                return False
-            raw = await _read_response_bytes(response, 256_000)
-            data = json.loads(raw.decode("utf-8", errors="replace"))
-            return bool(data.get("matches")) if isinstance(data, dict) else False
-    except Exception:
-        logger.debug("Google Safe Browsing lookup failed.", exc_info=True)
-        return False
+    return verdict.checked and verdict.matched
 
 
 async def fetch_public_page(url: str) -> FetchedPage:
@@ -308,7 +306,11 @@ async def fetch_public_page(url: str) -> FetchedPage:
         trust_env=False,
     ) as session:
         if await _safe_browsing_blocks(session, current):
-            raise ValueError("адрес отмечен Google Safe Browsing как опасный")
+            raise ValueError(
+                "адрес отмечен Google Safe Browsing как потенциально опасный; "
+                "Advisory provided by Google: "
+                "https://developers.google.com/safe-browsing/v4/advisory"
+            )
         for redirect_number in range(MAX_REDIRECTS + 1):
             async with session.get(current, allow_redirects=False) as response:
                 if response.status in {301, 302, 303, 307, 308}:
@@ -319,7 +321,11 @@ async def fetch_public_page(url: str) -> FetchedPage:
                     if redirected is None:
                         raise ValueError("перенаправление ведёт на запрещённый адрес")
                     if await _safe_browsing_blocks(session, redirected):
-                        raise ValueError("перенаправление ведёт на опасный адрес")
+                        raise ValueError(
+                            "перенаправление ведёт на потенциально опасный адрес; "
+                            "Advisory provided by Google: "
+                            "https://developers.google.com/safe-browsing/v4/advisory"
+                        )
                     current = redirected
                     continue
                 if response.status < 200 or response.status >= 300:

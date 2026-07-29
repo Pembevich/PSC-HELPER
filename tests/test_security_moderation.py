@@ -246,6 +246,58 @@ class AiModerationSafetyTests(unittest.IsolatedAsyncioTestCase):
             findings = await moderation._detect_dangerous_attachment_content(attachments)
         self.assertTrue(any("PE/Windows" in finding for finding in findings))
 
+    async def test_audio_is_included_in_ai_media_review(self):
+        attachment = SimpleNamespace(
+            filename="voice.mp3",
+            content_type="audio/mpeg",
+            size=128,
+        )
+        media_context = SimpleNamespace(
+            visual_inputs=[],
+            as_untrusted_text=lambda: (
+                "[UNTRUSTED_MEDIA_ANALYSIS]\n"
+                '{"analysis":"реклама казино"}\n'
+                "[/UNTRUSTED_MEDIA_ANALYSIS]"
+            ),
+        )
+        completion = AsyncMock(
+            return_value={
+                "content": (
+                    '{"results":[{"item":"media-1","label":"block",'
+                    '"basis":"visual","reason":"casino ad","confidence":0.99}]}'
+                )
+            }
+        )
+
+        with patch.object(
+            moderation,
+            "ai_has_configured_provider",
+            return_value=True,
+        ), patch.object(
+            moderation,
+            "ai_is_temporarily_unavailable",
+            return_value=False,
+        ), patch.object(
+            moderation,
+            "extract_media_context",
+            new=AsyncMock(return_value=media_context),
+        ), patch.object(
+            moderation,
+            "pos_chat_completion",
+            new=completion,
+        ):
+            verdicts = await moderation._classify_media_with_ai([attachment])
+
+        self.assertEqual(verdicts[id(attachment)][0], "block")
+        prompt = completion.await_args.args[0][1]["content"]
+        self.assertTrue(
+            any(
+                isinstance(item, dict)
+                and "UNTRUSTED_MEDIA_ANALYSIS" in str(item.get("text", ""))
+                for item in prompt
+            )
+        )
+
     async def test_vt_safe_cache_does_not_suppress_google_check(self):
         url = "https://example.com/hello"
         moderation._vt_cache[url] = (False, time.time())

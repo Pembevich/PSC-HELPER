@@ -1,17 +1,58 @@
+import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import ai_client
 from ai_client import (
     _bounded_float,
     _bounded_int,
+    _extract_interaction_text,
     _extract_gemini_text,
     _gemini_generate_content_url,
+    _gemini_interactions_url,
     _is_safe_provider_url,
     _parse_retry_after,
     ai_has_configured_media_provider,
     extract_json_block,
 )
+
+
+class _ResponseContent:
+    def __init__(self, payload: dict):
+        self._raw = json.dumps(payload).encode("utf-8")
+
+    async def read(self, _limit: int) -> bytes:
+        return self._raw
+
+
+class _MediaResponse:
+    def __init__(self, payload: dict):
+        self.status = 200
+        self.headers = {}
+        self.charset = "utf-8"
+        self.content = _ResponseContent(payload)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _MediaSession:
+    def __init__(self, payload: dict):
+        self.payload = payload
+        self.posts = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    def post(self, url, **kwargs):
+        self.posts.append((url, kwargs))
+        return _MediaResponse(self.payload)
 
 
 class ExtractJsonBlockTests(unittest.TestCase):
@@ -72,6 +113,13 @@ class AIClientBoundaryTests(unittest.TestCase):
         )
         self.assertNotIn("secret", endpoint)
 
+        interactions_endpoint = _gemini_interactions_url(provider)
+        self.assertEqual(
+            interactions_endpoint,
+            "https://generativelanguage.googleapis.com/v1beta/interactions",
+        )
+        self.assertNotIn("secret", interactions_endpoint)
+
     def test_native_gemini_text_parser_joins_text_parts(self):
         payload = {
             "candidates": [
@@ -91,6 +139,23 @@ class AIClientBoundaryTests(unittest.TestCase):
             "Первая часть.\nВторая часть.",
         )
 
+    def test_interactions_text_parser_reads_model_output_steps(self):
+        payload = {
+            "status": "completed",
+            "steps": [
+                {
+                    "type": "model_output",
+                    "content": [
+                        {"type": "text", "text": "Точная расшифровка."},
+                    ],
+                }
+            ],
+        }
+        self.assertEqual(
+            _extract_interaction_text(payload),
+            "Точная расшифровка.",
+        )
+
     def test_native_media_capability_requires_authenticated_gemini(self):
         providers = [
             {"provider": "generic", "api_key": "key"},
@@ -102,6 +167,66 @@ class AIClientBoundaryTests(unittest.TestCase):
         providers.append({"provider": "gemini", "api_key": "configured"})
         with patch.object(ai_client, "_AI_PROVIDER_POOL", providers):
             self.assertTrue(ai_has_configured_media_provider())
+
+
+class GeminiMediaRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_video_uses_interactions_payload_and_header_key(self):
+        provider = {
+            "name": "gemini-test",
+            "provider": "gemini",
+            "api_url": (
+                "https://generativelanguage.googleapis.com/"
+                "v1beta/openai/chat/completions"
+            ),
+            "model": "google/gemini-3.5-flash",
+            "api_key": "secret-key",
+        }
+        session = _MediaSession(
+            {
+                "status": "completed",
+                "steps": [
+                    {
+                        "type": "model_output",
+                        "content": [
+                            {"type": "text", "text": "Видео проверено."},
+                        ],
+                    }
+                ],
+            }
+        )
+
+        with (
+            patch.object(ai_client, "_AI_PROVIDER_POOL", [provider]),
+            patch.object(
+                ai_client,
+                "_reserve_exact_provider_index",
+                new=AsyncMock(return_value=0),
+            ),
+            patch.object(
+                ai_client.aiohttp,
+                "ClientSession",
+                return_value=session,
+            ),
+            patch.object(ai_client.aiohttp, "TCPConnector"),
+        ):
+            result = await ai_client.pos_gemini_media_analysis(
+                b"\x00\x00\x00\x18ftypmp42",
+                "video/mp4",
+                prompt="Опиши видео.",
+            )
+
+        self.assertEqual(result, "Видео проверено.")
+        self.assertEqual(len(session.posts), 1)
+        endpoint, kwargs = session.posts[0]
+        self.assertEqual(
+            endpoint,
+            "https://generativelanguage.googleapis.com/v1beta/interactions",
+        )
+        self.assertNotIn("secret-key", endpoint)
+        self.assertEqual(kwargs["headers"]["x-goog-api-key"], "secret-key")
+        self.assertEqual(kwargs["json"]["model"], "gemini-3.5-flash")
+        self.assertEqual(kwargs["json"]["input"][0]["type"], "video")
+        self.assertEqual(kwargs["json"]["input"][0]["mime_type"], "video/mp4")
 
 
 if __name__ == "__main__":
