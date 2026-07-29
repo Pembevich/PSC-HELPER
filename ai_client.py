@@ -48,6 +48,7 @@ _ai_backoff_reason = ""
 _ai_last_backoff_log_at = 0.0
 _provider_cursor = 0
 _provider_backoff_until: dict[int, float] = {}
+_missing_media_provider_logged = False
 _MAX_UPSTREAM_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_INLINE_MEDIA_BYTES = 14 * 1024 * 1024
 _SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -160,6 +161,14 @@ _AI_PROVIDER_POOL = _build_provider_pool()
 def ai_has_configured_provider() -> bool:
     """True, если есть хотя бы один реально настроенный AI-провайдер."""
     return bool(_AI_PROVIDER_POOL and any(provider.get("api_key") for provider in _AI_PROVIDER_POOL))
+
+
+def ai_has_configured_media_provider() -> bool:
+    """True when native audio/video analysis has an authenticated Gemini route."""
+    return any(
+        provider.get("provider") == "gemini" and bool(provider.get("api_key"))
+        for provider in _AI_PROVIDER_POOL
+    )
 
 
 def ai_cooldown_remaining() -> float:
@@ -475,12 +484,18 @@ async def pos_gemini_media_analysis(
     encoded_text = encoded.decode("ascii")
     request_timeout = _bounded_int(timeout, 90, 10, 180)
     request_max_tokens = _bounded_int(max_tokens, 1800, 64, 8192)
+    global _missing_media_provider_logged
     gemini_count = sum(
         1
         for provider in _AI_PROVIDER_POOL
         if provider.get("provider") == "gemini" and provider.get("api_key")
     )
     if gemini_count == 0:
+        if not _missing_media_provider_logged:
+            logger.warning(
+                "Native audio/video analysis is unavailable: no authenticated Gemini provider."
+            )
+            _missing_media_provider_logged = True
         return None
 
     attempted: set[int] = set()

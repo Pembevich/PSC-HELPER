@@ -1,5 +1,7 @@
 import unittest
+from unittest.mock import patch
 
+import ai_client
 from ai_client import (
     _bounded_float,
     _bounded_int,
@@ -7,6 +9,7 @@ from ai_client import (
     _gemini_generate_content_url,
     _is_safe_provider_url,
     _parse_retry_after,
+    ai_has_configured_media_provider,
     extract_json_block,
 )
 
@@ -87,6 +90,18 @@ class AIClientBoundaryTests(unittest.TestCase):
             _extract_gemini_text(payload),
             "Первая часть.\nВторая часть.",
         )
+
+    def test_native_media_capability_requires_authenticated_gemini(self):
+        providers = [
+            {"provider": "generic", "api_key": "key"},
+            {"provider": "gemini", "api_key": ""},
+        ]
+        with patch.object(ai_client, "_AI_PROVIDER_POOL", providers):
+            self.assertFalse(ai_has_configured_media_provider())
+
+        providers.append({"provider": "gemini", "api_key": "configured"})
+        with patch.object(ai_client, "_AI_PROVIDER_POOL", providers):
+            self.assertTrue(ai_has_configured_media_provider())
 
 
 if __name__ == "__main__":

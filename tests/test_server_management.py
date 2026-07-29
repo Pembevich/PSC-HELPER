@@ -31,7 +31,7 @@ class ToolSchemaTests(unittest.TestCase):
             "archive_thread", "voice_action", "security_scan", "set_security_preset",
             "list_members", "user_info", "read_messages", "search_logs", "search_pings",
             "bulk_user_action", "list_channels", "list_roles", "read_audit_log",
-            "research_web", "read_web_page",
+            "research_web", "read_web_page", "runtime_status",
         ]:
             self.assertIn(expected, names, f"tool {expected} отсутствует в схеме")
 
@@ -42,7 +42,7 @@ class ToolSchemaTests(unittest.TestCase):
                      "edit_server", "lock_channel", "unlock_channel", "create_thread",
                      "archive_thread", "voice_action", "security_scan", "set_security_preset",
                      "list_members", "user_info", "read_messages", "search_logs", "search_pings",
-                     "bulk_user_action", "research_web", "read_web_page"]:
+                     "bulk_user_action", "research_web", "read_web_page", "runtime_status"]:
             self.assertIn(name, _OWNER_ONLY_TOOLS)
 
     def test_every_ai_tool_is_owner_only_in_current_beta(self):
@@ -105,6 +105,7 @@ class ToolSchemaTests(unittest.TestCase):
             "read_audit_log",
             "research_web",
             "read_web_page",
+            "runtime_status",
         ]:
             self.assertIn(name, _OWNER_INFO_TOOLS)
 
@@ -124,6 +125,20 @@ class ToolSchemaTests(unittest.TestCase):
     def test_only_process_shutdown_keeps_owner_confirmation(self):
         self.assertEqual(_OWNER_ONLY_TOOLS - _READ_ONLY_TOOLS, _MUTATING_TOOLS)
         self.assertEqual(_OWNER_CONFIRMATION_TOOLS, frozenset({"shutdown_bot"}))
+
+    def test_runtime_status_intent_is_narrow_and_read_only(self):
+        self.assertEqual(
+            pos_ai._allowed_tool_names_for_text("P.OS, какая версия сейчас запущена?"),
+            frozenset({"runtime_status"}),
+        )
+        self.assertEqual(
+            pos_ai._allowed_tool_names_for_text("Покажи active commit P.OS"),
+            frozenset({"runtime_status"}),
+        )
+        self.assertEqual(
+            pos_ai._allowed_tool_names_for_text("Расскажи про разные версии Discord"),
+            frozenset(),
+        )
 
 
 class ChannelResolverTests(unittest.TestCase):
@@ -513,6 +528,51 @@ class ToolExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Фактические серверы", result)
         self.assertNotIn("bot.guilds", result)
+
+    async def test_runtime_status_reports_only_verified_deploy_facts(self):
+        bot = SimpleNamespace(guilds=[object(), object()])
+        message = SimpleNamespace(guild=None)
+        environment = {
+            "RAILWAY_GIT_COMMIT_SHA": "bcdf04f1234567890abcdef",
+            "SECRET_API_KEY": "must-not-leak",
+        }
+
+        with patch.dict(pos_ai.os.environ, environment, clear=True), \
+             patch.object(pos_ai, "ai_has_configured_provider", return_value=True), \
+             patch.object(pos_ai, "ai_has_configured_media_provider", return_value=True), \
+             patch.object(pos_ai, "BRAVE_SEARCH_API_KEY", "configured"):
+            result = await pos_ai._perform_tool_action(
+                bot,
+                message,
+                "runtime_status",
+                {},
+                None,
+            )
+
+        self.assertIn("bcdf04f12345", result)
+        self.assertIn("подключено серверов: 2", result)
+        self.assertIn("нативный анализ аудио/видео: настроен", result)
+        self.assertNotIn("must-not-leak", result)
+
+    async def test_runtime_status_does_not_invent_missing_commit(self):
+        bot = SimpleNamespace(guilds=[])
+        message = SimpleNamespace(guild=None)
+
+        with patch.dict(pos_ai.os.environ, {}, clear=True), \
+             patch.object(pos_ai, "ai_has_configured_provider", return_value=False), \
+             patch.object(pos_ai, "ai_has_configured_media_provider", return_value=False), \
+             patch.object(pos_ai, "BRAVE_SEARCH_API_KEY", None):
+            result = await pos_ai._perform_tool_action(
+                bot,
+                message,
+                "runtime_status",
+                {},
+                None,
+            )
+
+        self.assertIn("SHA подтвердить нельзя", result)
+        self.assertIn("основной AI: не настроен", result)
+        self.assertIn("Wikipedia-поиск", result)
 
 
 class ShutdownPreparationTests(unittest.IsolatedAsyncioTestCase):

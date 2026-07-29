@@ -7,6 +7,7 @@ import difflib
 import hashlib
 import json
 import logging
+import os
 import random as _random
 import re
 import asyncio
@@ -20,6 +21,7 @@ from discord.utils import escape_markdown, escape_mentions
 
 from ai_client import (
     ai_cooldown_remaining,
+    ai_has_configured_media_provider,
     ai_has_configured_provider,
     ai_is_temporarily_unavailable,
     ai_unavailable_reason,
@@ -27,6 +29,7 @@ from ai_client import (
 )
 from config import (
     BOT_COMMAND_PREFIX,
+    BRAVE_SEARCH_API_KEY,
     POS_AI_MAX_TOKENS,
     POS_AI_MODEL,
     POS_AI_PROVIDER,
@@ -37,6 +40,7 @@ from config import (
     POS_CREATOR_ID,
     POS_IDENTITY_PROMPT,
     POS_OWNER_USER_IDS,
+    POS_VERSION,
 )
 from commands import (
     format_gif_error_for_user,
@@ -106,7 +110,7 @@ _OWNER_ONLY_TOOLS = frozenset({
     "ping_user", "dm_user", "lift_restrictions", "deactivate_raid_mode",
     "leave_server", "shutdown_bot",
     "mute_ai_for_user", "unmute_ai_for_user",
-    "research_web", "read_web_page",
+    "research_web", "read_web_page", "runtime_status",
 })
 
 # Tools that only read verified Discord/SQLite state and cannot mutate it.
@@ -114,7 +118,7 @@ _READ_ONLY_TOOLS = frozenset({
     "list_servers", "get_settings", "list_members", "user_info", "read_messages",
     "search_logs", "search_pings", "security_scan", "list_channels", "list_roles",
     "read_audit_log",
-    "research_web", "read_web_page",
+    "research_web", "read_web_page", "runtime_status",
 })
 
 # Owner-only information tools: non-owners are denied without disclosing data.
@@ -322,6 +326,15 @@ _TOOL_INTENT_RULES: tuple[tuple[frozenset[str], re.Pattern[str]], ...] = (
             r"\b(?:найд\w*|поищ\w*|узна\w*|проверь|исслед\w*)\b.{0,70}"
             r"\b(?:в\s+интернет\w*|в\s+сети|онлайн|веб\w*|web\b)|"
             r"\b(?:internet|web)\s+(?:search|research)\b|\bsearch\s+(?:the\s+)?web\b"
+        ),
+    ),
+    (
+        frozenset({"runtime_status"}),
+        _intent_pattern(
+            r"\b(?:какая|какой|покаж\w*|проверь|дай|назов\w*).{0,45}"
+            r"(?:верси\w*|сборк\w*|коммит\w*|commit\b|sha\b|runtime[-\s]?статус\w*)"
+            r"(?:.{0,30}(?:pos|p[.\s_-]*o[.\s_-]*s|пос|бот\w*))?|"
+            r"\b(?:runtime\s+status|active\s+(?:build|commit|version))\b"
         ),
     ),
 )
@@ -661,6 +674,7 @@ _TOOL_ACTION_LABELS = {
     "mute_ai_for_user": "блокировку ответов", "unmute_ai_for_user": "снятие блокировки",
     "research_web": "исследование в интернете",
     "read_web_page": "чтение веб-страницы",
+    "runtime_status": "проверку активной сборки P.OS",
 }
 
 _TOOL_ARGUMENT_LABELS = {
@@ -1625,6 +1639,34 @@ async def _perform_tool_action(
     # Инструменты, которым НЕ нужен сервер-контекст, обрабатываются раньше.
     if name == "shutdown_bot":
         return await _perform_shutdown(bot, args)
+    if name == "runtime_status":
+        raw_sha = os.getenv("RAILWAY_GIT_COMMIT_SHA", "").strip()
+        verified_sha = raw_sha[:12] if re.fullmatch(r"[0-9a-fA-F]{7,64}", raw_sha) else ""
+        ai_status = "настроен" if ai_has_configured_provider() else "не настроен"
+        media_status = (
+            "настроен"
+            if ai_has_configured_media_provider()
+            else "не настроен (нет Gemini-маршрута)"
+        )
+        web_status = (
+            "полный поиск и безопасное чтение страниц"
+            if BRAVE_SEARCH_API_KEY
+            else "Wikipedia-поиск и безопасное чтение страниц"
+        )
+        commit_status = (
+            f"`{verified_sha}`"
+            if verified_sha
+            else "не передан средой запуска; SHA подтвердить нельзя"
+        )
+        return (
+            "Фактический runtime-статус P.OS:\n"
+            f"- версия кода: `{POS_VERSION}`\n"
+            f"- Railway commit: {commit_status}\n"
+            f"- основной AI: {ai_status}\n"
+            f"- нативный анализ аудио/видео: {media_status}\n"
+            f"- веб-исследование: {web_status}\n"
+            f"- подключено серверов: {len(getattr(bot, 'guilds', ()))}"
+        )
     if name == "research_web":
         query = str(args.get("query", "")).strip()
         try:
