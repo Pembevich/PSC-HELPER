@@ -99,7 +99,7 @@ Gemini-first example with a GitHub Models fallback:
 ```env
 POS_AI_PROVIDER_KEYS=gemini_key,github_models_token
 POS_AI_PROVIDER_URLS=https://generativelanguage.googleapis.com/v1beta/openai/chat/completions,https://models.github.ai/inference/chat/completions
-POS_AI_PROVIDER_MODELS=gemini-3.5-flash,openai/gpt-4.1
+POS_AI_PROVIDER_MODELS=gemini-3.6-flash,openai/gpt-4.1
 ```
 
 An entry whose endpoint is on `googleapis.com` is treated as Gemini. P.OS uses
