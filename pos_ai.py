@@ -554,6 +554,68 @@ def resolve_channel_smart(guild: discord.Guild, ident: str) -> discord.abc.Guild
     return None
 
 
+def _resolve_category_smart(
+    guild: discord.Guild,
+    ident: str,
+    *,
+    current_message_text: str = "",
+) -> discord.CategoryChannel | None:
+    """Resolve a category without confusing a shortened model value with channels.
+
+    If the model shortens a category to a generic word such as "каналы", recover
+    only when the owner's current message contains exactly one full category name.
+    Historical context is deliberately not considered.
+    """
+    raw_ident = str(ident or "").strip()
+    if raw_ident:
+        digits = re.sub(r"[^0-9]", "", raw_ident)
+        if digits and (
+            raw_ident.replace("<#", "").replace(">", "").strip().isdigit()
+        ):
+            category = guild.get_channel(int(digits))
+            if isinstance(category, discord.CategoryChannel):
+                return category
+
+    categories = list(getattr(guild, "categories", []) or [])
+    lowered = raw_ident.casefold()
+    for category in categories:
+        if category.name.casefold() == lowered:
+            return category
+
+    normalized = _normalize_role_name(raw_ident)
+    if normalized:
+        exact_normalized = [
+            category
+            for category in categories
+            if _normalize_role_name(category.name) == normalized
+        ]
+        if len(exact_normalized) == 1:
+            return exact_normalized[0]
+        substring_hits = [
+            category
+            for category in categories
+            if normalized in _normalize_role_name(category.name)
+            or _normalize_role_name(category.name) in normalized
+        ]
+        if len(substring_hits) == 1:
+            return substring_hits[0]
+
+    current_lowered = str(current_message_text or "").casefold()
+    current_normalized = _normalize_role_name(current_message_text)
+    explicit_hits = [
+        category
+        for category in categories
+        if (
+            category.name.casefold() in current_lowered
+            or (
+                len(_normalize_role_name(category.name)) >= 4
+                and _normalize_role_name(category.name) in current_normalized
+            )
+        )
+    ]
+    return explicit_hits[0] if len(explicit_hits) == 1 else None
+
+
 def _parse_bool(value, default: bool = False) -> bool:
     return str(value).strip().lower() in {"true", "1", "да", "yes", "on", "вкл"} if value not in (None, "") else default
 
@@ -602,6 +664,8 @@ _TOOL_ARGUMENT_LABELS = {
     "name": "имя",
     "new_name": "новое имя",
     "channel_id_or_name": "канал",
+    "category_id_or_name": "категория",
+    "topic": "тема",
     "target_role_or_user": "цель",
     "user_identifier": "пользователь",
     "user_identifiers": "пользователи",
@@ -1107,8 +1171,12 @@ async def _prepare_mutating_tool_action(
         resolved_labels.append(f"голосовой канал: {channel.name} (`{channel.id}`)")
 
     if name == "create_channel" and args.get("category_id_or_name"):
-        category = resolve_channel_smart(guild, str(args["category_id_or_name"]))
-        if not isinstance(category, discord.CategoryChannel):
+        category = _resolve_category_smart(
+            guild,
+            str(args["category_id_or_name"]),
+            current_message_text=message.content or "",
+        )
+        if category is None:
             return args, user_id, guild, resolved_labels, "категория не найдена однозначно"
         args["category_id_or_name"] = str(category.id)
         resolved_labels.append(f"категория: {category.name} (`{category.id}`)")
@@ -2721,6 +2789,7 @@ def _summarize_tool_call(name: str, args: dict, user_id: int | None) -> str:
         details.append(f"пользователь `{user_id}`")
     for key in (
         "server_id_or_name", "role_id_or_name", "name", "new_name", "channel_id_or_name",
+        "category_id_or_name", "topic",
         "target_role_or_user", "user_identifier", "user_identifiers", "username", "login",
         "nickname", "reason", "minutes", "count", "limit", "query", "event_type", "text",
         "settings_json", "mode", "action", "preset", "scope", "message_id", "include_roles",

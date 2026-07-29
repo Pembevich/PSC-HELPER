@@ -15,7 +15,7 @@ with patch("storage.add_entry"), \
         _OWNER_ONLY_TOOLS, _OWNER_INFO_TOOLS, _READ_ONLY_TOOLS,
         _TOOL_ACTION_LABELS,
         _perform_shutdown, _prepare_mutating_tool_action, _resolve_member_smart,
-        _resolve_guild, _split_user_identifiers,
+        _resolve_category_smart, _resolve_guild, _split_user_identifiers,
     )
 
 from cogs.ai_tools import POS_AI_TOOLS
@@ -124,6 +124,49 @@ class ToolSchemaTests(unittest.TestCase):
     def test_only_process_shutdown_keeps_owner_confirmation(self):
         self.assertEqual(_OWNER_ONLY_TOOLS - _READ_ONLY_TOOLS, _MUTATING_TOOLS)
         self.assertEqual(_OWNER_CONFIRMATION_TOOLS, frozenset({"shutdown_bot"}))
+
+
+class ChannelResolverTests(unittest.TestCase):
+    def setUp(self):
+        self.text_category = MagicMock(spec=discord.CategoryChannel)
+        self.text_category.id = 101
+        self.text_category.name = "Текстовые каналы"
+        self.voice_category = MagicMock(spec=discord.CategoryChannel)
+        self.voice_category.id = 102
+        self.voice_category.name = "Голосовые каналы"
+        self.guild = MagicMock(spec=discord.Guild)
+        self.guild.categories = [self.text_category, self.voice_category]
+        self.guild.get_channel.side_effect = lambda channel_id: {
+            101: self.text_category,
+            102: self.voice_category,
+        }.get(channel_id)
+
+    def test_resolves_exact_category_name_and_id(self):
+        self.assertIs(
+            _resolve_category_smart(self.guild, "Текстовые каналы"),
+            self.text_category,
+        )
+        self.assertIs(_resolve_category_smart(self.guild, "101"), self.text_category)
+
+    def test_recovers_short_model_value_from_current_message(self):
+        resolved = _resolve_category_smart(
+            self.guild,
+            "каналы",
+            current_message_text=(
+                "Создай канал в категории «Текстовые каналы» с временной темой."
+            ),
+        )
+        self.assertIs(resolved, self.text_category)
+
+    def test_does_not_guess_when_current_message_mentions_two_categories(self):
+        resolved = _resolve_category_smart(
+            self.guild,
+            "каналы",
+            current_message_text=(
+                "Сравни категории Текстовые каналы и Голосовые каналы."
+            ),
+        )
+        self.assertIsNone(resolved)
 
 
 class UserResolverTests(unittest.IsolatedAsyncioTestCase):

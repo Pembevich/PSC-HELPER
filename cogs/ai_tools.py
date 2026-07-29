@@ -203,7 +203,7 @@ POS_AI_TOOLS = [
                 "properties": {
                     "name": {"type": "string", "description": "Название нового канала."},
                     "type": {"type": "string", "description": "Тип канала: 'text', 'voice' или 'category'. По умолчанию 'text'."},
-                    "category_id_or_name": {"type": "string", "description": "Необязательно. Категория, в которую поместить канал (ID или имя)."},
+                    "category_id_or_name": {"type": "string", "description": "Необязательно. Точный ID или полное имя категории из запроса пользователя; не сокращай имя до общего слова вроде 'каналы'."},
                     "topic": {"type": "string", "description": "Необязательно. Описание (topic) для текстового канала."}
                 },
                 "required": ["name"]
