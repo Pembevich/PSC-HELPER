@@ -213,6 +213,35 @@ def _provider_cooldown_remaining(index: int) -> float:
 PRIMARY_PROVIDER = "gemini"
 
 
+def ai_provider_runtime_summary() -> str:
+    """Return the effective provider order without credentials or endpoints."""
+    configured = [
+        provider
+        for provider in _AI_PROVIDER_POOL
+        if provider.get("api_key") and provider.get("model")
+    ]
+    configured.sort(
+        key=lambda provider: provider.get("provider") != PRIMARY_PROVIDER
+    )
+    if not configured:
+        return "not configured"
+
+    routes: list[str] = []
+    for provider in configured:
+        provider_kind = re.sub(
+            r"[^a-z0-9_.-]",
+            "_",
+            str(provider.get("provider") or "unknown").casefold(),
+        )[:40]
+        model = re.sub(
+            r"[\x00-\x1f\x7f]+",
+            " ",
+            str(provider.get("model") or "unknown"),
+        ).strip()[:120]
+        routes.append(f"{provider_kind}:{model}")
+    return ", ".join(routes)
+
+
 def _pick_provider_index(provider_type: str | None = None) -> int | None:
     if not _AI_PROVIDER_POOL:
         return None

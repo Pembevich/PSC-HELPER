@@ -33,7 +33,8 @@ from discord.ext import commands  # noqa: E402
 # before importing config/storage.
 load_dotenv()
 
-from config import BOT_COMMAND_PREFIX, POS_AI_MODEL, POS_AI_PROVIDER  # noqa: E402
+from ai_client import ai_provider_runtime_summary  # noqa: E402
+from config import BOT_COMMAND_PREFIX  # noqa: E402
 from storage import close_all_connections, init_db  # noqa: E402
 from utils import sanitize_discord_token  # noqa: E402
 
@@ -143,9 +144,8 @@ async def run_bot() -> None:
                 raise RuntimeError(f"Required cog failed to load: {cog}") from exc
 
         logger.info(
-            "Запуск P.OS: AI provider=%s, model=%s",
-            POS_AI_PROVIDER,
-            POS_AI_MODEL,
+            "Запуск P.OS: AI routes=%s",
+            ai_provider_runtime_summary(),
         )
         # Login authenticates the HTTP client without opening the gateway. This
         # lets us restore persistent state before Discord starts dispatching

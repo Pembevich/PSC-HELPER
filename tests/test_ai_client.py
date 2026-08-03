@@ -14,6 +14,7 @@ from ai_client import (
     _messages_have_visual_inputs,
     _parse_retry_after,
     ai_has_configured_media_provider,
+    ai_provider_runtime_summary,
     extract_json_block,
 )
 
@@ -77,6 +78,33 @@ class ExtractJsonBlockTests(unittest.TestCase):
 
 
 class AIClientBoundaryTests(unittest.TestCase):
+    def test_runtime_provider_summary_is_effective_and_secret_free(self):
+        providers = [
+            {
+                "provider": "generic_openai_compatible",
+                "model": "text-model",
+                "api_key": "must-not-leak-text",
+                "api_url": "https://text.example/v1/chat",
+            },
+            {
+                "provider": "gemini",
+                "model": "gemini-model\nforged-log",
+                "api_key": "must-not-leak-gemini",
+                "api_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            },
+        ]
+
+        with patch.object(ai_client, "_AI_PROVIDER_POOL", providers):
+            summary = ai_provider_runtime_summary()
+
+        self.assertEqual(
+            summary,
+            "gemini:gemini-model forged-log, "
+            "generic_openai_compatible:text-model",
+        )
+        self.assertNotIn("must-not-leak", summary)
+        self.assertNotIn("https://", summary)
+
     def test_visual_input_detection_requires_an_image_part(self):
         self.assertFalse(
             _messages_have_visual_inputs(
