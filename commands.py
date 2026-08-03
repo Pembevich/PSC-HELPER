@@ -8,7 +8,7 @@ import asyncio
 import re
 import subprocess
 import time
-from math import sqrt
+from math import isfinite, sqrt
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,10 +21,9 @@ from PIL import Image, ImageOps
 Image.MAX_IMAGE_PIXELS = 24_000_000
 
 GIF_MAX_DIMENSION = 960
-GIF_MAX_VIDEO_SECONDS = 8
 GIF_MIN_VIDEO_FPS = 8
-GIF_MAX_VIDEO_FPS = 24
-GIF_DEFAULT_VIDEO_FPS = 20
+GIF_MAX_VIDEO_FPS = 30
+GIF_DEFAULT_VIDEO_FPS = 24
 GIF_IMAGE_FRAME_MS = 700
 GIF_MAX_ATTACHMENT_BYTES = 60 * 1024 * 1024
 GIF_MAX_TOTAL_BYTES = 80 * 1024 * 1024
@@ -35,7 +34,7 @@ GIF_MAX_ATTACHMENTS = 12
 GIF_MAX_SOURCE_FRAMES = 120
 GIF_MAX_PIXELS = 24_000_000
 GIF_MAX_RENDERED_FRAME_PIXELS = 18_000_000
-GIF_MAX_ENCODE_SECONDS = 90
+GIF_MAX_ENCODE_SECONDS = 180
 GIF_ATTACHMENT_DOWNLOAD_SECONDS = 45
 GIF_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "bmp", "gif"}
 GIF_VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "avi", "mkv"}
@@ -93,7 +92,7 @@ def parse_gif_options_from_text(text: str) -> dict[str, Any]:
         seconds_text = sec_match.group(1) or sec_match.group(2)
         try:
             val_f = float(seconds_text)
-            if 0.1 <= val_f <= 15.0:
+            if isfinite(val_f) and val_f >= 0.1:
                 options['max_video_seconds'] = val_f
                 options['duration'] = int(val_f * 1000)
         except ValueError:
@@ -200,7 +199,7 @@ def format_gif_error_for_user(error: Exception) -> str:
         "не удалось уложить GIF в лимит",
     )
     public_runtime_messages = {
-        "Не нашёл подходящих вложений для GIF (нужны изображения или короткое видео).",
+        "Не нашёл подходящих вложений для GIF (нужны изображения или видео).",
         "GIF не был создан.",
         "FFmpeg не успел обработать видео в безопасный срок.",
         "FFmpeg не смог безопасно обработать видео.",
@@ -502,7 +501,7 @@ def _run_ffmpeg_gif_encode(
     output_path: str,
     *,
     fps: int,
-    max_duration: float,
+    max_duration: float | None,
     max_dim: int,
     timeout: float,
 ) -> None:
@@ -515,12 +514,12 @@ def _run_ffmpeg_gif_encode(
         "-loglevel",
         "error",
         "-y",
-        "-ss",
-        "0",
-        "-t",
-        str(max_duration),
         "-i",
         video_path,
+    ]
+    if max_duration is not None:
+        cmd.extend(["-t", str(max_duration)])
+    cmd.extend([
         "-an",
         "-sn",
         "-dn",
@@ -529,7 +528,7 @@ def _run_ffmpeg_gif_encode(
         "-loop",
         "0",
         output_path,
-    ]
+    ])
     result = subprocess.run(
         cmd,
         stdout=subprocess.DEVNULL,
@@ -545,7 +544,7 @@ def _run_ffmpeg_gif_encode(
 
 def _video_quality_profiles(max_dim: int, fps: int) -> list[tuple[int, int]]:
     profiles: list[tuple[int, int]] = []
-    for dimension in _dimension_ladder(max_dim)[:7]:
+    for dimension in _dimension_ladder(max_dim):
         if dimension >= 720:
             candidate_fps = fps
         elif dimension >= 560:
@@ -571,11 +570,12 @@ def _build_gif_from_video(
     max_dim: int = GIF_MAX_DIMENSION,
     max_output_bytes: int = GIF_DEFAULT_OUTPUT_BYTES,
 ) -> None:
-    actual_duration = (
-        max(0.25, min(float(max_duration), 15.0))
-        if max_duration is not None
-        else GIF_MAX_VIDEO_SECONDS
-    )
+    actual_duration: float | None = None
+    if max_duration is not None:
+        parsed_duration = float(max_duration)
+        if not isfinite(parsed_duration) or parsed_duration <= 0:
+            raise ValueError("длительность видео должна быть положительным числом")
+        actual_duration = max(0.25, parsed_duration)
     actual_fps = max(
         GIF_MIN_VIDEO_FPS,
         min(int(fps or GIF_DEFAULT_VIDEO_FPS), GIF_MAX_VIDEO_FPS),
@@ -597,7 +597,7 @@ def _build_gif_from_video(
                 fps=profile_fps,
                 max_duration=actual_duration,
                 max_dim=profile_dimension,
-                timeout=min(30.0, remaining),
+                timeout=min(75.0, remaining),
             )
             encoded_any = True
             if os.path.getsize(candidate_path) <= max_output_bytes:
@@ -712,7 +712,7 @@ async def generate_gif_from_attachments(
                     max_output_bytes=output_limit,
                 )
             else:
-                raise RuntimeError("Не нашёл подходящих вложений для GIF (нужны изображения или короткое видео).")
+                raise RuntimeError("Не нашёл подходящих вложений для GIF (нужны изображения или видео).")
 
             if not os.path.exists(output_path) or os.path.getsize(output_path) <= 0:
                 raise RuntimeError("GIF не был создан.")

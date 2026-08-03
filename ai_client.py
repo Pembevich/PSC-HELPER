@@ -171,6 +171,22 @@ def ai_has_configured_media_provider() -> bool:
     )
 
 
+def _messages_have_visual_inputs(messages: list[dict[str, Any]]) -> bool:
+    """Detect OpenAI-compatible image parts that require a vision model."""
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in {"image_url", "input_image"}:
+                return True
+            if "image_url" in part:
+                return True
+    return False
+
+
 def ai_cooldown_remaining() -> float:
     remaining = _ai_backoff_until - time.monotonic()
     return remaining if remaining > 0 else 0.0
@@ -357,27 +373,142 @@ async def _read_bounded_response(response: aiohttp.ClientResponse) -> str:
         return raw.decode("utf-8", errors="replace")
 
 
-def _extract_message_from_payload(data: dict[str, Any]) -> dict[str, Any] | None:
-    choices = data.get("choices")
-    if choices and isinstance(choices, list):
-        choice0 = choices[0] or {}
-        msg = choice0.get("message")
-        if msg:
-            return msg
-        text = choice0.get("text")
-        if text:
-            return {"role": "assistant", "content": text}
+def _message_from_choices(container: Mapping[str, Any]) -> dict[str, Any] | None:
+    choices = container.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    choice0 = choices[0]
+    if not isinstance(choice0, Mapping):
+        return None
+    for key in ("message", "delta"):
+        message = choice0.get(key)
+        if isinstance(message, Mapping) and message:
+            return dict(message)
+    text = choice0.get("text")
+    if isinstance(text, str) and text.strip():
+        return {"role": "assistant", "content": text.strip()}
+    return None
 
-    result = data.get("result") or {}
-    choices = result.get("choices")
-    if choices and isinstance(choices, list):
-        choice0 = choices[0] or {}
-        msg = choice0.get("message")
-        if msg:
-            return msg
-        text = choice0.get("text")
-        if text:
-            return {"role": "assistant", "content": text}
+
+def _message_from_gemini_candidates(data: Mapping[str, Any]) -> dict[str, Any] | None:
+    candidates = data.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        return None
+    candidate = candidates[0]
+    if not isinstance(candidate, Mapping):
+        return None
+    content = candidate.get("content")
+    if not isinstance(content, Mapping):
+        return None
+    parts = content.get("parts")
+    if not isinstance(parts, list):
+        return None
+
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    for index, part in enumerate(parts, start=1):
+        if not isinstance(part, Mapping):
+            continue
+        text = part.get("text")
+        if isinstance(text, str) and text.strip():
+            text_parts.append(text.strip())
+        function_call = part.get("functionCall") or part.get("function_call")
+        if not isinstance(function_call, Mapping):
+            continue
+        name = str(function_call.get("name") or "").strip()
+        if not name:
+            continue
+        arguments = function_call.get("args", function_call.get("arguments", {}))
+        tool_calls.append(
+            {
+                "id": f"gemini-call-{index}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": (
+                        arguments
+                        if isinstance(arguments, str)
+                        else json.dumps(arguments, ensure_ascii=False)
+                    ),
+                },
+            }
+        )
+    if not text_parts and not tool_calls:
+        return None
+    message: dict[str, Any] = {
+        "role": str(content.get("role") or "assistant"),
+        "content": "\n".join(text_parts),
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return message
+
+
+def _message_from_responses_output(data: Mapping[str, Any]) -> dict[str, Any] | None:
+    output = data.get("output")
+    if not isinstance(output, list):
+        return None
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    for index, item in enumerate(output, start=1):
+        if not isinstance(item, Mapping):
+            continue
+        item_type = item.get("type")
+        if item_type in {"function_call", "tool_call"}:
+            name = str(item.get("name") or "").strip()
+            if name:
+                tool_calls.append(
+                    {
+                        "id": str(item.get("call_id") or item.get("id") or f"response-call-{index}"),
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": item.get("arguments", "{}"),
+                        },
+                    }
+                )
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, Mapping):
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                text_parts.append(text.strip())
+    if not text_parts and not tool_calls:
+        return None
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": "\n".join(text_parts),
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return message
+
+
+def _extract_message_from_payload(data: dict[str, Any]) -> dict[str, Any] | None:
+    direct_message = data.get("message")
+    if isinstance(direct_message, Mapping) and direct_message:
+        return dict(direct_message)
+
+    message = _message_from_choices(data)
+    if message:
+        return message
+
+    result = data.get("result")
+    if isinstance(result, Mapping):
+        message = _message_from_choices(result)
+        if message:
+            return message
+
+    message = _message_from_gemini_candidates(data)
+    if message:
+        return message
+
+    message = _message_from_responses_output(data)
+    if message:
+        return message
 
     text = data.get("output_text") or data.get("generated_text")
     if isinstance(text, list):
@@ -391,6 +522,26 @@ def _extract_message_from_payload(data: dict[str, Any]) -> dict[str, Any] | None
         return {"role": "assistant", "content": text.strip()}
 
     return None
+
+
+def _response_shape_summary(data: Mapping[str, Any]) -> str:
+    root_keys = sorted(str(key) for key in data.keys())[:12]
+    details = ["keys=" + ",".join(root_keys)]
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        details.append(f"choices={len(choices)}")
+        if choices and isinstance(choices[0], Mapping):
+            finish_reason = choices[0].get("finish_reason")
+            if finish_reason is not None:
+                details.append(f"finish={str(finish_reason)[:40]}")
+    candidates = data.get("candidates")
+    if isinstance(candidates, list):
+        details.append(f"candidates={len(candidates)}")
+        if candidates and isinstance(candidates[0], Mapping):
+            finish_reason = candidates[0].get("finishReason")
+            if finish_reason is not None:
+                details.append(f"finish={str(finish_reason)[:40]}")
+    return ";".join(details)[:300]
 
 
 def _upstream_body_fingerprint(body: str) -> str:
@@ -746,7 +897,20 @@ async def pos_chat_completion(
         if isinstance(tool_choice, str) and tool_choice in _SUPPORTED_TOOL_CHOICES
         else None
     )
-    max_attempts = len(_AI_PROVIDER_POOL)
+    requires_vision = _messages_have_visual_inputs(messages)
+    if requires_vision:
+        max_attempts = sum(
+            1
+            for provider in _AI_PROVIDER_POOL
+            if provider.get("provider") == "gemini" and provider.get("api_key")
+        )
+        if max_attempts == 0:
+            logger.warning(
+                "P.OS vision request skipped: no authenticated Gemini provider."
+            )
+            return None
+    else:
+        max_attempts = len(_AI_PROVIDER_POOL)
 
     for attempt in range(max_attempts):
         response_text = ""
@@ -760,9 +924,25 @@ async def pos_chat_completion(
                     )
                     return None
 
-                provider_index = await _reserve_provider_index(provider_type)
+                provider_index = (
+                    await _reserve_exact_provider_index("gemini")
+                    if requires_vision
+                    else await _reserve_provider_index(provider_type)
+                )
                 if provider_index is None:
-                    shortest = min((_provider_cooldown_remaining(i) for i in range(len(_AI_PROVIDER_POOL))), default=5.0)
+                    eligible_indices = [
+                        index
+                        for index, candidate in enumerate(_AI_PROVIDER_POOL)
+                        if not requires_vision
+                        or candidate.get("provider") == "gemini"
+                    ]
+                    shortest = min(
+                        (
+                            _provider_cooldown_remaining(index)
+                            for index in eligible_indices
+                        ),
+                        default=5.0,
+                    )
                     _set_ai_backoff(shortest, "all_providers_rate_limited")
                     _log_ai_backoff_once(
                         f"P.OS AI provider pool cooldown: all providers limited, retry in {shortest:.0f}s."
@@ -818,7 +998,7 @@ async def pos_chat_completion(
                             # Только проверяем наличие свободного провайдера — резерв
                             # выполнит следующая итерация цикла (иначе курсор
                             # сдвигался дважды и провайдеры пропускались).
-                            if _pick_provider_index(provider_type) is not None:
+                            if attempt < max_attempts - 1:
                                 continue  # retry next provider
                             _set_ai_backoff(min(retry_after, 30.0), "rate_limited")
                             return None
@@ -831,7 +1011,7 @@ async def pos_chat_completion(
                                 provider["name"],
                                 _upstream_body_fingerprint(response_text),
                             )
-                            if _pick_provider_index() is not None:
+                            if attempt < max_attempts - 1:
                                 continue  # retry next provider
                             _set_ai_backoff(5.0, "upstream_error")
                             return None
@@ -909,8 +1089,9 @@ async def pos_chat_completion(
         msg = _extract_message_from_payload(data)
         if not msg:
             logger.warning(
-                "P.OS API response had no message: body_sha256=%s",
+                "P.OS API response had no message: body_sha256=%s shape=%s",
                 _upstream_body_fingerprint(response_text),
+                _response_shape_summary(data),
             )
             return None
         return msg

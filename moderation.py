@@ -103,6 +103,11 @@ CONTENT_HOST_DOMAINS = {
     "imgur.com", "i.imgur.com", "reddit.com", "redd.it",
     "drive.google.com", "docs.google.com", "sites.google.com",
 }
+TRUSTED_MEDIA_CDN_DOMAINS = {
+    "cdn.discordapp.com",
+    "media.discordapp.net",
+}
+SAFE_MEDIA_PATH_EXTENSIONS = set(IMAGE_EXTENSIONS + VIDEO_EXTENSIONS + AUDIO_EXTENSIONS)
 URL_SHORTENER_DOMAINS = {
     "bit.ly", "tinyurl.com", "t.co", "cutt.ly", "is.gd", "rb.gy",
     "shorturl.at", "tiny.one", "rebrand.ly", "buff.ly", "soo.gd",
@@ -781,16 +786,31 @@ def _detect_attachment_metadata_flags(
     for attachment in attachments:
         name = (attachment.filename or "").lower()
         content_type = (attachment.content_type or "").lower()
-        if check_nsfw and any(keyword in name for keyword in NSFW_FILENAME_KEYWORDS):
+        if check_nsfw and any(_filename_has_keyword(name, keyword) for keyword in NSFW_FILENAME_KEYWORDS):
             flags.append((id(attachment), attachment.filename, f"NSFW по имени файла: {attachment.filename}"))
-        if check_ads and any(keyword in name for keyword in AD_FILENAME_KEYWORDS):
+        if check_ads and any(_filename_has_keyword(name, keyword) for keyword in AD_FILENAME_KEYWORDS):
             flags.append((id(attachment), attachment.filename, f"подозрительное имя файла: {attachment.filename}"))
         if content_type.startswith("video/") and (
-            (check_ads and any(keyword in name for keyword in ["casino", "nitro", "robux"]))
-            or (check_nsfw and "porn" in name)
+            (check_ads and any(_filename_has_keyword(name, keyword) for keyword in ["casino", "nitro", "robux"]))
+            or (check_nsfw and _filename_has_keyword(name, "porn"))
         ):
             flags.append((id(attachment), attachment.filename, f"подозрительное видео по имени файла: {attachment.filename}"))
     return flags
+
+
+def _filename_has_keyword(file_name: str, keyword: str) -> bool:
+    """Match filename signals as tokens, so `sex` does not match `Essex.gif`."""
+    normalized_name = unicodedata.normalize("NFKC", file_name or "").casefold()
+    normalized_keyword = unicodedata.normalize("NFKC", keyword or "").casefold()
+    if not normalized_keyword:
+        return False
+    return bool(
+        re.search(
+            rf"(?<![a-z0-9а-яё]){re.escape(normalized_keyword)}(?![a-z0-9а-яё])",
+            normalized_name,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def _detect_dangerous_attachment_files(
@@ -890,15 +910,50 @@ def _attachment_needs_hash_reputation(attachment: discord.Attachment, data: byte
     name = unicodedata.normalize("NFKC", attachment.filename or "").casefold().rstrip(" .")
     extension = os.path.splitext(name)[1]
     content_type = str(attachment.content_type or "").casefold().split(";", 1)[0].strip()
+    executable_signature = bool(
+        data.startswith((b"MZ", b"\x7fELF")) or data[:4] in _MACHO_MAGICS
+    )
+    if executable_signature:
+        return True
+    if _matches_safe_media_signature(extension, data):
+        return False
     return bool(
-        data.startswith((b"MZ", b"\x7fELF"))
-        or data[:4] in _MACHO_MAGICS
+        executable_signature
         or extension in {
             ".zip", ".rar", ".7z", ".doc", ".docx", ".docm", ".xls", ".xlsx",
             ".xlsm", ".ppt", ".pptx", ".pptm", ".pdf", ".jar", ".apk",
         }
         or content_type in {"application/octet-stream", "application/zip"}
     )
+
+
+def _matches_safe_media_signature(extension: str, data: bytes) -> bool:
+    signatures = {
+        ".gif": data.startswith((b"GIF87a", b"GIF89a")),
+        ".png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+        ".jpg": data.startswith(b"\xff\xd8\xff"),
+        ".jpeg": data.startswith(b"\xff\xd8\xff"),
+        ".webp": data.startswith(b"RIFF") and data[8:12] == b"WEBP",
+        ".bmp": data.startswith(b"BM"),
+        ".mp4": len(data) >= 12 and data[4:8] == b"ftyp",
+        ".mov": len(data) >= 12 and data[4:8] == b"ftyp",
+        ".webm": data.startswith(b"\x1aE\xdf\xa3"),
+        ".mkv": data.startswith(b"\x1aE\xdf\xa3"),
+        ".avi": data.startswith(b"RIFF") and data[8:12] == b"AVI ",
+        ".wav": data.startswith(b"RIFF") and data[8:12] == b"WAVE",
+        ".ogg": data.startswith(b"OggS"),
+        ".oga": data.startswith(b"OggS"),
+        ".opus": data.startswith(b"OggS"),
+        ".flac": data.startswith(b"fLaC"),
+    }
+    return bool(signatures.get(extension, False))
+
+
+def _is_trusted_media_cdn_url(domain: str, path: str) -> bool:
+    if not _domain_in(domain, TRUSTED_MEDIA_CDN_DOMAINS):
+        return False
+    extension = os.path.splitext((path or "").casefold())[1]
+    return extension in SAFE_MEDIA_PATH_EXTENSIONS
 
 
 def _attachment_content_priority(attachment: discord.Attachment) -> int:
@@ -1164,6 +1219,9 @@ async def check_and_handle_urls(
             ]
             if check_scam and hard_deception:
                 suspicious.append((url, "deceptive-url:" + ",".join(hard_deception)))
+                continue
+
+            if not risk_signals and _is_trusted_media_cdn_url(normalized_domain, path_decoded):
                 continue
 
             is_content_host = _domain_in(normalized_domain, CONTENT_HOST_DOMAINS)
@@ -1753,12 +1811,13 @@ async def detect_attachment_violations(
     for attachment_key, file_name, reason in metadata_flags:
         metadata_attachment_keys.add(attachment_key)
         verdict = ai_verdicts.get(attachment_key)
-        if verdict and verdict[0] == "allow":
-            continue
         if verdict and verdict[0] == "block":
             final_reason = f"Подтверждено-медиа: {file_name}: {verdict[1]}"
         else:
-            final_reason = f"Сигнал-метаданных: {reason}"
+            # A filename is attacker-controlled metadata, not evidence. It may
+            # trigger visual review, but can never delete an ordinary GIF/image
+            # by itself when the media provider is unavailable or uncertain.
+            continue
         if final_reason not in already_added:
             reasons.append(final_reason)
             already_added.add(final_reason)

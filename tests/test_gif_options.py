@@ -33,14 +33,17 @@ class ParseGifOptionsFromTextTests(unittest.TestCase):
         self.assertEqual(opts.get("max_video_seconds"), 5.0)
         self.assertEqual(opts.get("duration"), 5000)
 
+        opts = parse_gif_options_from_text("duration=45s")
+        self.assertEqual(opts.get("max_video_seconds"), 45.0)
+
     def test_parses_standalone_number_fps(self):
         # Supported integer values are treated as FPS.
         opts = parse_gif_options_from_text("12")
         self.assertEqual(opts.get("fps"), 12)
         self.assertNotIn("duration", opts)
 
-    def test_unsupported_fps_is_not_silently_clamped(self):
-        self.assertNotIn("fps", parse_gif_options_from_text("fps=30"))
+    def test_supports_high_quality_30_fps(self):
+        self.assertEqual(parse_gif_options_from_text("fps=30").get("fps"), 30)
 
     def test_parses_standalone_number_delay_ms(self):
         # 50 to 3000 is treated as delay in ms

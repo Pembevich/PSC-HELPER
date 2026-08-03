@@ -116,6 +116,33 @@ class ContentPrecisionTests(unittest.TestCase):
         self.assertEqual(confirmed, [])
         self.assertEqual(len(review_only), 1)
 
+    def test_filename_keywords_do_not_match_inside_ordinary_words(self):
+        self.assertFalse(moderation._filename_has_keyword("essex-trip.gif", "sex"))
+        self.assertFalse(moderation._filename_has_keyword("better-result.gif", "bet"))
+        self.assertTrue(moderation._filename_has_keyword("casino-promo.gif", "casino"))
+
+    def test_valid_gif_with_generic_mime_skips_virustotal_hash_lookup(self):
+        attachment = SimpleNamespace(
+            filename="reaction.gif",
+            content_type="application/octet-stream",
+        )
+        payload = b"GIF89a" + b"\x00" * 64
+        self.assertFalse(moderation._attachment_needs_hash_reputation(attachment, payload))
+
+    def test_discord_cdn_gif_is_recognized_as_trusted_media_url(self):
+        self.assertTrue(
+            moderation._is_trusted_media_cdn_url(
+                "cdn.discordapp.com",
+                "/attachments/1/2/reaction.gif",
+            )
+        )
+        self.assertFalse(
+            moderation._is_trusted_media_cdn_url(
+                "cdn.discordapp.com",
+                "/attachments/1/2/payload.exe",
+            )
+        )
+
     def test_executable_attachment_is_confirmed_deterministically(self):
         attachment = SimpleNamespace(
             filename="invoice.pdf.exe",
@@ -246,6 +273,25 @@ class AiModerationSafetyTests(unittest.IsolatedAsyncioTestCase):
             findings = await moderation._detect_dangerous_attachment_content(attachments)
         self.assertTrue(any("PE/Windows" in finding for finding in findings))
 
+    async def test_suspicious_media_filename_alone_never_deletes_attachment(self):
+        attachment = SimpleNamespace(
+            filename="casino-promo.gif",
+            content_type="image/gif",
+            size=128,
+        )
+        with patch.object(
+            moderation,
+            "_detect_dangerous_attachment_content",
+            new=AsyncMock(return_value=[]),
+        ), patch.object(
+            moderation,
+            "_classify_media_with_ai",
+            new=AsyncMock(return_value={}),
+        ):
+            findings = await moderation.detect_attachment_violations([attachment])
+
+        self.assertEqual(findings, [])
+
     async def test_audio_is_included_in_ai_media_review(self):
         attachment = SimpleNamespace(
             filename="voice.mp3",
@@ -312,6 +358,31 @@ class AiModerationSafetyTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await moderation.check_and_handle_urls(_msg(url)))
 
         google_check.assert_awaited_once()
+        vt_check.assert_not_awaited()
+
+    async def test_discord_cdn_gif_skips_url_reputation_services(self):
+        google_check = AsyncMock(return_value=True)
+        vt_check = AsyncMock(return_value=True)
+        message = _msg(
+            "https://cdn.discordapp.com/attachments/1/2/reaction.gif"
+        )
+
+        with patch.object(
+            moderation,
+            "GOOGLE_SAFEBROWSING_KEY",
+            "test-key",
+        ), patch.object(
+            moderation,
+            "check_google_safe_browsing",
+            google_check,
+        ), patch.object(
+            moderation,
+            "check_virustotal",
+            vt_check,
+        ):
+            self.assertFalse(await moderation.check_and_handle_urls(message))
+
+        google_check.assert_not_awaited()
         vt_check.assert_not_awaited()
 
     async def test_google_network_failure_is_not_cached_as_safe(self):

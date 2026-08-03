@@ -13,7 +13,13 @@ import cogs.logging_events as logging_events
 import storage
 from message_gate import begin_moderation, finish_moderation, wait_for_moderation
 from moderation import extract_urls
-from pos_ai import _extract_textual_tool_calls, request_pos_reply
+from pos_ai import (
+    _allowed_user_mentions_for_text,
+    _extract_textual_tool_calls,
+    _normalize_reply_user_mentions,
+    _send_plain_response,
+    request_pos_reply,
+)
 from storage import close_all_connections, restore_db_from_discord
 
 
@@ -176,6 +182,45 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         ))
         execute.assert_not_awaited()
 
+    async def test_unstructured_ban_with_verified_mention_uses_real_fallback_call(self):
+        target_id = 1351879409832951893
+        guild = SimpleNamespace(id=1)
+        message = SimpleNamespace(
+            id=77,
+            content=f"P.OS, забань <@{target_id}>",
+            author=SimpleNamespace(id=968698192411652176),
+            guild=guild,
+            channel=SimpleNamespace(id=10),
+            mentions=[SimpleNamespace(id=target_id)],
+            raw_mentions=[target_id],
+            role_mentions=[],
+            channel_mentions=[],
+            reference=None,
+        )
+        chat = AsyncMock(
+            side_effect=[
+                {"role": "assistant", "content": "Сейчас забаню."},
+                {"role": "assistant", "content": "Выполняю инструмент."},
+            ]
+        )
+        execute = AsyncMock(return_value=f"Пользователь {target_id} успешно забанен.")
+        state = {"tools_executed": False}
+
+        with patch("pos_ai.pos_chat_completion", new=chat), patch(
+            "pos_ai.execute_pos_tool",
+            new=execute,
+        ):
+            result = await request_pos_reply(SimpleNamespace(user=SimpleNamespace(id=999)), message, [], state=state)
+
+        self.assertIn("успешно забанен", result)
+        self.assertTrue(state["tools_executed"])
+        execute.assert_awaited_once()
+        fallback_call = execute.await_args.args[2]
+        fallback_args = json.loads(fallback_call["function"]["arguments"])
+        self.assertEqual(fallback_call["function"]["name"], "ban_user")
+        self.assertEqual(fallback_args["user_id"], str(target_id))
+        self.assertEqual(fallback_args["reason"], "По распоряжению Пумбы")
+
     async def test_simulated_action_is_rejected_without_calling_model(self):
         message = SimpleNamespace(
             content=(
@@ -268,6 +313,42 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
             json.loads(call["function"]["arguments"])["user_id"],
             "1351879409832951893",
         )
+
+
+class PlainReplyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_plain_login_becomes_one_safe_real_user_mention(self):
+        member = SimpleNamespace(id=1351879409832951893, name="juniperbot")
+        guild = SimpleNamespace(
+            members=[member],
+            get_member=lambda user_id: member if user_id == member.id else None,
+        )
+        normalized = _normalize_reply_user_mentions("Позвал @juniperbot, но не @everyone.", guild)
+        self.assertIn(f"<@{member.id}>", normalized)
+        self.assertIn("@everyone", normalized)
+
+        allowed = _allowed_user_mentions_for_text(normalized, guild)
+        self.assertEqual(allowed.to_dict(), {"users": [member.id], "parse": []})
+
+    async def test_normal_response_sends_text_without_embed(self):
+        member = SimpleNamespace(id=1351879409832951893, name="juniperbot")
+        guild = SimpleNamespace(
+            members=[member],
+            get_member=lambda user_id: member if user_id == member.id else None,
+        )
+        message = SimpleNamespace(
+            guild=guild,
+            reply=AsyncMock(),
+            channel=SimpleNamespace(send=AsyncMock()),
+        )
+
+        sent = await _send_plain_response(message, "Готово, @juniperbot уведомлён.")
+
+        self.assertTrue(sent)
+        message.reply.assert_awaited_once()
+        args, kwargs = message.reply.await_args
+        self.assertIn(f"<@{member.id}>", args[0])
+        self.assertNotIn("embed", kwargs)
+        self.assertEqual(kwargs["allowed_mentions"].to_dict(), {"users": [member.id], "parse": []})
 
 
 class RestoreFallbackTests(unittest.IsolatedAsyncioTestCase):

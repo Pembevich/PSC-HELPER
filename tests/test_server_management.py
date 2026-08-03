@@ -453,6 +453,61 @@ class ToolExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
         persist.assert_awaited_once()
         creator.assert_not_awaited()
 
+    async def test_owner_ban_uses_mentioned_target_and_code_level_reason(self):
+        target_id = 1351879409832951893
+        guild = SimpleNamespace(id=1, name="Test")
+        message = SimpleNamespace(
+            guild=guild,
+            channel=SimpleNamespace(id=10),
+            author=SimpleNamespace(id=968698192411652176),
+            content=f"забань <@{target_id}>",
+            mentions=[SimpleNamespace(id=target_id)],
+            raw_mentions=[target_id],
+            role_mentions=[],
+            channel_mentions=[],
+            reference=None,
+        )
+        bot = SimpleNamespace(user=SimpleNamespace(id=9999))
+        prepare = AsyncMock(
+            return_value=(
+                {
+                    "user_id": str(target_id),
+                    "server_id_or_name": "1",
+                    "reason": "По распоряжению Пумбы",
+                },
+                target_id,
+                guild,
+                ["сервер: Test (`1`)"],
+                None,
+            )
+        )
+        perform = AsyncMock(return_value="Пользователь успешно забанен.")
+
+        with patch.object(pos_ai, "_prepare_mutating_tool_action", new=prepare), patch.object(
+            pos_ai,
+            "_perform_tool_action",
+            new=perform,
+        ), patch.object(pos_ai, "_log_pos_tool_result", new=AsyncMock(return_value=True)):
+            result = await pos_ai.execute_pos_tool(
+                bot,
+                message,
+                {
+                    "id": "ban-without-reason",
+                    "function": {
+                        "name": "ban_user",
+                        "arguments": json.dumps(
+                            {"user_id": "111111111111111111"}
+                        ),
+                    },
+                },
+                allowed_tool_names=frozenset({"ban_user"}),
+            )
+
+        self.assertIn("успешно забанен", result)
+        prepared_args = prepare.await_args.args[3]
+        self.assertEqual(prepared_args["user_id"], str(target_id))
+        self.assertEqual(prepared_args["reason"], "По распоряжению Пумбы")
+
     async def test_outsider_action_is_sent_to_owner_without_execution(self):
         pos_ai._owner_approval_last_requested.clear()
         guild = SimpleNamespace(id=1, name="Test")

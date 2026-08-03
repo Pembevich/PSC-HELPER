@@ -11,6 +11,7 @@ from ai_client import (
     _gemini_generate_content_url,
     _gemini_interactions_url,
     _is_safe_provider_url,
+    _messages_have_visual_inputs,
     _parse_retry_after,
     ai_has_configured_media_provider,
     extract_json_block,
@@ -76,6 +77,73 @@ class ExtractJsonBlockTests(unittest.TestCase):
 
 
 class AIClientBoundaryTests(unittest.TestCase):
+    def test_visual_input_detection_requires_an_image_part(self):
+        self.assertFalse(
+            _messages_have_visual_inputs(
+                [{"role": "user", "content": "Обычный текст"}]
+            )
+        )
+        self.assertTrue(
+            _messages_have_visual_inputs(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Что здесь?"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,AA=="},
+                            },
+                        ],
+                    }
+                ]
+            )
+        )
+
+    def test_native_gemini_function_call_is_normalized(self):
+        message = ai_client._extract_message_from_payload(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "role": "model",
+                            "parts": [
+                                {
+                                    "functionCall": {
+                                        "name": "ban_user",
+                                        "args": {"user_id": "123"},
+                                    }
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "ban_user")
+        self.assertEqual(
+            json.loads(message["tool_calls"][0]["function"]["arguments"]),
+            {"user_id": "123"},
+        )
+
+    def test_responses_api_function_call_is_normalized(self):
+        message = ai_client._extract_message_from_payload(
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call-1",
+                        "name": "list_roles",
+                        "arguments": "{}",
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(message["tool_calls"][0]["id"], "call-1")
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "list_roles")
+
     def test_provider_urls_require_https_except_loopback(self):
         self.assertTrue(_is_safe_provider_url("https://models.example.com/v1/chat"))
         self.assertTrue(_is_safe_provider_url("http://127.0.0.1:8080/v1/chat"))
@@ -170,6 +238,66 @@ class AIClientBoundaryTests(unittest.TestCase):
 
 
 class GeminiMediaRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_visual_chat_never_falls_back_to_text_only_provider(self):
+        providers = [
+            {
+                "name": "text-only",
+                "provider": "generic",
+                "api_url": "https://api.example.com/v1/chat/completions",
+                "model": "text-model",
+                "api_key": "text-key",
+            },
+            {
+                "name": "gemini-test",
+                "provider": "gemini",
+                "api_url": (
+                    "https://generativelanguage.googleapis.com/"
+                    "v1beta/openai/chat/completions"
+                ),
+                "model": "gemini-test",
+                "api_key": "gemini-key",
+            },
+        ]
+        session = _MediaSession(
+            {"choices": [{"message": {"role": "assistant", "content": "Фото."}}]}
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Опиши."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AA=="},
+                    },
+                ],
+            }
+        ]
+
+        reserve_exact = AsyncMock(return_value=1)
+        reserve_regular = AsyncMock(return_value=0)
+        with (
+            patch.object(ai_client, "_AI_PROVIDER_POOL", providers),
+            patch.object(
+                ai_client,
+                "_reserve_exact_provider_index",
+                new=reserve_exact,
+            ),
+            patch.object(
+                ai_client,
+                "_reserve_provider_index",
+                new=reserve_regular,
+            ),
+            patch.object(ai_client.aiohttp, "ClientSession", return_value=session),
+            patch.object(ai_client.aiohttp, "TCPConnector"),
+        ):
+            result = await ai_client.pos_chat_completion(messages)
+
+        self.assertEqual(result["content"], "Фото.")
+        reserve_exact.assert_awaited_once_with("gemini")
+        reserve_regular.assert_not_awaited()
+        self.assertEqual(session.posts[0][0], providers[1]["api_url"])
+
     async def test_video_uses_interactions_payload_and_header_key(self):
         provider = {
             "name": "gemini-test",

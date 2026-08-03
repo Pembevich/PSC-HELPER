@@ -55,7 +55,6 @@ from media_intelligence import (
     MediaContext,
     extract_media_context,
 )
-from pos_embeds import build_action_result_embed, build_service_status_embed
 from storage import (
     add_ai_event,
     add_entry,
@@ -168,6 +167,36 @@ def _index_tool_schemas() -> dict[str, dict[str, Any]]:
 
 _TOOL_SCHEMAS_BY_NAME = _index_tool_schemas()
 _MAX_TOOL_CALLS_PER_TURN = 8
+
+
+def _tool_schema_properties(name: str) -> dict[str, Any]:
+    tool = _TOOL_SCHEMAS_BY_NAME.get(name, {})
+    function = tool.get("function", {}) if isinstance(tool, dict) else {}
+    parameters = function.get("parameters", {}) if isinstance(function, dict) else {}
+    properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
+    return properties if isinstance(properties, dict) else {}
+
+
+def _apply_tool_argument_defaults(
+    name: str,
+    raw_args: dict[str, Any],
+    message: discord.Message | None,
+) -> dict[str, Any]:
+    """Fill safe operational defaults that do not need model inference."""
+    args = dict(raw_args)
+    properties = _tool_schema_properties(name)
+    author_id = getattr(getattr(message, "author", None), "id", 0)
+    owner_request = author_id == POS_CREATOR_ID
+
+    if "reason" in properties and not str(args.get("reason") or "").strip():
+        args["reason"] = (
+            "По распоряжению Пумбы"
+            if owner_request
+            else f"Запрос участника Discord {author_id}"
+        )
+    if name == "timeout_user" and not str(args.get("minutes") or "").strip():
+        args["minutes"] = "10"
+    return args
 
 
 def _validate_tool_arguments(name: str, raw_args: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -1111,6 +1140,128 @@ async def _resolve_banned_user_id(
         variants = ", ".join(f"{user} (`{user.id}`)" for user in matches[:8])
         return None, f"в бан-листе несколько совпадений: {variants}; уточни ID"
     return None, f"точный username/login `{ident}` не найден в бан-листе"
+
+
+def _message_target_user_id(
+    message: discord.Message | None,
+    bot: discord.Client | None,
+) -> int | None:
+    """Return one unambiguous user target from the current Discord message."""
+    if message is None:
+        return None
+
+    bot_id = getattr(getattr(bot, "user", None), "id", None)
+    excluded_ids = {
+        value
+        for value in (
+            bot_id,
+            getattr(getattr(message, "guild", None), "id", None),
+            getattr(getattr(message, "channel", None), "id", None),
+        )
+        if isinstance(value, int)
+    }
+    candidates: list[int] = []
+
+    for mentioned in list(getattr(message, "mentions", None) or []):
+        mentioned_id = getattr(mentioned, "id", None)
+        if isinstance(mentioned_id, int) and mentioned_id not in excluded_ids:
+            candidates.append(mentioned_id)
+
+    if not candidates:
+        for raw_id in list(getattr(message, "raw_mentions", None) or []):
+            try:
+                mentioned_id = int(raw_id)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if mentioned_id not in excluded_ids:
+                candidates.append(mentioned_id)
+
+    if not candidates:
+        for raw_id in re.findall(r"(?<!\d)(\d{15,22})(?!\d)", message.content or ""):
+            mentioned_id = int(raw_id)
+            if mentioned_id not in excluded_ids:
+                candidates.append(mentioned_id)
+
+    unique = list(dict.fromkeys(candidates))
+    if len(unique) == 1:
+        return unique[0]
+    if unique:
+        return None
+
+    reference = getattr(message, "reference", None)
+    referenced = (
+        getattr(reference, "resolved", None)
+        or getattr(reference, "cached_message", None)
+    )
+    referenced_author_id = getattr(getattr(referenced, "author", None), "id", None)
+    if isinstance(referenced_author_id, int) and referenced_author_id != bot_id:
+        return referenced_author_id
+    return None
+
+
+def _message_target_role_id(message: discord.Message | None) -> int | None:
+    roles = list(getattr(message, "role_mentions", None) or []) if message else []
+    role_ids = list(dict.fromkeys(
+        role.id for role in roles if isinstance(getattr(role, "id", None), int)
+    ))
+    return role_ids[0] if len(role_ids) == 1 else None
+
+
+def _message_target_channel_id(message: discord.Message | None) -> int | None:
+    channels = list(getattr(message, "channel_mentions", None) or []) if message else []
+    channel_ids = list(dict.fromkeys(
+        channel.id for channel in channels if isinstance(getattr(channel, "id", None), int)
+    ))
+    return channel_ids[0] if len(channel_ids) == 1 else None
+
+
+def _augment_tool_arguments_from_message(
+    name: str,
+    raw_args: dict[str, Any],
+    message: discord.Message | None,
+    bot: discord.Client | None,
+) -> dict[str, Any]:
+    """Ground omitted model arguments in verified current-message metadata."""
+    args = _apply_tool_argument_defaults(name, raw_args, message)
+    properties = _tool_schema_properties(name)
+
+    has_user = any(
+        str(args.get(key) or "").strip()
+        for key in ("user_id", "user_identifier", "username", "login")
+    )
+    if name in _USER_TARGET_TOOLS:
+        user_id = _message_target_user_id(message, bot)
+        if user_id is not None and "user_id" in properties:
+            # A real mention/reply is stronger evidence than a model-generated ID.
+            args["user_id"] = str(user_id)
+        elif not has_user:
+            args.pop("user_id", None)
+
+    role_id = _message_target_role_id(message)
+    if role_id is not None:
+        explicit_role_key = next(
+            (key for key in ("role_id_or_name", "target_role_or_user") if key in properties),
+            None,
+        )
+        if explicit_role_key:
+            args[explicit_role_key] = str(role_id)
+
+    if "channel_id_or_name" in properties:
+        channel_id = _message_target_channel_id(message)
+        if channel_id is None and not str(args.get("channel_id_or_name") or "").strip() and name in {
+            "lock_channel", "unlock_channel", "set_channel_permission",
+            "delete_messages", "read_messages", "ping_user",
+        }:
+            channel_id = getattr(getattr(message, "channel", None), "id", None)
+        if isinstance(channel_id, int):
+            args["channel_id_or_name"] = str(channel_id)
+
+    if "url" in properties and not str(args.get("url") or "").strip() and message:
+        url_match = re.search(r"https://[^\s<>]+", message.content or "", flags=re.IGNORECASE)
+        if url_match:
+            args["url"] = url_match.group(0).rstrip(".,;:!?)\"]}")
+
+    return args
 
 
 _BOT_PERMISSION_BY_TOOL = {
@@ -3311,6 +3462,7 @@ async def execute_pos_tool(
         return "Ошибка: параметры операции повреждены; действие не выполнено."
     if len(json.dumps(args, ensure_ascii=False, default=str)) > 20_000:
         return "Отказано: параметры операции слишком велики; разбей запрос на части."
+    args = _augment_tool_arguments_from_message(name, args, message, bot)
     validated_args, validation_error = _validate_tool_arguments(name, args)
     if validated_args is None:
         return (
@@ -4033,7 +4185,107 @@ def _strip_address_prefix(text: str, bot: discord.Client) -> str:
 def _chunk_text(text: str, limit: int = AI_MAX_RESPONSE_CHARS) -> List[str]:
     if not text:
         return []
-    return [text[i:i + limit] for i in range(0, len(text), limit)]
+    chunks: list[str] = []
+    remaining = text.strip()
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        split_at = remaining.rfind("\n", 0, limit + 1)
+        if split_at < limit // 2:
+            split_at = remaining.rfind(" ", 0, limit + 1)
+        if split_at < limit // 2:
+            split_at = limit
+        chunk = remaining[:split_at].rstrip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip()
+    return chunks
+
+
+_PLAIN_LOGIN_MENTION = re.compile(
+    r"(?<![\w@<])@([a-z0-9._]{2,32})(?![\w.])",
+    re.IGNORECASE,
+)
+
+
+def _normalize_reply_user_mentions(
+    text: str,
+    guild: discord.Guild | None,
+    *,
+    max_mentions: int = 5,
+) -> str:
+    """Turn exact @login text into real mentions without enabling mass pings."""
+    if not text or guild is None or "@" not in text:
+        return text
+
+    by_login: dict[str, list[discord.Member]] = defaultdict(list)
+    for member in list(getattr(guild, "members", None) or []):
+        login = _normalize_user_lookup(getattr(member, "name", ""))
+        if login:
+            by_login[login].append(member)
+
+    replacements = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal replacements
+        login = _normalize_user_lookup(match.group(1))
+        if login in {"everyone", "here"} or replacements >= max_mentions:
+            return match.group(0)
+        members = by_login.get(login, [])
+        if len(members) != 1:
+            return match.group(0)
+        replacements += 1
+        return f"<@{members[0].id}>"
+
+    return _PLAIN_LOGIN_MENTION.sub(replace, text)
+
+
+def _allowed_user_mentions_for_text(
+    text: str,
+    guild: discord.Guild | None,
+    *,
+    max_mentions: int = 5,
+) -> discord.AllowedMentions:
+    if guild is None:
+        return discord.AllowedMentions.none()
+    user_objects: list[discord.Member] = []
+    seen: set[int] = set()
+    for raw_id in re.findall(r"<@!?(\d{15,22})>", text or ""):
+        user_id = int(raw_id)
+        if user_id in seen:
+            continue
+        member = guild.get_member(user_id)
+        if member is None:
+            continue
+        seen.add(user_id)
+        user_objects.append(member)
+        if len(user_objects) >= max_mentions:
+            break
+    return discord.AllowedMentions(
+        everyone=False,
+        users=user_objects,
+        roles=False,
+        replied_user=False,
+    )
+
+
+async def _send_plain_response(message: discord.Message, text: str) -> bool:
+    normalized = _normalize_reply_user_mentions(text, message.guild)
+    chunks = _chunk_text(normalized)
+    if not chunks:
+        return False
+    for index, chunk in enumerate(chunks):
+        allowed_mentions = _allowed_user_mentions_for_text(chunk, message.guild)
+        if index == 0:
+            await message.reply(
+                chunk,
+                mention_author=False,
+                allowed_mentions=allowed_mentions,
+            )
+        else:
+            await message.channel.send(chunk, allowed_mentions=allowed_mentions)
+    return True
 
 
 def _sanitize_text(text: str) -> str:
@@ -5124,6 +5376,69 @@ def _tool_call_required(
     )
 
 
+_DETERMINISTIC_EMPTY_ARG_TOOLS = frozenset({
+    "list_servers", "get_settings", "list_members", "list_channels", "list_roles",
+    "read_audit_log", "read_messages", "search_logs", "search_pings",
+    "security_scan", "setup_logging", "create_invite", "runtime_status",
+    "list_invites", "list_webhooks", "list_automod_rules",
+    "list_scheduled_events", "list_emojis", "list_stickers",
+    "list_memory_entries", "refresh_server_memory", "deactivate_raid_mode",
+    "lock_channel", "unlock_channel",
+})
+
+
+def _build_deterministic_fallback_tool_call(
+    bot: discord.Client | None,
+    message: discord.Message | None,
+    allowed_tool_names: frozenset[str],
+) -> dict[str, Any] | None:
+    """Build a narrow fallback only from verified current-message metadata.
+
+    This path is used after two provider responses failed to return a structured
+    call. It never guesses a user, role, channel, or action from conversation
+    history, and therefore cannot broaden the current message's authority.
+    """
+    if message is None or len(allowed_tool_names) != 1:
+        return None
+    name = next(iter(allowed_tool_names))
+    args: dict[str, Any] = {}
+
+    if name in _DETERMINISTIC_EMPTY_ARG_TOOLS:
+        pass
+    elif name in _USER_TARGET_TOOLS:
+        target_id = _message_target_user_id(message, bot)
+        if target_id is None:
+            return None
+        args["user_id"] = str(target_id)
+        if name in {"add_role", "remove_role"}:
+            role_id = _message_target_role_id(message)
+            if role_id is None:
+                return None
+            args["role_id_or_name"] = str(role_id)
+    elif name == "delete_messages":
+        count_match = re.search(r"\b(\d{1,3})\b", message.content or "")
+        if not count_match:
+            return None
+        args["count"] = str(max(1, min(int(count_match.group(1)), 100)))
+    elif name == "read_web_page":
+        pass
+    else:
+        return None
+
+    args = _augment_tool_arguments_from_message(name, args, message, bot)
+    validated, _error = _validate_tool_arguments(name, args)
+    if validated is None:
+        return None
+    return {
+        "id": f"verified-fallback-{getattr(message, 'id', 0)}",
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json.dumps(validated, ensure_ascii=False),
+        },
+    }
+
+
 def _extract_response_tool_calls(
     response_msg: dict[str, Any],
     allowed_tool_names: frozenset[str],
@@ -5259,6 +5574,18 @@ async def request_pos_reply(
                 allowed_tool_names,
                 allow_bare_text=True,
             )
+    if require_tool_call and not tool_calls:
+        fallback_call = _build_deterministic_fallback_tool_call(
+            bot,
+            message,
+            allowed_tool_names,
+        )
+        if fallback_call is not None:
+            logger.warning(
+                "P.OS provider omitted required tool call; using verified current-message fallback for %s.",
+                fallback_call["function"]["name"],
+            )
+            tool_calls = [fallback_call]
     if not tool_calls:
         if require_tool_call:
             return (
@@ -6050,27 +6377,17 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
         # #9: пишем мут в БД (единый источник истины), чтобы он переживал рестарт
         # и совпадал с tool-инструментом mute_ai_for_user.
         await set_ai_muted_user(message.author.id, guild.id, True)
-        await message.reply(
-            embed=build_action_result_embed(
-                "Ответы P.OS",
-                "Ответы для этого аккаунта на сервере отключены.",
-                guild=guild,
-            ),
-            mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none(),
+        await _send_plain_response(
+            message,
+            "Ответы P.OS для этого аккаунта на сервере отключены.",
         )
         return True
 
     if _is_unmute_request(text):
         await set_ai_muted_user(message.author.id, guild.id, False)
-        await message.reply(
-            embed=build_action_result_embed(
-                "Ответы P.OS",
-                "Ответы для этого аккаунта на сервере включены.",
-                guild=guild,
-            ),
-            mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none(),
+        await _send_plain_response(
+            message,
+            "Ответы P.OS для этого аккаунта на сервере включены.",
         )
         return True
 
@@ -6086,7 +6403,7 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
             attachments = await _collect_recent_media_attachments(message)
             if not attachments:
                 await message.reply(
-                    "Нужны вложения. Прикрепи изображение или короткое видео, и я соберу GIF.",
+                    "Нужны вложения. Прикрепи изображение или видео, и я соберу GIF.",
                     mention_author=False,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
@@ -6139,15 +6456,10 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
             )
             _missing_key_warned = True
         if _should_send_rate_limit_notice(message.channel.id):
-            await message.reply(
-                embed=build_service_status_embed(
-                    "Контур интеллекта недоступен",
-                    "Для текущего запуска не настроен ни один AI-провайдер. "
-                    "Серверные действия не выполнялись.",
-                    guild=guild,
-                ),
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
+            await _send_plain_response(
+                message,
+                "Контур интеллекта недоступен: для текущего запуска не настроен "
+                "ни один AI-провайдер. Серверные действия не выполнялись.",
             )
         return True
 
@@ -6199,59 +6511,27 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
         if explicit_addressing:
             if ai_is_temporarily_unavailable() and _should_send_rate_limit_notice(message.channel.id):
                 try:
-                    await message.reply(
-                        embed=build_service_status_embed(
-                            "Контур интеллекта временно недоступен",
-                            _build_rate_limit_reply(),
-                            guild=guild,
-                        ),
-                        mention_author=False,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
+                    await _send_plain_response(message, _build_rate_limit_reply())
                 except Exception:
                     pass
             elif _should_send_rate_limit_notice(message.channel.id):
                 try:
-                    await message.reply(
-                        embed=build_service_status_embed(
-                            "Запрос не обработан",
-                            "AI-провайдер не вернул проверяемый ответ. "
-                            "Никакое серверное действие не выполнялось.",
-                            guild=guild,
-                        ),
-                        mention_author=False,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                    await _send_plain_response(
+                        message,
+                        "AI-провайдер не вернул проверяемый ответ. "
+                        "Никакое серверное действие не выполнялось.",
                     )
                 except Exception:
                     pass
         return True
 
     if call_state.get("tools_executed"):
-        tool_results = call_state.get("tool_results")
-        if isinstance(tool_results, list) and tool_results:
-            for item in tool_results[:10]:
-                if not isinstance(item, dict):
-                    continue
-                name = str(item.get("name") or "server_action")
-                result = str(item.get("result") or "")
-                label = _TOOL_ACTION_LABELS.get(name, "Серверная операция")
-                try:
-                    await message.channel.send(
-                        embed=build_action_result_embed(
-                            label.capitalize(),
-                            result,
-                            guild=guild,
-                        ),
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                except Exception:
-                    logger.exception(
-                        "Не удалось отправить результат операции P.OS %s.",
-                        name,
-                    )
-                    break
-            _touch_state(state_channel, message.author.id, bot_replied=True)
-            return True
+        try:
+            await _send_plain_response(message, reply)
+        except Exception:
+            logger.exception("Не удалось отправить результат операции P.OS.")
+        _touch_state(state_channel, message.author.id, bot_replied=True)
+        return True
 
     media_context = media_state.get("context")
     reply = _guard_unverified_media_reply(
@@ -6268,16 +6548,10 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
     except Exception:
         pass
 
-    first = True
-    for chunk in chunks:
-        try:
-            if first:
-                await message.reply(chunk, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
-                first = False
-            else:
-                await message.channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
-        except Exception:
-            break
+    try:
+        await _send_plain_response(message, reply)
+    except Exception:
+        logger.exception("Не удалось отправить ответ P.OS в Discord.")
 
     _touch_state(state_channel, message.author.id, bot_replied=True)
 

@@ -1,4 +1,5 @@
 import asyncio
+import subprocess
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,6 +52,30 @@ class GifResourceLimitTests(IsolatedAsyncioTestCase):
 
 
 class GifQualityTests(TestCase):
+    def test_full_video_encode_does_not_add_duration_cutoff(self):
+        captured: list[str] = []
+
+        def fake_run(cmd, **_kwargs):
+            captured.extend(cmd)
+            Path(cmd[-1]).write_bytes(b"gif")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            commands.imageio_ffmpeg,
+            "get_ffmpeg_exe",
+            return_value="ffmpeg",
+        ), patch.object(commands.subprocess, "run", side_effect=fake_run):
+            commands._run_ffmpeg_gif_encode(
+                "source.mp4",
+                str(Path(temp_dir) / "full.gif"),
+                fps=24,
+                max_duration=None,
+                max_dim=960,
+                timeout=30,
+            )
+
+        self.assertNotIn("-t", captured)
+
     def test_uses_highest_video_profile_that_fits(self):
         calls: list[tuple[int, int]] = []
 

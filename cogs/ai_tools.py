@@ -16,7 +16,7 @@ POS_AI_TOOLS = [
                         "description": "Причина бана."
                     }
                 },
-                "required": ["user_id", "reason"]
+                "required": ["user_id"]
             }
         }
     },
@@ -37,7 +37,7 @@ POS_AI_TOOLS = [
                         "description": "Причина разбана."
                     }
                 },
-                "required": ["user_id", "reason"]
+                "required": ["user_id"]
             }
         }
     },
@@ -62,7 +62,7 @@ POS_AI_TOOLS = [
                         "description": "Причина мута."
                     }
                 },
-                "required": ["user_id", "minutes", "reason"]
+                "required": ["user_id"]
             }
         }
     },

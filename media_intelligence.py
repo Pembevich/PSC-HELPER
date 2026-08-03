@@ -378,6 +378,7 @@ def _video_timestamps(duration: float | None) -> list[float]:
         return [0.0]
     if duration < 0.4:
         return [0.0]
+    fractions: tuple[float, ...]
     if MAX_VIDEO_FRAMES <= 1:
         fractions = (0.5,)
     else:
