@@ -200,9 +200,16 @@ class TelegramOwnerBridge:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
         try:
             async with self._session.post(url, json=payload) as response:
-                raw = await response.content.read(_MAX_TELEGRAM_RESPONSE_BYTES + 1)
-                if len(raw) > _MAX_TELEGRAM_RESPONSE_BYTES:
-                    raise TelegramBridgeError("response_too_large")
+                raw = bytearray()
+                while True:
+                    chunk = await response.content.read(
+                        min(64 * 1024, _MAX_TELEGRAM_RESPONSE_BYTES + 1 - len(raw))
+                    )
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+                    if len(raw) > _MAX_TELEGRAM_RESPONSE_BYTES:
+                        raise TelegramBridgeError("response_too_large")
                 data = json.loads(raw.decode("utf-8", "replace"))
         except asyncio.CancelledError:
             raise
@@ -424,7 +431,11 @@ class TelegramOwnerBridge:
         )
         if delivery_error:
             await self._send_telegram(
-                "Discord не принял ответ; ошибка сохранена без раскрытия внутренних данных.",
+                (
+                    "Discord не принял публичный ответ."
+                    if public
+                    else "Не удалось доставить ответ в ЛС Discord. В исходный канал он не отправлен."
+                ),
                 reply_to=incoming_id,
             )
         else:
@@ -481,13 +492,9 @@ class TelegramOwnerBridge:
                 await user.send(content, allowed_mentions=discord.AllowedMentions.none())
                 return "личные сообщения Discord", None
             except Exception as exc:
-                logger.info("Telegram reply DM fallback after %s.", type(exc).__name__)
-        try:
-            await send_to_source()
-            return "исходный канал (ЛС закрыты)", None
-        except Exception as exc:
-            logger.warning("Telegram reply fallback failed: %s", type(exc).__name__)
-            return "Discord", type(exc).__name__
+                logger.info("Private Telegram reply delivery failed: %s.", type(exc).__name__)
+                return "личные сообщения Discord", type(exc).__name__
+        return "личные сообщения Discord", "recipient_unavailable"
 
 
 async def forward_contact_to_pumba(

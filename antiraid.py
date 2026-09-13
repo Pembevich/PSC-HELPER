@@ -85,7 +85,7 @@ def join_risk_score(member: discord.abc.User, min_account_age_hours: int) -> int
     """Conservative score: weak cosmetic signals cannot cause a kick by themselves."""
     score = 0
     age = account_age_hours(member)
-    if age is not None:
+    if age is not None and min_account_age_hours > 0:
         if age < 1:
             score += 4
         elif age < float(min_account_age_hours):
@@ -186,7 +186,7 @@ def evaluate_join(member: discord.Member, settings: dict[str, Any], *, now: floa
     window = int(settings.get("raid_join_window_seconds", 60) or 60)
     threshold = int(settings.get("raid_join_threshold", 8) or 8)
     cooldown = int(settings.get("raid_mode_cooldown_seconds", 600) or 600)
-    min_age = int(settings.get("min_account_age_hours", 72) or 72)
+    min_age = int(settings.get("min_account_age_hours", 72))
     raid_action = str(settings.get("raid_action", "quarantine") or "quarantine").lower()
     # lockdown никогда не был реализован отдельно — старые настройки с ним
     # трактуем как quarantine.

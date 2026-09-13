@@ -848,9 +848,10 @@ async def claim_recent_pos_action_group(
         # A crashed worker may leave a claim behind. Re-open it after five
         # minutes; normal duplicate requests still fail closed.
         await conn.execute(
-            "UPDATE pos_tool_actions SET undo_status = 'ready', undo_started_at = NULL "
-            "WHERE undo_status = 'in_progress' AND undo_started_at < ? "
-            "AND inverse_operation IS NOT NULL",
+            "UPDATE pos_tool_actions SET undo_status = CASE "
+            "WHEN inverse_operation IS NULL THEN 'not_reversible' ELSE 'ready' END, "
+            "undo_started_at = NULL "
+            "WHERE undo_status = 'in_progress' AND undo_started_at < ?",
             (stale_cutoff,),
         )
         cursor = await conn.execute(
@@ -860,7 +861,7 @@ async def claim_recent_pos_action_group(
             WHERE actor_id = ? AND source_guild_id = ? AND ts >= ?
               AND (? IS NULL OR source_channel_id = ?)
               AND success = 1
-              AND undo_status IN ('ready', 'failed', 'not_reversible')
+              AND undo_status IN ('ready', 'failed', 'not_reversible', 'in_progress')
             ORDER BY ts DESC, id DESC
             LIMIT 1
             """,
@@ -877,10 +878,18 @@ async def claim_recent_pos_action_group(
             await conn.commit()
             return []
         source_message_id = int(group_row[0])
+        active_cursor = await conn.execute(
+            "SELECT 1 FROM pos_tool_actions WHERE source_message_id = ? "
+            "AND actor_id = ? AND undo_status = 'in_progress' LIMIT 1",
+            (source_message_id, int(actor_id)),
+        )
+        if await active_cursor.fetchone():
+            await conn.commit()
+            return []
         await conn.execute(
             "UPDATE pos_tool_actions SET undo_status = 'in_progress', undo_started_at = ? "
             "WHERE source_message_id = ? AND actor_id = ? "
-            "AND undo_status IN ('ready', 'failed')",
+            "AND success = 1 AND undo_status IN ('ready', 'failed', 'not_reversible')",
             (now, source_message_id, int(actor_id)),
         )
         rows_cursor = await conn.execute(
@@ -891,7 +900,7 @@ async def claim_recent_pos_action_group(
                    undo_started_at, undone_at, undo_result
             FROM pos_tool_actions
             WHERE source_message_id = ? AND actor_id = ? AND success = 1
-              AND undo_status IN ('in_progress', 'not_reversible')
+              AND undo_status = 'in_progress'
             ORDER BY id DESC
             """,
             (source_message_id, int(actor_id)),
@@ -931,6 +940,11 @@ async def finish_pos_action_undo(
 # Telegram owner bridge persistence and abuse controls
 # ---------------------------------------------------------------------------
 
+# A reservation normally covers one classification and one HTTP request. After
+# an interrupted worker, release its pending slot without re-sending a message
+# whose remote delivery may already have succeeded.
+_TELEGRAM_RESERVATION_TTL_SECONDS = 10 * 60
+
 async def reserve_telegram_contact_request(
     *,
     guild_id: int,
@@ -955,6 +969,13 @@ async def reserve_telegram_contact_request(
     payload_hash = hashlib.sha256(clean_text.casefold().encode("utf-8", "replace")).hexdigest()
     async with _loop_lock(_write_locks):
         conn = await _get_conn(db_path)
+        await conn.execute(
+            "UPDATE telegram_contact_requests SET status = 'failed', "
+            "delivery_error = 'reservation_expired_delivery_unknown' "
+            "WHERE status = 'reserved' AND created_at < ?",
+            (timestamp - _TELEGRAM_RESERVATION_TTL_SECONDS,),
+        )
+        await conn.commit()
         duplicate_cursor = await conn.execute(
             "SELECT id, status FROM telegram_contact_requests "
             "WHERE discord_message_id = ?",

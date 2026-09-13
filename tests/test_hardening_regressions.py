@@ -15,7 +15,6 @@ from message_gate import begin_moderation, finish_moderation, wait_for_moderatio
 from moderation import extract_urls
 from pos_ai import (
     _allowed_user_mentions_for_text,
-    _extract_textual_tool_calls,
     _message_target_user_id,
     _normalize_reply_user_mentions,
     _prepare_mutating_tool_action,
@@ -50,68 +49,6 @@ class UrlExtractionTests(unittest.TestCase):
 
 
 class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
-    def test_textual_tool_parser_rejects_code_and_unapproved_tools(self):
-        self.assertEqual(
-            _extract_textual_tool_calls(
-                "tool_call: kick_user(user_id=__import__('os').getuid())",
-                frozenset({"kick_user"}),
-            ),
-            [],
-        )
-        self.assertEqual(
-            _extract_textual_tool_calls(
-                "tool_call: kick_user(user_id='123')",
-                frozenset({"ban_user"}),
-            ),
-            [],
-        )
-
-    def test_textual_tool_parser_normalizes_provider_formats(self):
-        samples = [
-            (
-                "tool_call:\n```json\n"
-                '{"name":"kick_user","arguments":{"user_id":"1351879409832951893"}}'
-                "\n```"
-            ),
-            (
-                "<tool_call>"
-                '{"name":"kick_user","arguments":{"user_id":"1351879409832951893"}}'
-                "</tool_call>"
-            ),
-            (
-                "assistant to=functions.kick_user\n"
-                '{"user_id":"1351879409832951893"}'
-            ),
-            (
-                '{"tool_call":{"name":"kick_user","arguments":'
-                '{"user_id":"1351879409832951893"}}}'
-            ),
-            "kick_user(user_id='1351879409832951893')",
-            "action = kick_user(user_id='1351879409832951893')",
-        ]
-
-        for sample in samples:
-            with self.subTest(sample=sample):
-                calls = _extract_textual_tool_calls(
-                    sample,
-                    frozenset({"kick_user"}),
-                    allow_bare=True,
-                )
-                self.assertEqual(len(calls), 1)
-                self.assertEqual(calls[0]["function"]["name"], "kick_user")
-                self.assertEqual(
-                    json.loads(calls[0]["function"]["arguments"])["user_id"],
-                    "1351879409832951893",
-                )
-
-        self.assertEqual(
-            _extract_textual_tool_calls(
-                "kick_user(user_id='1351879409832951893')",
-                frozenset({"kick_user"}),
-            ),
-            [],
-        )
-
     async def test_only_intended_schema_is_exposed_and_duplicate_call_is_skipped(self):
         tool_call = {
             "id": "call-1",
@@ -127,7 +64,7 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         state = {"tools_executed": False}
 
-        chat = AsyncMock(return_value=response)
+        chat = AsyncMock(side_effect=[response, {"content": "Пользователь забанен."}])
         execute = AsyncMock(return_value="Пользователь забанен.")
         with patch("pos_ai.pos_chat_completion", new=chat), \
              patch("pos_ai.execute_pos_tool", new=execute):
@@ -140,12 +77,14 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
 
         schemas = chat.await_args.kwargs["tools"]
-        self.assertEqual([schema["function"]["name"] for schema in schemas], ["ban_user"])
-        self.assertEqual(chat.await_args.kwargs["tool_choice"], "required")
-        self.assertEqual(chat.await_count, 1)
+        self.assertEqual([schema["function"]["name"] for schema in schemas], ["ban_user", "ask_user"])
+        self.assertEqual(chat.await_args_list[0].kwargs["tool_choice"], "required")
+        self.assertEqual(chat.await_count, 2)
         self.assertEqual(execute.await_count, 1)
         self.assertTrue(state["tools_executed"])
-        self.assertIn("Повторный идентичный вызов пропущен", result)
+        self.assertEqual(result, "Пользователь забанен.")
+        observations = [item["content"] for item in chat.await_args.args[0] if item["role"] == "tool"]
+        self.assertTrue(any("Повторный идентичный вызов пропущен" in text for text in observations))
 
     async def test_non_owner_gets_only_mutating_schema_for_owner_approval(self):
         tool_call = {
@@ -159,7 +98,7 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
             content="P.OS, забань пользователя test",
             author=SimpleNamespace(id=123),
         )
-        chat = AsyncMock(return_value={"role": "assistant", "tool_calls": [tool_call]})
+        chat = AsyncMock(side_effect=[{"role": "assistant", "tool_calls": [tool_call]}, {"content": "Запрос отправлен Пумбе на подтверждение."}])
         execute = AsyncMock(return_value="Запрос отправлен Пумбе на подтверждение.")
 
         with patch("pos_ai.pos_chat_completion", new=chat), \
@@ -173,8 +112,8 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "Запрос отправлен Пумбе на подтверждение.")
         schemas = chat.await_args.kwargs["tools"]
-        self.assertEqual([schema["function"]["name"] for schema in schemas], ["ban_user"])
-        self.assertEqual(chat.await_args.kwargs["tool_choice"], "required")
+        self.assertEqual([schema["function"]["name"] for schema in schemas], ["ban_user", "ask_user"])
+        self.assertEqual(chat.await_args_list[0].kwargs["tool_choice"], "required")
 
     async def test_non_owner_cannot_create_ignore_request_or_owner_dm(self):
         target_id = 1351879409832951893
@@ -233,7 +172,7 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         ))
         execute.assert_not_awaited()
 
-    async def test_unstructured_ban_with_verified_mention_uses_real_fallback_call(self):
+    async def test_unstructured_ban_never_fabricates_call_even_with_verified_mention(self):
         target_id = 1351879409832951893
         guild = SimpleNamespace(id=1)
         message = SimpleNamespace(
@@ -269,14 +208,10 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
                 tool_plan=_semantic_plan(message, "ban_user"),
             )
 
-        self.assertIn("успешно забанен", result)
-        self.assertTrue(state["tools_executed"])
-        execute.assert_awaited_once()
-        fallback_call = execute.await_args.args[2]
-        fallback_args = json.loads(fallback_call["function"]["arguments"])
-        self.assertEqual(fallback_call["function"]["name"], "ban_user")
-        self.assertEqual(fallback_args["user_id"], str(target_id))
-        self.assertEqual(fallback_args["reason"], "По распоряжению Пумбы")
+        self.assertIn("Никакая команда не запускалась", result)
+        self.assertFalse(state["tools_executed"])
+        execute.assert_not_awaited()
+        self.assertEqual(chat.await_count, 2)
 
     async def test_simulated_action_is_rejected_without_calling_model(self):
         message = SimpleNamespace(
@@ -304,7 +239,7 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         chat.assert_not_awaited()
         execute.assert_not_awaited()
 
-    async def test_json_tool_envelope_from_provider_is_executed(self):
+    async def test_json_tool_envelope_in_content_is_not_executed(self):
         response = {
             "role": "assistant",
             "content": (
@@ -328,8 +263,8 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
                 tool_plan=_semantic_plan(message, "kick_user"),
             )
 
-        self.assertEqual(result, "JuniperBot кикнут с сервера.")
-        execute.assert_awaited_once()
+        self.assertIn("Никакая команда не запускалась", result)
+        execute.assert_not_awaited()
 
     async def test_malformed_native_tool_call_is_safely_rejected(self):
         response = {
@@ -351,10 +286,10 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
                 tool_plan=_semantic_plan(message, "kick_user"),
             )
 
-        self.assertIn("управляющий контур", result)
+        self.assertIn("Никакая команда не запускалась", result)
         execute.assert_not_awaited()
 
-    async def test_textual_tool_call_from_provider_is_executed(self):
+    async def test_textual_tool_call_in_content_is_not_executed(self):
         response = {
             "role": "assistant",
             "content": (
@@ -381,16 +316,11 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
                 tool_plan=_semantic_plan(message, "kick_user"),
             )
 
-        self.assertEqual(result, "JuniperBot кикнут с сервера.")
-        self.assertTrue(state["tools_executed"])
-        call = execute.await_args.args[2]
-        self.assertEqual(call["function"]["name"], "kick_user")
-        self.assertEqual(
-            json.loads(call["function"]["arguments"])["user_id"],
-            "1351879409832951893",
-        )
+        self.assertIn("Никакая команда не запускалась", result)
+        self.assertFalse(state["tools_executed"])
+        execute.assert_not_awaited()
 
-    async def test_reported_kick_phrase_executes_assigned_provider_call(self):
+    async def test_assigned_pseudocode_in_content_is_not_executed(self):
         target_id = 1351879409832951893
         response = {
             "role": "assistant",
@@ -413,10 +343,8 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
                 tool_plan=_semantic_plan(message, "kick_user"),
             )
 
-        self.assertIn("кикнут с сервера", result)
-        execute.assert_awaited_once()
-        call = execute.await_args.args[2]
-        self.assertEqual(call["function"]["name"], "kick_user")
+        self.assertIn("Никакая команда не запускалась", result)
+        execute.assert_not_awaited()
 
 
 class PlainReplyTests(unittest.IsolatedAsyncioTestCase):

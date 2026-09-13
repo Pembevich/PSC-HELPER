@@ -8,9 +8,10 @@ import asyncio
 import re
 import subprocess
 import time
+from functools import partial
 from math import isfinite, sqrt
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import imageio_ffmpeg
 
@@ -618,6 +619,26 @@ def _build_gif_from_video(
     raise RuntimeError("FFmpeg не смог безопасно обработать видео.") from last_error
 
 
+async def _run_gif_worker(function: Callable[..., None], *args: Any, **kwargs: Any) -> None:
+    worker = asyncio.get_running_loop().run_in_executor(None, partial(function, *args, **kwargs))
+    try:
+        await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # Cancelling an await cannot stop a running thread or its FFmpeg child.
+        # Keep the semaphore and input files until the encoder really finishes,
+        # including if shutdown sends another cancellation while we drain it.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not worker.cancelled():
+            worker.exception()
+        raise
+
+
 async def generate_gif_from_attachments(
     attachments: list[discord.Attachment],
     *,
@@ -695,7 +716,7 @@ async def generate_gif_from_attachments(
 
             output_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}.gif")
             if video_files:
-                await asyncio.to_thread(
+                await _run_gif_worker(
                     _build_gif_from_video,
                     video_files[0],
                     output_path,
@@ -704,7 +725,7 @@ async def generate_gif_from_attachments(
                     max_output_bytes=output_limit,
                 )
             elif image_files:
-                await asyncio.to_thread(
+                await _run_gif_worker(
                     _build_gif_from_images,
                     image_files,
                     output_path,
@@ -721,6 +742,6 @@ async def generate_gif_from_attachments(
                     f"Готовый GIF превышает {output_limit / (1024 * 1024):.1f} МБ."
                 )
             return output_path, temp_dir
-    except Exception:
+    except BaseException:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise

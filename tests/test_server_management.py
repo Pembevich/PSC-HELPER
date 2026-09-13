@@ -458,7 +458,7 @@ class ToolExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
         persist.assert_awaited_once()
         creator.assert_not_awaited()
 
-    async def test_owner_ban_uses_mentioned_target_and_code_level_reason(self):
+    async def test_owner_ban_fills_omitted_mention_target_and_code_level_reason(self):
         target_id = 1351879409832951893
         guild = SimpleNamespace(id=1, name="Test")
         message = SimpleNamespace(
@@ -501,7 +501,7 @@ class ToolExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
                     "function": {
                         "name": "ban_user",
                         "arguments": json.dumps(
-                            {"user_id": "111111111111111111"}
+                            {}
                         ),
                     },
                 },

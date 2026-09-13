@@ -1,3 +1,4 @@
+import asyncio
 import json
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -544,6 +545,205 @@ class ChatProviderRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(retry_visuals), 4)
 
 
+class ProviderRoutingRegressionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.providers = []
+        self.http = AsyncMock()
+        self.success = (
+            200,
+            {},
+            json.dumps({"choices": [{"message": {"content": "Ответ получен."}}]}),
+        )
+        for name, value in (
+            ("_AI_PROVIDER_POOL", self.providers),
+            ("_provider_cursor", 0),
+            ("_provider_backoff_until", {}),
+            ("_ai_backoff_until", 0.0),
+            ("_ai_backoff_reason", ""),
+            ("_provider_lock", asyncio.Lock()),
+            ("_AI_REQUEST_SEMAPHORE", asyncio.Semaphore(2)),
+            ("_post_ai_payload", self.http),
+        ):
+            self.enterContext(patch.object(ai_client, name, value))
+        self.enterContext(patch.object(ai_client.aiohttp, "TCPConnector"))
+        self.enterContext(
+            patch.object(
+                ai_client.aiohttp,
+                "ClientSession",
+                return_value=_SequenceSession([]),
+            )
+        )
+
+    def _pool(self, *kinds):
+        self.providers.extend(
+            {
+                "name": f"route-{index}",
+                "provider": kind,
+                "api_url": f"https://route-{index}.example.com/v1/chat/completions",
+                "model": "test-model",
+                "api_key": "test-key",
+            }
+            for index, kind in enumerate(kinds)
+        )
+
+    async def _chat(self, *, vision=False):
+        content = (
+            [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]
+            if vision
+            else "Привет"
+        )
+        return await ai_client.pos_chat_completion([{"role": "user", "content": content}])
+
+    def _requested_urls(self):
+        return [call.args[1] for call in self.http.await_args_list]
+
+    async def test_timeout_tries_healthy_lower_priority_provider(self):
+        self._pool("gemini", "github_models")
+        self.http.side_effect = [asyncio.TimeoutError(), self.success]
+
+        result = await self._chat()
+
+        self.assertEqual(result["content"], "Ответ получен.")
+        self.assertEqual(
+            self._requested_urls(), [provider["api_url"] for provider in self.providers]
+        )
+
+    async def test_request_specific_errors_try_each_route_once(self):
+        self._pool("gemini", "gemini", "github_models")
+        for status in (400, 413, 422):
+            with self.subTest(status=status):
+                ai_client._provider_cursor = 0
+                self.http.reset_mock()
+                self.http.side_effect = [(status, {}, "{}"), (status, {}, "{}"), self.success]
+
+                result = await self._chat()
+
+                self.assertEqual(result["content"], "Ответ получен.")
+                self.assertEqual(
+                    self._requested_urls(),
+                    [provider["api_url"] for provider in self.providers],
+                )
+                self.assertEqual(ai_client._provider_backoff_until, {})
+
+    async def test_failed_request_does_not_disable_routes_for_next_message(self):
+        self._pool("gemini", "github_models")
+        self.http.side_effect = [(400, {}, "{}"), (400, {}, "{}"), self.success]
+
+        self.assertIsNone(await self._chat())
+        self.assertFalse(ai_client.ai_is_temporarily_unavailable())
+        result = await self._chat()
+
+        self.assertEqual(result["content"], "Ответ получен.")
+        self.assertEqual(
+            self._requested_urls(),
+            [self.providers[index]["api_url"] for index in (0, 1, 0)],
+        )
+
+    async def test_vision_failure_does_not_pause_healthy_text_provider(self):
+        self._pool("gemini", "github_models")
+        for status in (429, 503):
+            with self.subTest(status=status):
+                ai_client._provider_backoff_until.clear()
+                ai_client._provider_cursor = 0
+                ai_client._ai_backoff_until = 0.0
+                self.http.reset_mock()
+                self.http.side_effect = [(status, {"Retry-After": "60"}, "{}"), self.success]
+
+                self.assertIsNone(await self._chat(vision=True))
+                self.assertFalse(ai_client.ai_is_temporarily_unavailable())
+                result = await self._chat()
+
+                self.assertEqual(result["content"], "Ответ получен.")
+                self.assertEqual(
+                    self._requested_urls(),
+                    [provider["api_url"] for provider in self.providers],
+                )
+
+    async def test_unavailable_vision_routes_leave_text_available(self):
+        self._pool("gemini", "github_models")
+        ai_client._provider_backoff_until[0] = ai_client.time.monotonic() + 60
+        self.http.return_value = self.success
+
+        self.assertIsNone(await self._chat(vision=True))
+        self.http.assert_not_awaited()
+        self.assertFalse(ai_client.ai_is_temporarily_unavailable())
+        result = await self._chat()
+
+        self.assertEqual(result["content"], "Ответ получен.")
+        self.assertEqual(self._requested_urls(), [self.providers[1]["api_url"]])
+
+    async def test_global_pause_requires_every_provider_to_be_limited(self):
+        self._pool("gemini", "github_models")
+        self.http.side_effect = [(429, {"Retry-After": "60"}, "{}")] * 2
+
+        self.assertIsNone(await self._chat())
+        self.assertTrue(ai_client.ai_is_temporarily_unavailable())
+        self.assertEqual(self.http.await_count, 2)
+        self.assertIsNone(await self._chat())
+        self.assertEqual(self.http.await_count, 2)
+
+    async def test_vision_failure_never_sends_images_to_text_only_route(self):
+        self._pool("gemini", "github_models")
+        self.http.return_value = (400, {}, "{}")
+
+        self.assertIsNone(await self._chat(vision=True))
+
+        self.assertEqual(self._requested_urls(), [self.providers[0]["api_url"]])
+        self.assertFalse(ai_client.ai_is_temporarily_unavailable())
+
+
+class ToolConversationContractTests(unittest.IsolatedAsyncioTestCase):
+    def test_native_gemini_signature_survives_response_conversion(self):
+        for field in ("thoughtSignature", "thought_signature"):
+            with self.subTest(field=field):
+                response = ai_client._extract_message_from_payload({
+                    "candidates": [{"content": {"role": "model", "parts": [{
+                        "functionCall": {"name": "read_messages", "args": {"limit": "2"}},
+                        field: "opaque-provider-signature",
+                    }]}}],
+                })
+
+                call = response["tool_calls"][0]
+                self.assertEqual(call["extra_content"]["google"]["thought_signature"], "opaque-provider-signature")
+                self.assertEqual(json.loads(call["function"]["arguments"]), {"limit": "2"})
+
+    async def test_413_compaction_preserves_current_tool_calls_and_observations(self):
+        signature = {"google": {"thought_signature": "opaque-provider-signature"}}
+        call = {
+            "id": "step-0", "type": "function", "extra_content": signature,
+            "function": {"name": "read_messages", "arguments": '{"limit":"2"}'},
+        }
+        current_turn = [
+            {"role": "user", "content": "Найди нужное сообщение и удали его."},
+            {"role": "assistant", "content": None, "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "step-0", "content": '{"message_id":"123456789012345678"}'},
+        ]
+        messages = [
+            {"role": "system", "content": "Проверяй результат каждого вызова."},
+            *[{"role": "user", "content": f"Предыдущая реплика {index}"} for index in range(40)],
+            *current_turn,
+        ]
+        provider = {"name": "gemini", "provider": "gemini", "api_url": "https://api.example.com/v1/chat/completions", "model": "test-model", "api_key": "test-key"}
+        session = _SequenceSession([
+            _RawResponse(413, "request entity too large"),
+            _RawResponse(200, json.dumps({"choices": [{"message": {"content": "Цель проверена."}}]})),
+        ])
+        with (
+            patch.object(ai_client, "_AI_PROVIDER_POOL", [provider]),
+            patch.object(ai_client, "_ai_backoff_until", 0.0),
+            patch.object(ai_client, "_provider_backoff_until", {}),
+            patch.object(ai_client.aiohttp, "ClientSession", return_value=session),
+            patch.object(ai_client.aiohttp, "TCPConnector"),
+        ):
+            result = await ai_client.pos_chat_completion(messages)
+
+        self.assertEqual(result["content"], "Цель проверена.")
+        self.assertEqual(len(session.posts), 2)
+        retry_messages = session.posts[1][1]["json"]["messages"]
+        self.assertLess(len(retry_messages), len(messages))
+        self.assertEqual(retry_messages[-3:], current_turn)
+
+
 class GeminiMediaRequestTests(unittest.IsolatedAsyncioTestCase):
     async def test_grounded_search_uses_native_tool_and_header_key(self):
         provider = {
@@ -664,7 +864,7 @@ class GeminiMediaRequestTests(unittest.IsolatedAsyncioTestCase):
             result = await ai_client.pos_chat_completion(messages)
 
         self.assertEqual(result["content"], "Фото.")
-        reserve_exact.assert_awaited_once_with("gemini")
+        reserve_exact.assert_awaited_once_with("gemini", exclude_indices=frozenset())
         reserve_regular.assert_not_awaited()
         self.assertEqual(session.posts[0][0], providers[1]["api_url"])
 

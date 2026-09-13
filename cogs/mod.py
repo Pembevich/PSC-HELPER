@@ -101,7 +101,34 @@ class ModerationCog(commands.Cog):
         finally:
             finish_moderation(message.id, blocked)
 
-    async def _moderate_message(self, message: discord.Message) -> bool:
+    @commands.Cog.listener()
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
+        if not payload.guild_id or not {"content", "attachments"}.intersection(payload.data):
+            return
+        # discord.py >= 2.5 supplies the updated Message even outside its cache.
+        # Use only this raw listener, so cached edits are not checked twice.
+        message = getattr(payload, "message", None)
+        if message is None or message.author.bot:
+            return
+        before = payload.cached_message
+        if before is not None:
+            before_attachments = [(att.id, att.filename, att.content_type) for att in before.attachments]
+            after_attachments = [(att.id, att.filename, att.content_type) for att in message.attachments]
+            if before.content == message.content and before_attachments == after_attachments:
+                return
+        try:
+            # An edit has its own content check; the original send's cached
+            # gate verdict is not applicable and this is not another flood event.
+            await self._moderate_message(message, check_behavior=False)
+        except Exception:
+            logger.exception("Ошибка модерации изменения сообщения %s", message.id)
+
+    async def _moderate_message(
+        self,
+        message: discord.Message,
+        *,
+        check_behavior: bool = True,
+    ) -> bool:
         guild = message.guild
         if guild is None:
             return False
@@ -133,7 +160,7 @@ class ModerationCog(commands.Cog):
                 logger.error("Ошибка проверки ссылок: %s", exc, exc_info=True)
 
         if is_staff or functional_channel:
-            if settings.get("filter_nsfw", True) or settings.get("filter_ads", True):
+            if any(settings.get(key, True) for key in ("filter_scam", "filter_nsfw", "filter_ads")):
                 try:
                     attachment_reasons = await detect_attachment_violations(
                         message.attachments,
@@ -141,6 +168,7 @@ class ModerationCog(commands.Cog):
                         message.author.id,
                         check_nsfw=bool(settings.get("filter_nsfw", True)),
                         check_ads=bool(settings.get("filter_ads", True)),
+                        check_malware=bool(settings.get("filter_scam", True)),
                     )
                     deterministic, ai_only = _partition_attachment_findings(attachment_reasons)
                     if deterministic:
@@ -182,7 +210,7 @@ class ModerationCog(commands.Cog):
                 logger.error(f"Ошибка проверки упоминаний: {e}", exc_info=True)
 
         # 2. Cross-channel spam.
-        if settings.get("filter_crosschannel", True):
+        if check_behavior and settings.get("filter_crosschannel", True):
             try:
                 cross_reasons = detect_crosschannel_spam(
                     message,
@@ -205,11 +233,12 @@ class ModerationCog(commands.Cog):
                 logger.error(f"Ошибка проверки кросс-канального спама: {e}", exc_info=True)
 
         # 3. Duplicate spam / flood.
-        try:
-            if await handle_spam_if_needed(message, in_raid=in_raid):
-                return True
-        except Exception as e:
-            logger.error(f"Ошибка проверки на спам: {e}", exc_info=True)
+        if check_behavior:
+            try:
+                if await handle_spam_if_needed(message, in_raid=in_raid):
+                    return True
+            except Exception as e:
+                logger.error(f"Ошибка проверки на спам: {e}", exc_info=True)
 
         # 4. Content. AI-only findings are review signals, never sole punishment.
         try:
@@ -221,8 +250,9 @@ class ModerationCog(commands.Cog):
                     message.author.id,
                     check_nsfw=bool(settings.get("filter_nsfw", True)),
                     check_ads=bool(settings.get("filter_ads", True)),
+                    check_malware=bool(settings.get("filter_scam", True)),
                 )
-                if settings.get("filter_nsfw", True) or settings.get("filter_ads", True)
+                if any(settings.get(key, True) for key in ("filter_scam", "filter_nsfw", "filter_ads"))
                 else []
             )
             ai_reasons = []

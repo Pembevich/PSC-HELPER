@@ -240,6 +240,68 @@ class SecurityPostureStorageTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SecurityPostureQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_partial_outages_preserve_diffs_until_recovery_and_restart(self):
+        import json
+
+        baseline = _snapshot()
+        outage = copy.deepcopy(baseline)
+        outage["webhooks"] = {"available": False, "items": []}
+        outage["automod"] = {"available": False, "items": []}
+        outage["verification_level"] = 2
+        recovered = copy.deepcopy(outage)
+        recovered["webhooks"] = {
+            "available": True,
+            "items": [{"id": 88, "name": "new", "channel_id": 20}],
+        }
+        recovered["automod"] = {"available": True, "items": []}
+        stored = copy.deepcopy(baseline)
+
+        async def read_snapshot(_guild_id):
+            return json.loads(json.dumps(stored))
+
+        async def save_snapshot(_guild_id, snapshot):
+            nonlocal stored
+            stored = json.loads(json.dumps(snapshot))
+
+        guild = SimpleNamespace(id=42, name="Test")
+        add_event = AsyncMock()
+        with patch.dict(SecurityCog._check_security_posture.__globals__, {
+            "collect_security_snapshot": AsyncMock(side_effect=[outage, outage, recovered, recovered]),
+            "get_security_posture": read_snapshot,
+            "set_security_posture": save_snapshot,
+            "add_ai_event": add_event,
+            "send_log_embed": AsyncMock(),
+        }):
+            cog = SecurityCog(SimpleNamespace())
+            await cog._check_security_posture(guild, source="test")
+            self.assertFalse(stored["automod"]["available"])
+            self.assertEqual(stored["automod"]["last_successful_items"], baseline["automod"]["items"])
+            self.assertEqual(stored["verification_level"], 2)
+            await cog._check_security_posture(guild, source="test")
+            # A fresh cog has no in-memory knowledge of the old observations.
+            restarted = SecurityCog(SimpleNamespace())
+            await restarted._check_security_posture(guild, source="test")
+            await restarted._check_security_posture(guild, source="test")
+        titles = [
+            alert["title"]
+            for call in add_event.await_args_list
+            for alert in call.kwargs["details"]["alerts"]
+        ]
+        self.assertEqual(titles.count("Ослаблен уровень проверки участников"), 1)
+        self.assertEqual(titles.count("Создан новый webhook"), 1)
+        self.assertEqual(titles.count("Удалено правило Discord AutoMod"), 1)
+
+    async def test_recovery_without_changes_or_previous_observation_has_no_false_alerts(self):
+        baseline = _snapshot()
+        outage = copy.deepcopy(baseline)
+        outage["webhooks"] = {"available": False, "items": []}
+        outage["automod"] = {"available": False, "items": []}
+        retained = security_monitor.preserve_security_observations(baseline, outage)
+        self.assertEqual(security_monitor.diff_security_snapshots(retained, baseline), [])
+        first_outage = security_monitor.preserve_security_observations(None, outage)
+        self.assertNotIn("last_successful_items", first_outage["automod"])
+        self.assertEqual(security_monitor.diff_security_snapshots(first_outage, baseline), [])
+
     async def test_event_burst_is_coalesced_into_one_scan(self):
         cog = SecurityCog(SimpleNamespace())
         cog._check_security_posture = AsyncMock()

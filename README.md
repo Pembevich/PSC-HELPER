@@ -27,6 +27,7 @@ The project is free to self-host on Railway or other infrastructure; operators p
 
 - **Automated moderation** — canonical URL screening with Google Safe Browsing/VirusTotal support, attachment magic/archive checks, normalized spam detection, AI-assisted review, mass-mention protection, and persistent anti-raid state
 - **P.OS AI assistant** — responds to mentions and replies, keeps conversational context, understands images and representative GIF/video frames, and can transcribe supported audio/video through Gemini
+- **Multi-step tool use** — the model receives each tool result, can use it in the next call, and writes the final answer. Missing targets lead to clarification. Plain-text pseudo-commands and invented fallback calls never execute.
 - **Owner-gated tools** — factual server inspection plus bans, timeouts, roles, channels, settings, and cross-server actions; owner commands execute directly, third-party requests require approval
 - **Application workflows** — interactive forms for applications, reports, and staff review
 - **Continuous security posture** — an initial audit plus persisted baselines for Discord MFA, verification/media filters, privileged roles, channel overwrites, bot permissions, webhooks, and AutoMod rules, with owner alerts on dangerous changes
@@ -38,7 +39,9 @@ The project is free to self-host on Railway or other infrastructure; operators p
 
 High-privilege operations are **never delegated directly to the LLM**. The model may request actions through tool calls; `pos_ai.py` validates every argument against a closed schema, resolves targets to canonical Discord IDs, checks the current message's intent, permissions and role hierarchy, limits actions per turn, and protects the owner and bot before execution. Mutating requests do not expose channel history or visual payloads to the action-selection context.
 
-The only direct privileged operator is Pumba, identified by the immutable Discord user ID `968698192411652176`. This trust boundary cannot be expanded through an environment variable. Pumba's verified Discord actions execute immediately and return the factual API result. A state-changing request from anyone else is sent to Pumba's DM for explicit button approval and expires after 10 minutes. Process shutdown still requires Pumba's separate confirmation.
+The only direct privileged operator is Pumba, identified by the immutable Discord user ID `968698192411652176`. This trust boundary cannot be expanded through an environment variable. Pumba's verified Discord actions execute immediately; factual API results return to the model for the next step or final answer. A state-changing request from anyone else is sent to Pumba's DM for explicit button approval and expires after 10 minutes. Process shutdown still requires Pumba's separate confirmation.
+
+The actor-bound router selects available capabilities, not a mandatory execution checklist. An agent turn allows up to six model rounds and eight tool attempts, suppresses identical repeated calls, and keeps completed-action receipts if a later model call fails. Message operations use exact IDs or typed `reply`/`current` references; bulk deletion is bounded before the requesting message so newly arriving messages are preserved. An explicit user target is never overwritten with the author of a reply.
 
 AI moderation findings are advisory unless a deterministic signal or independently confirmed visual signal reaches the required confidence threshold. URL and file reputation also require corroborated verdicts before automatic punishment. This prevents a model response, one outlier scanner, or prompt-injected message from becoming an automatic punishment by itself.
 

@@ -16,7 +16,7 @@ from discord.ext import commands, tasks
 
 import antiraid
 from guild_config import get_settings as get_guild_settings
-from join_gate import begin_join_security, finish_join_security
+from join_gate import begin_join_security, finish_join_security, join_token_for_member
 from logging_utils import send_log_embed
 from moderation import quarantine_member
 from config import POS_CREATOR_ID, SECURITY_MONITOR_INTERVAL_SECONDS
@@ -24,6 +24,7 @@ from security_monitor import (
     assess_security_snapshot,
     collect_security_snapshot,
     diff_security_snapshots,
+    preserve_security_observations,
     security_snapshot_hash,
     summarize_security_snapshot,
 )
@@ -137,6 +138,7 @@ class SecurityCog(commands.Cog):
         async with self._posture_lock(guild.id):
             current = await collect_security_snapshot(guild)
             previous = await get_security_posture(guild.id)
+            current = preserve_security_observations(previous, current)
             current_hash = security_snapshot_hash(current)
             if previous is not None and security_snapshot_hash(previous) == current_hash:
                 return
@@ -378,14 +380,20 @@ class SecurityCog(commands.Cog):
             self._queue_security_posture_check(guild, "bot_join")
             return
 
-        begin_join_security(guild.id, member.id)
+        join_token = join_token_for_member(member)
+        begin_join_security(guild.id, member.id, join_token=join_token)
         suppress_roles = True
         try:
             suppress_roles = await self._process_member_join(member)
         except Exception as exc:
             logger.error("Необработанная ошибка антирейда для %s: %s", member.id, exc, exc_info=True)
         finally:
-            finish_join_security(guild.id, member.id, suppress_roles=suppress_roles)
+            finish_join_security(
+                guild.id,
+                member.id,
+                join_token=join_token,
+                suppress_roles=suppress_roles,
+            )
 
     async def _process_member_join(self, member: discord.Member) -> bool:
         guild = member.guild

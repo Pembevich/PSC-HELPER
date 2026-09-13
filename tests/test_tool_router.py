@@ -83,7 +83,7 @@ class SemanticToolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("create_role создаёт новую", prompt)
         self.assertIn("add_role только назначает", prompt)
         self.assertIn("без получателя означают create_role", prompt)
-        self.assertIn("не добавляй list/read-инструменты", prompt)
+        self.assertIn("необходимые read/list-инструменты", prompt)
 
     async def test_semantic_paraphrase_routes_kick_without_keyword_matching(self):
         message = _message("P.OS, этому роботу здесь больше не место, проводи его за дверь")
@@ -284,7 +284,7 @@ class SemanticToolRouterTests(unittest.IsolatedAsyncioTestCase):
         schemas = completion.await_args.kwargs["tools"]
         self.assertEqual(
             [schema["function"]["name"] for schema in schemas],
-            ["undo_recent_actions"],
+            ["undo_recent_actions", "ask_user"],
         )
 
     async def test_hypothetical_stays_chat(self):
@@ -407,7 +407,7 @@ class SemanticToolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("фактически исключён", result)
         execute.assert_awaited_once()
 
-    async def test_multi_action_plan_repairs_missing_call_before_execution(self):
+    async def test_multi_action_plan_continues_after_observing_first_result(self):
         target_id = 1351879409832951893
         message = _message(f"выкинь с сервера и забань <@{target_id}>")
         plan = ToolIntentPlan.for_tools(message, {"kick_user", "ban_user"})
@@ -429,7 +429,7 @@ class SemanticToolRouterTests(unittest.IsolatedAsyncioTestCase):
                 },
             }]
         }
-        chat = AsyncMock(side_effect=[kick_call, ban_call])
+        chat = AsyncMock(side_effect=[kick_call, ban_call, {"content": "Кик выполнен. Бан выполнен."}])
         execute = AsyncMock(side_effect=["Кик выполнен.", "Бан выполнен."])
         with patch("pos_ai.pos_chat_completion", new=chat), patch(
             "pos_ai.execute_pos_tool",
@@ -442,8 +442,10 @@ class SemanticToolRouterTests(unittest.IsolatedAsyncioTestCase):
                 tool_plan=plan,
             )
 
-        self.assertEqual(chat.await_count, 2)
+        self.assertEqual(chat.await_count, 3)
         self.assertEqual(execute.await_count, 2)
+        observations = [item["content"] for item in chat.await_args_list[1].args[0] if item["role"] == "tool"]
+        self.assertTrue(any("Кик выполнен" in item for item in observations))
         executed_names = [
             call.args[2]["function"]["name"]
             for call in execute.await_args_list

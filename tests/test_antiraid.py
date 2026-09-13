@@ -120,6 +120,24 @@ class EvaluateJoinTests(unittest.TestCase):
         self.assertTrue(last["raid"])
         self.assertEqual(last["action"], "kick")
 
+    def test_zero_minimum_age_disables_all_age_risk_during_raid(self):
+        settings = self._settings(min_account_age_hours=0, raid_action="quarantine")
+        antiraid.set_raid_mode(9, now=1000, cooldown=600)
+        for age_hours in (0.5, 24):
+            with self.subTest(age_hours=age_hours):
+                result = antiraid.evaluate_join(
+                    _member(100, age_hours=age_hours, guild_id=9), settings, now=1001,
+                )
+                self.assertFalse(result["fresh"])
+                self.assertEqual(result["risk_score"], 0)
+                self.assertEqual(result["signals"], [])
+                self.assertEqual(result["action"], "alert")
+
+    def test_disabling_age_check_keeps_other_risk_signals(self):
+        member = _member(100, age_hours=0.5, name="free nitro", guild_id=9)
+        self.assertEqual(antiraid.join_risk_score(member, 0), 4)
+        self.assertEqual(antiraid.join_risk_score(member, 72), 8)
+
     def test_raid_only_alerts_established_account(self):
         s = self._settings()
         # 3 свежих заводят счётчик, 4-й — старый чистый аккаунт пересекает порог

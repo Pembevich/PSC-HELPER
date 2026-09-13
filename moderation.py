@@ -96,7 +96,7 @@ DANGEROUS_ATTACHMENT_MIME_TYPES = {
     "application/vnd.microsoft.portable-executable",
     "application/x-bat",
 }
-MAX_URLS_PER_MESSAGE = 10
+MAX_URL_REPUTATION_CHECKS = 10
 CONTENT_HOST_DOMAINS = {
     "cdn.discordapp.com", "media.discordapp.net", "github.com",
     "raw.githubusercontent.com", "gist.github.com", "github.io",
@@ -250,12 +250,12 @@ def extract_urls(text: str) -> list[str]:
     seen: set[str] = set()
     for url in raw:
         url = url.rstrip(").,!?]>\"'")
-        normalized_key = url.lower()
+        # Paths and query values can be case-sensitive. Canonical host
+        # deduplication happens later, without discarding distinct resources.
+        normalized_key = url
         if url and normalized_key not in seen:
             cleaned.append(url)
             seen.add(normalized_key)
-        if len(cleaned) >= MAX_URLS_PER_MESSAGE:
-            break
     return cleaned
 
 
@@ -1174,110 +1174,109 @@ async def check_and_handle_urls(
     _trim_url_caches()  # #7: периодическая очистка кэшей
     suspicious: list[tuple[str, str]] = []
     borderline: list[dict] = []
+    reputation_candidates: dict[str, str] = {}
 
-    async with aiohttp.ClientSession() as session:
-        for url in urls:
-            parsed_url = _canonicalize_url(url)
-            if parsed_url is None:
-                continue
-            normalized_url = str(parsed_url["url"])
-            normalized_domain = str(parsed_url["domain"])
-            path_decoded = str(parsed_url["path"])
-            raw_signals = parsed_url.get("signals", [])
-            risk_signals = (
-                [str(value) for value in raw_signals]
-                if isinstance(raw_signals, list)
-                else []
+    # Check every URL locally before spending the bounded external budget.
+    # A harmless prefix must not hide a blacklisted eleventh link.
+    for url in urls:
+        parsed_url = _canonicalize_url(url)
+        if parsed_url is None:
+            continue
+        normalized_url = str(parsed_url["url"])
+        normalized_domain = str(parsed_url["domain"])
+        path_decoded = str(parsed_url["path"])
+        raw_signals = parsed_url.get("signals", [])
+        risk_signals = (
+            [str(value) for value in raw_signals]
+            if isinstance(raw_signals, list)
+            else []
+        )
+
+        hard_deception = [
+            signal for signal in risk_signals
+            if signal in {"control-or-bidi", "userinfo", "unsupported-scheme"}
+        ]
+        if check_scam and hard_deception:
+            suspicious.append((url, "deceptive-url:" + ",".join(hard_deception)))
+            continue
+
+        if not risk_signals and _is_trusted_media_cdn_url(normalized_domain, path_decoded):
+            continue
+
+        is_content_host = _domain_in(normalized_domain, CONTENT_HOST_DOMAINS)
+        needs_reputation_review = bool(risk_signals) or is_content_host
+        if _domain_matches_whitelist(normalized_domain) and not needs_reputation_review:
+            continue
+
+        if _domain_matches_blacklist(normalized_domain):
+            is_ad = _is_advertising_or_adult_url(normalized_domain, path_decoded)
+            if (is_ad and check_ads) or (not is_ad and check_scam):
+                suspicious.append((url, "local-domain/keyword"))
+            continue
+
+        path_keywords = _extract_path_keywords(path_decoded)
+        high_risk_path = any(marker in path_decoded for marker in HIGH_CONFIDENCE_PATH_MARKERS)
+        if check_scam and (high_risk_path or len(path_keywords) >= 2 or risk_signals):
+            borderline.append(
+                {
+                    "url": url,
+                    "domain": normalized_domain,
+                    "path_keywords": path_keywords,
+                    "path": path_decoded[:300],
+                    "high_risk_path": high_risk_path,
+                    "risk_signals": risk_signals,
+                }
             )
+        if check_scam:
+            reputation_candidates.setdefault(normalized_url, url)
 
-            hard_deception = [
-                signal for signal in risk_signals
-                if signal in {"control-or-bidi", "userinfo", "unsupported-scheme"}
-            ]
-            if check_scam and hard_deception:
-                suspicious.append((url, "deceptive-url:" + ",".join(hard_deception)))
-                continue
+    # A local violation already determines the action; external services are
+    # only needed for links whose status is still unknown.
+    if not suspicious and reputation_candidates:
+        async with aiohttp.ClientSession() as session:
+            for normalized_url, url in list(reputation_candidates.items())[:MAX_URL_REPUTATION_CHECKS]:
+                now = time.time()
+                gsb_bad: bool | None = None
+                if GOOGLE_SAFEBROWSING_KEY:
+                    gsb_cached = _gsb_cache.get(normalized_url)
+                    if gsb_cached and now < gsb_cached[1]:
+                        gsb_bad = gsb_cached[0]
+                    if gsb_bad is None:
+                        gsb_bad = await check_google_safe_browsing(session, normalized_url)
+                        if gsb_bad is not None:
+                            default_ttl = _VT_CACHE_TTL if gsb_bad else _GSB_SAFE_CACHE_TTL
+                            cache_ttl = _gsb_cache_duration_hint.pop(
+                                normalized_url,
+                                default_ttl,
+                            )
+                            _gsb_cache[normalized_url] = (
+                                gsb_bad,
+                                now + max(1.0, min(cache_ttl, 24 * 60 * 60)),
+                            )
+                    if gsb_bad:
+                        suspicious.append((url, "GoogleSafeBrowsing"))
+                        continue
 
-            if not risk_signals and _is_trusted_media_cdn_url(normalized_domain, path_decoded):
-                continue
-
-            is_content_host = _domain_in(normalized_domain, CONTENT_HOST_DOMAINS)
-            needs_reputation_review = bool(risk_signals) or is_content_host
-            if _domain_matches_whitelist(normalized_domain) and not needs_reputation_review:
-                continue
-
-            if _domain_matches_blacklist(normalized_domain):
-                is_ad = _is_advertising_or_adult_url(normalized_domain, path_decoded)
-                if (is_ad and check_ads) or (not is_ad and check_scam):
-                    suspicious.append((url, "local-domain/keyword"))
-                continue
-
-            path_keywords = _extract_path_keywords(path_decoded)
-            high_risk_path = any(marker in path_decoded for marker in HIGH_CONFIDENCE_PATH_MARKERS)
-            if check_scam and (high_risk_path or len(path_keywords) >= 2):
-                borderline.append(
-                    {
-                        "url": url,
-                        "domain": normalized_domain,
-                        "path_keywords": path_keywords,
-                        "path": path_decoded[:300],
-                        "high_risk_path": high_risk_path,
-                        "risk_signals": risk_signals,
-                    }
-                )
-            elif check_scam and risk_signals:
-                borderline.append(
-                    {
-                        "url": url,
-                        "domain": normalized_domain,
-                        "path_keywords": path_keywords,
-                        "path": path_decoded[:300],
-                        "high_risk_path": False,
-                        "risk_signals": risk_signals,
-                    }
-                )
-
-            if not check_scam:
-                continue
-
-            now = time.time()
-            gsb_bad: bool | None = None
-            if GOOGLE_SAFEBROWSING_KEY:
-                gsb_cached = _gsb_cache.get(normalized_url)
-                if gsb_cached and now < gsb_cached[1]:
-                    gsb_bad = gsb_cached[0]
-                if gsb_bad is None:
-                    gsb_bad = await check_google_safe_browsing(session, normalized_url)
-                    if gsb_bad is not None:
-                        default_ttl = _VT_CACHE_TTL if gsb_bad else _GSB_SAFE_CACHE_TTL
-                        cache_ttl = _gsb_cache_duration_hint.pop(
-                            normalized_url,
-                            default_ttl,
-                        )
-                        _gsb_cache[normalized_url] = (
-                            gsb_bad,
-                            now + max(1.0, min(cache_ttl, 24 * 60 * 60)),
-                        )
-                if gsb_bad:
-                    suspicious.append((url, "GoogleSafeBrowsing"))
+                cached = _vt_cache.get(normalized_url)
+                if cached and (now - cached[1]) < _VT_CACHE_TTL:
+                    if cached[0]:
+                        suspicious.append((url, "vt-cache"))
                     continue
 
-            cached = _vt_cache.get(normalized_url)
-            if cached and (now - cached[1]) < _VT_CACHE_TTL:
-                if cached[0]:
-                    suspicious.append((url, "vt-cache"))
-                continue
+                try:
+                    vt_bad = await check_virustotal(session, normalized_url)
+                    if vt_bad is not None:
+                        _vt_cache[normalized_url] = (vt_bad, now)
+                    if vt_bad:
+                        suspicious.append((url, "VirusTotal"))
+                except Exception as exc:
+                    logger.error(f"VirusTotal check error: {exc}")
 
-            try:
-                vt_bad = await check_virustotal(session, normalized_url)
-                if vt_bad is not None:
-                    _vt_cache[normalized_url] = (vt_bad, now)
-                if vt_bad:
-                    suspicious.append((url, "VirusTotal"))
-            except Exception as exc:
-                logger.error(f"VirusTotal check error: {exc}")
-
-    ai_suspicious = await _classify_urls_with_ai(borderline) if check_scam else []
+    ai_suspicious = (
+        await _classify_urls_with_ai(borderline[:MAX_URL_REPUTATION_CHECKS])
+        if check_scam and not suspicious
+        else []
+    )
 
     if not suspicious:
         if ai_suspicious:
@@ -1753,10 +1752,15 @@ async def detect_attachment_violations(
     *,
     check_nsfw: bool = True,
     check_ads: bool = True,
+    check_malware: bool = True,
 ):
     attachment_list = list(attachments)
-    dangerous_file_reasons = _detect_dangerous_attachment_files(attachment_list)
-    dangerous_content_reasons = await _detect_dangerous_attachment_content(attachment_list)
+    dangerous_file_reasons = (
+        _detect_dangerous_attachment_files(attachment_list) if check_malware else []
+    )
+    dangerous_content_reasons = (
+        await _detect_dangerous_attachment_content(attachment_list) if check_malware else []
+    )
     metadata_flags = _detect_attachment_metadata_flags(
         attachment_list,
         check_nsfw=check_nsfw,

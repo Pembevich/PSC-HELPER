@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
+import tempfile
 
 import discord
 from discord import Embed, Color
 from discord.ui import View, button, Modal, TextInput
 
-from logging_utils import send_log_embed
+from logging_utils import get_log_channel, send_log_embed
 from storage import claim_form_decision
 from utils import safe_send_dm
 
@@ -89,6 +91,76 @@ async def _disable_view_on_message(interaction: discord.Interaction, view: View)
             await interaction.message.edit(view=view)
     except Exception:
         pass
+
+
+async def _archive_complaint(
+    guild: discord.Guild,
+    channel: discord.TextChannel | discord.Thread,
+) -> tuple[bool, str]:
+    """Preserve all messages and evidence before a complaint channel is deleted."""
+    archive = get_log_channel(guild, "forms")
+    if (
+        not isinstance(archive, discord.TextChannel)
+        or archive.id == channel.id
+        or archive.permissions_for(guild.default_role).view_channel
+    ):
+        return False, ""
+    # A closed @everyone overwrite alone is insufficient: an ordinary role or
+    # an explicit member overwrite can still expose a private complaint.
+    readers: list[discord.Role | discord.Member] = list(guild.roles)
+    readers.extend(principal for principal in archive.overwrites if isinstance(principal, discord.Member))
+    if any(
+        archive.permissions_for(principal).view_channel
+        and not channel.permissions_for(principal).view_channel
+        for principal in readers
+    ):
+        return False, ""
+    preview = ""
+    upload_limit = max(1, int(guild.filesize_limit) - 64 * 1024)
+    try:
+        with tempfile.TemporaryFile(mode="w+b") as transcript:
+            transcript.write(f"Полная история жалобы #{channel.name} (ID: {channel.id})\n\n".encode("utf-8"))
+            async for message in channel.history(limit=None, oldest_first=True):
+                body = f"[{message.created_at.isoformat()}] {message.author} (ID: {message.author.id})\n{message.content or ''}\n"
+                for embed in message.embeds:
+                    body += json.dumps(embed.to_dict(), ensure_ascii=False, indent=2) + "\n"
+                preview = (preview + body)[:1900]
+                transcript.write(body.encode("utf-8"))
+                for attachment in message.attachments:
+                    if attachment.size > upload_limit:
+                        raise ValueError("complaint evidence exceeds archive upload limit")
+                    evidence = await attachment.to_file(use_cached=True)
+                    try:
+                        saved = await archive.send(
+                            content=f"Доказательство из жалобы `{channel.id}`, сообщение `{message.id}`.",
+                            file=evidence,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    finally:
+                        evidence.close()
+                    transcript.write(
+                        (
+                            f"Вложение: {attachment.filename} ({attachment.size} байт)\n"
+                            f"Оригинал: {attachment.url}\nКопия в архиве: {saved.jump_url}\n"
+                        ).encode("utf-8")
+                    )
+                transcript.write(b"\n")
+                if transcript.tell() > upload_limit:
+                    raise ValueError("complaint transcript exceeds archive upload limit")
+            transcript.seek(0)
+            file = discord.File(transcript, filename=f"complaint-{channel.id}.txt")
+            try:
+                await archive.send(
+                    content=f"Полный архив жалобы `{channel.id}` перед закрытием.",
+                    file=file,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            finally:
+                file.close()
+        return True, preview or "(нет истории)"
+    except Exception:
+        logger.exception("Не удалось архивировать жалобу %s; исходный канал сохранён.", channel.id)
+        return False, ""
 
 
 class ConfirmView(View):
@@ -411,6 +483,11 @@ class RejectModal(Modal):
         if guild is None:
             await interaction.followup.send("Сервер недоступен; жалоба не изменена.", ephemeral=True)
             return
+        if not isinstance(interaction.user, discord.Member) or not (
+            interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild
+        ):
+            await interaction.followup.send("Недостаточно прав для решения по жалобе.", ephemeral=True)
+            return
         complaint_channel = guild.get_channel(self.complaint_channel_id)
         if not isinstance(complaint_channel, (discord.TextChannel, discord.Thread)):
             await interaction.followup.send(
@@ -418,21 +495,19 @@ class RejectModal(Modal):
                 ephemeral=True,
             )
             return
+        archived, history_text = await _archive_complaint(guild, complaint_channel)
+        if not archived:
+            await interaction.followup.send(
+                "Не удалось сохранить полный архив в приватном канале логов. Жалоба и доказательства сохранены; попробуйте ещё раз после восстановления архива.",
+                ephemeral=True,
+            )
+            return
         if not await _claim_message_id(self.source_message_id):
             await interaction.followup.send("Эта жалоба уже обработана.", ephemeral=True)
             return
-        try:
-            history = []
-            async for m in complaint_channel.history(limit=200, oldest_first=True):
-                history.append(f"{m.author.display_name}: {m.content}")
-            history_text = "\n".join(history) if history else "(нет истории)"
-        except Exception:
-            history_text = "(не удалось получить историю)"
-
         if self.submitter:
-            embed = Embed(title="❌ Ваша жалоба отклонена", color=Color.red())
+            embed = Embed(title="❌ Ваша жалоба отклонена", description=history_text, color=Color.red())
             embed.add_field(name="Причина", value=reason_text, inline=False)
-            embed.add_field(name="История жалобы", value=f"```{history_text[:1900]}```", inline=False)
             dm_sent = await safe_send_dm(self.submitter, embed)
         else:
             dm_sent = False
@@ -514,7 +589,6 @@ class ComplaintView(View):
             return
         submitter = await self._resolve_submitter(interaction)
         channel_id = self._resolve_channel_id(interaction)
-        history = []
         channel = guild.get_channel(channel_id)
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             await interaction.followup.send(
@@ -522,20 +596,19 @@ class ComplaintView(View):
                 ephemeral=True,
             )
             return
+        archived, history_text = await _archive_complaint(guild, channel)
+        if not archived:
+            await interaction.followup.send(
+                "Не удалось сохранить полный архив в приватном канале логов. Жалоба и доказательства сохранены; попробуйте ещё раз после восстановления архива.",
+                ephemeral=True,
+            )
+            return
         if not await _claim_message(interaction.message):
             await interaction.followup.send("Эта жалоба уже обработана.", ephemeral=True)
             return
         await _disable_view_on_message(interaction, self)
-        try:
-            async for m in channel.history(limit=200, oldest_first=True):
-                history.append(f"{m.author.display_name}: {m.content}")
-        except Exception:
-            pass
-        history_text = "\n".join(history) if history else "(нет истории)"
-
         if submitter:
-            embed = Embed(title="✅ Ваша жалоба одобрена", color=Color.green())
-            embed.add_field(name="История жалобы", value=f"```{history_text[:1900]}```", inline=False)
+            embed = Embed(title="✅ Ваша жалоба одобрена", description=history_text, color=Color.green())
             dm_sent = await safe_send_dm(submitter, embed)
         else:
             dm_sent = False

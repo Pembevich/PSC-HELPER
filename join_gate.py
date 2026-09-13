@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime
+
+import discord
 
 
-_events: dict[tuple[int, int], asyncio.Event] = {}
-_results: dict[tuple[int, int], tuple[bool, float]] = {}
+_events: dict[tuple[int, int, str], asyncio.Event] = {}
+_results: dict[tuple[int, int, str], tuple[bool, float]] = {}
 _RESULT_TTL_SECONDS = 120.0
 _MAX_RESULTS = 5000
 
@@ -20,12 +23,28 @@ def _prune(now: float) -> None:
         _events.pop(key, None)
 
 
-def begin_join_security(guild_id: int, user_id: int) -> None:
-    _events.setdefault((guild_id, user_id), asyncio.Event())
+def join_token_for_member(member: discord.Member) -> str:
+    """Identify this join independently of listener scheduling order."""
+    joined_at = getattr(member, "joined_at", None)
+    if isinstance(joined_at, datetime):
+        return joined_at.isoformat()
+    # Both listeners receive the same Member for a gateway dispatch. This
+    # fallback also keeps incomplete Member objects from sharing an old result.
+    return f"member:{id(member)}"
 
 
-def finish_join_security(guild_id: int, user_id: int, *, suppress_roles: bool) -> None:
-    key = (guild_id, user_id)
+def begin_join_security(guild_id: int, user_id: int, *, join_token: str) -> None:
+    _events.setdefault((guild_id, user_id, join_token), asyncio.Event())
+
+
+def finish_join_security(
+    guild_id: int,
+    user_id: int,
+    *,
+    join_token: str,
+    suppress_roles: bool,
+) -> None:
+    key = (guild_id, user_id, join_token)
     now = time.monotonic()
     _results[key] = (bool(suppress_roles), now)
     event = _events.pop(key, None)
@@ -38,13 +57,16 @@ async def wait_for_join_security(
     guild_id: int,
     user_id: int,
     *,
+    join_token: str,
     timeout: float = 15.0,
 ) -> bool | None:
     """Return whether welcome/roles must be suppressed, or None on timeout."""
-    key = (guild_id, user_id)
+    key = (guild_id, user_id, join_token)
     cached = _results.get(key)
     if cached is not None:
-        return cached[0]
+        if time.monotonic() - cached[1] <= _RESULT_TTL_SECONDS:
+            return cached[0]
+        _results.pop(key, None)
 
     event = _events.setdefault(key, asyncio.Event())
     try:

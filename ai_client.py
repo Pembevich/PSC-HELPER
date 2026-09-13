@@ -209,7 +209,8 @@ def _provider_cooldown_remaining(index: int) -> float:
 
 # 0.8: Gemini — приоритетный провайдер для ВСЕХ запросов (и чат P.OS, и
 # модерация). Остальные провайдеры из пула задействуются ТОЛЬКО когда все
-# Gemini-провайдеры на cooldown. Если явно запрошен provider_type — он имеет
+# Gemini-провайдеры недоступны или уже проверены в текущем запросе.
+# Если явно запрошен provider_type — он имеет
 # наивысший приоритет; иначе предпочитаем "gemini".
 PRIMARY_PROVIDER = "gemini"
 
@@ -243,7 +244,11 @@ def ai_provider_runtime_summary() -> str:
     return ", ".join(routes)
 
 
-def _pick_provider_index(provider_type: str | None = None) -> int | None:
+def _pick_provider_index(
+    provider_type: str | None = None,
+    *,
+    exclude_indices: frozenset[int] = frozenset(),
+) -> int | None:
     if not _AI_PROVIDER_POOL:
         return None
     total = len(_AI_PROVIDER_POOL)
@@ -263,29 +268,41 @@ def _pick_provider_index(provider_type: str | None = None) -> int | None:
     for wanted in preferred:
         for offset in range(total):
             idx = (start + offset) % total
-            if _provider_cooldown_remaining(idx) <= 0 and _AI_PROVIDER_POOL[idx]["provider"] == wanted:
+            if (
+                idx not in exclude_indices
+                and _provider_cooldown_remaining(idx) <= 0
+                and _AI_PROVIDER_POOL[idx]["provider"] == wanted
+            ):
                 return idx
 
     # Запасной тир: любой доступный (uncool) провайдер.
     for offset in range(total):
         idx = (start + offset) % total
-        if _provider_cooldown_remaining(idx) <= 0:
+        if idx not in exclude_indices and _provider_cooldown_remaining(idx) <= 0:
             return idx
 
     return None
 
 
-async def _reserve_provider_index(provider_type: str | None = None) -> int | None:
+async def _reserve_provider_index(
+    provider_type: str | None = None,
+    *,
+    exclude_indices: frozenset[int] = frozenset(),
+) -> int | None:
     """#14: Атомарно выбрать провайдера и сдвинуть курсор под локом."""
     global _provider_cursor
     async with _provider_lock:
-        idx = _pick_provider_index(provider_type)
+        idx = _pick_provider_index(provider_type, exclude_indices=exclude_indices)
         if idx is not None:
             _provider_cursor = (idx + 1) % len(_AI_PROVIDER_POOL)
         return idx
 
 
-async def _reserve_exact_provider_index(provider_type: str) -> int | None:
+async def _reserve_exact_provider_index(
+    provider_type: str,
+    *,
+    exclude_indices: frozenset[int] = frozenset(),
+) -> int | None:
     """Reserve only the requested provider kind.
 
     Native provider APIs are not wire-compatible with the OpenAI-compatible
@@ -301,7 +318,8 @@ async def _reserve_exact_provider_index(provider_type: str) -> int | None:
             idx = (start + offset) % total
             provider = _AI_PROVIDER_POOL[idx]
             if (
-                provider.get("provider") == provider_type
+                idx not in exclude_indices
+                and provider.get("provider") == provider_type
                 and provider.get("api_key")
                 and _provider_cooldown_remaining(idx) <= 0
             ):
@@ -323,6 +341,22 @@ def _set_ai_backoff(seconds: float, reason: str) -> None:
     cooldown = _bounded_float(seconds, 1.0, 1.0, 3600.0)
     _ai_backoff_until = max(_ai_backoff_until, time.monotonic() + cooldown)
     _ai_backoff_reason = reason
+
+
+def _set_pool_backoff_if_unavailable(seconds: float, reason: str) -> None:
+    """Pause all chat only when every authenticated route is cooling down.
+
+    Exhausting a capability subset, such as Gemini vision, must not block
+    healthy text providers. Request-local failures also do not disable routes
+    for unrelated messages.
+    """
+    remaining = [
+        _provider_cooldown_remaining(index)
+        for index, provider in enumerate(_AI_PROVIDER_POOL)
+        if provider.get("api_key")
+    ]
+    if remaining and all(cooldown > 0 for cooldown in remaining):
+        _set_ai_backoff(min(seconds, min(remaining)), reason)
 
 
 def _parse_retry_after(headers: Mapping[str, str]) -> float | None:
@@ -449,20 +483,24 @@ def _message_from_gemini_candidates(data: Mapping[str, Any]) -> dict[str, Any] |
         if not name:
             continue
         arguments = function_call.get("args", function_call.get("arguments", {}))
-        tool_calls.append(
-            {
-                "id": f"gemini-call-{index}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": (
-                        arguments
-                        if isinstance(arguments, str)
-                        else json.dumps(arguments, ensure_ascii=False)
-                    ),
-                },
-            }
-        )
+        tool_call: dict[str, Any] = {
+            "id": f"gemini-call-{index}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": (
+                    arguments
+                    if isinstance(arguments, str)
+                    else json.dumps(arguments, ensure_ascii=False)
+                ),
+            },
+        }
+        signature = part.get("thoughtSignature", part.get("thought_signature"))
+        if isinstance(signature, str) and signature:
+            # Gemini validates the signature again when the tool observation
+            # is returned through its OpenAI-compatible conversation format.
+            tool_call["extra_content"] = {"google": {"thought_signature": signature}}
+        tool_calls.append(tool_call)
     if not text_parts and not tool_calls:
         return None
     message: dict[str, Any] = {
@@ -901,7 +939,9 @@ async def pos_gemini_grounded_search(
         provider: dict[str, str] | None = None
         try:
             async with _request_slot(request_timeout):
-                provider_index = await _reserve_exact_provider_index("gemini")
+                provider_index = await _reserve_exact_provider_index(
+                    "gemini", exclude_indices=frozenset(attempted)
+                )
                 if provider_index is None or provider_index in attempted:
                     return None
                 attempted.add(provider_index)
@@ -1050,7 +1090,9 @@ async def pos_gemini_media_analysis(
         provider: dict[str, str] | None = None
         try:
             async with _request_slot(request_timeout):
-                provider_index = await _reserve_exact_provider_index("gemini")
+                provider_index = await _reserve_exact_provider_index(
+                    "gemini", exclude_indices=frozenset(attempted)
+                )
                 if provider_index is None or provider_index in attempted:
                     return None
                 attempted.add(provider_index)
@@ -1391,6 +1433,7 @@ async def pos_chat_completion(
     else:
         max_attempts = len(_AI_PROVIDER_POOL)
 
+    attempted: set[int] = set()
     for attempt in range(max_attempts):
         response_text = ""
         provider_index: int | None = None
@@ -1404,9 +1447,13 @@ async def pos_chat_completion(
                     return None
 
                 provider_index = (
-                    await _reserve_exact_provider_index("gemini")
+                    await _reserve_exact_provider_index(
+                        "gemini", exclude_indices=frozenset(attempted)
+                    )
                     if requires_vision
-                    else await _reserve_provider_index(provider_type)
+                    else await _reserve_provider_index(
+                        provider_type, exclude_indices=frozenset(attempted)
+                    )
                 )
                 if provider_index is None:
                     eligible_indices = [
@@ -1422,12 +1469,15 @@ async def pos_chat_completion(
                         ),
                         default=5.0,
                     )
-                    _set_ai_backoff(shortest, "all_providers_rate_limited")
+                    _set_pool_backoff_if_unavailable(
+                        shortest, "all_providers_rate_limited"
+                    )
                     _log_ai_backoff_once(
-                        f"P.OS AI provider pool cooldown: all providers limited, retry in {shortest:.0f}s."
+                        "P.OS AI request has no remaining compatible provider."
                     )
                     return None
 
+                attempted.add(provider_index)
                 provider = _AI_PROVIDER_POOL[provider_index]
 
                 accept_header = "application/vnd.github+json" if provider["provider"] == "github_models" else "application/json"
@@ -1511,7 +1561,9 @@ async def pos_chat_completion(
                         # сдвигался дважды и провайдеры пропускались).
                         if attempt < max_attempts - 1:
                             continue  # retry next provider
-                        _set_ai_backoff(min(retry_after, 30.0), "rate_limited")
+                        _set_pool_backoff_if_unavailable(
+                            min(retry_after, 30.0), "rate_limited"
+                        )
                         return None
 
                     if response_status >= 500:
@@ -1524,7 +1576,7 @@ async def pos_chat_completion(
                         )
                         if attempt < max_attempts - 1:
                             continue  # retry next provider
-                        _set_ai_backoff(5.0, "upstream_error")
+                        _set_pool_backoff_if_unavailable(5.0, "upstream_error")
                         return None
 
                     if 300 <= response_status < 400:

@@ -14,7 +14,7 @@ from config import (
     NEW_MEMBER_ROLE_IDS,
 )
 from guild_config import get_settings as get_guild_settings
-from join_gate import wait_for_join_security
+from join_gate import join_token_for_member, wait_for_join_security
 from logging_utils import send_log_embed, is_log_channel
 from pos_ai import forget_server_messages, remember_server_message
 from storage import add_ai_event, mark_ai_message_deleted, mark_ai_messages_deleted
@@ -625,7 +625,11 @@ class LoggingCog(commands.Cog):
         if member.bot:
             suppress_welcome_and_roles = True
         else:
-            gate_result = await wait_for_join_security(member.guild.id, member.id)
+            gate_result = await wait_for_join_security(
+                member.guild.id,
+                member.id,
+                join_token=join_token_for_member(member),
+            )
             suppress_welcome_and_roles = gate_result is not False
             if gate_result is None:
                 logger.error(

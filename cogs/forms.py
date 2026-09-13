@@ -283,10 +283,9 @@ class FormsCog(commands.Cog):
                 )
                 return
 
-            embed = Embed(title="📢 Новая жалоба", color=Color.blue())
-            embed.add_field(name="Отправитель", value=f"{message.author.mention} (ID: {message.author.id})", inline=False)
             full_text = "\n".join(lines)
-            embed.add_field(name="Жалоба", value=f"```{full_text[:1900]}```", inline=False)
+            embed = Embed(title="📢 Новая жалоба", description=full_text[:4096], color=Color.blue())
+            embed.add_field(name="Отправитель", value=f"{message.author.mention} (ID: {message.author.id})", inline=False)
             embed.set_footer(text=f"ID жалобы: {index} | {discord.utils.utcnow().strftime('%d.%m.%Y %H:%M:%S')}")
 
             try:

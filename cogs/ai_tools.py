@@ -158,10 +158,11 @@ POS_AI_TOOLS = [
         "type": "function",
         "function": {
             "name": "delete_messages",
-            "description": "Удаляет указанное количество последних сообщений в текущем канале.",
+            "description": "Массовая очистка: удаляет заданное количество сообщений ДО команды пользователя. Для одного конкретного сообщения, включая reply, используй manage_message(action=delete). Количество не угадывать.",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "channel_id_or_name": {"type": "string", "description": "Точный канал; по умолчанию канал запроса."},
                     "count": {
                         "type": "string",
                         "description": "Сколько последних сообщений удалить (от 1 до 100)."
@@ -1053,17 +1054,17 @@ POS_AI_TOOLS.extend([
         "type": "function",
         "function": {
             "name": "manage_message",
-            "description": "Редактирует собственное сообщение P.OS, удаляет, закрепляет, открепляет, публикует announcement или завершает poll по фактическому ID.",
+            "description": "Действие над ОДНИМ конкретным сообщением: удалить, редактировать собственное сообщение P.OS, закрепить, открепить, опубликовать announcement или завершить poll. Для 'удали это сообщение' в reply передай message_id=reply; без точной цели уточни её. Не заменяй действие чтением логов.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "description": "edit|delete|pin|unpin|publish|end_poll."},
+                    "action": {"type": "string", "enum": ["edit", "delete", "pin", "unpin", "publish", "end_poll"]},
                     "channel_id_or_name": {"type": "string", "description": "Точный канал сообщения."},
-                    "message_id": {"type": "string", "description": "Discord ID сообщения."},
-                    "text": {"type": "string", "description": "Новый текст для edit."},
+                    "message_id": {"type": "string", "description": "Точный Discord ID либо reply (сообщение, на которое ответил пользователь), current (сама текущая команда). Не угадывать ID."},
+                    "text": {"type": "string", "maxLength": 2000, "description": "Новый текст для edit."},
                     "reason": {"type": "string", "description": "Необязательно. Причина."},
                 },
-                "required": ["action", "channel_id_or_name", "message_id"],
+                "required": ["action", "message_id"],
             },
         },
     },
@@ -1075,13 +1076,13 @@ POS_AI_TOOLS.extend([
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "description": "add|remove_pos|clear|clear_all."},
+                    "action": {"type": "string", "enum": ["add", "remove_pos", "clear", "clear_all"]},
                     "channel_id_or_name": {"type": "string", "description": "Точный канал сообщения."},
-                    "message_id": {"type": "string", "description": "Discord ID сообщения."},
+                    "message_id": {"type": "string", "description": "Discord ID сообщения либо reply/current из метаданных текущего запроса."},
                     "emoji": {"type": "string", "description": "Unicode emoji или Discord custom emoji."},
                     "reason": {"type": "string", "description": "Необязательно. Причина."},
                 },
-                "required": ["action", "channel_id_or_name", "message_id"],
+                "required": ["action", "message_id"],
             },
         },
     },

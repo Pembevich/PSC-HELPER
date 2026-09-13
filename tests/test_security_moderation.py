@@ -250,6 +250,50 @@ class AiModerationSafetyTests(unittest.IsolatedAsyncioTestCase):
         moderation._ai_text_cache.clear()
         moderation._AI_TEXT_USER_LAST_CHECK.clear()
 
+    async def test_blacklisted_url_beyond_external_budget_is_still_blocked(self):
+        for prefix in ("https://youtube.com/watch?v=", "https://ordinary.example/item/"):
+            with self.subTest(prefix=prefix):
+                content = " ".join(f"{prefix}{index}" for index in range(15))
+                message = _msg(content + " https://discord-gift.com/")
+                message.delete = AsyncMock()
+                message.author.send = AsyncMock()
+                with (
+                    patch.object(moderation, "check_virustotal", AsyncMock()) as vt,
+                    patch.object(moderation, "check_google_safe_browsing", AsyncMock()) as gsb,
+                    patch.object(moderation, "_classify_urls_with_ai", AsyncMock()) as ai,
+                    patch.object(moderation, "log_violation_with_evidence", AsyncMock()),
+                ):
+                    self.assertTrue(await moderation.check_and_handle_urls(message))
+                    message.delete.assert_awaited_once()
+                    vt.assert_not_awaited()
+                    gsb.assert_not_awaited()
+                    ai.assert_not_awaited()
+
+    async def test_external_url_and_ai_review_budgets_remain_bounded(self):
+        urls = [f"https://ordinary.example/password-reset/{index}" for index in range(15)]
+        message = _msg(" ".join(urls + [urls[0]]))
+        with (
+            patch.object(moderation, "GOOGLE_SAFEBROWSING_KEY", "test-key"),
+            patch.object(moderation, "check_virustotal", AsyncMock(return_value=None)) as vt,
+            patch.object(moderation, "check_google_safe_browsing", AsyncMock(return_value=None)) as gsb,
+            patch.object(moderation, "_classify_urls_with_ai", AsyncMock(return_value=[])) as ai,
+        ):
+            self.assertFalse(await moderation.check_and_handle_urls(message))
+            self.assertEqual(vt.await_count, moderation.MAX_URL_REPUTATION_CHECKS)
+            self.assertEqual(gsb.await_count, moderation.MAX_URL_REPUTATION_CHECKS)
+            self.assertEqual(len(ai.await_args.args[0]), moderation.MAX_URL_REPUTATION_CHECKS)
+            self.assertEqual(len(moderation.extract_urls(message.content)), 15)
+
+    async def test_case_sensitive_url_paths_are_checked_separately(self):
+        urls = ["https://ordinary.example/A", "https://ordinary.example/a"]
+        with (
+            patch.object(moderation, "GOOGLE_SAFEBROWSING_KEY", None),
+            patch.object(moderation, "check_virustotal", AsyncMock(return_value=None)) as vt,
+            patch.object(moderation, "_classify_urls_with_ai", AsyncMock(return_value=[])),
+        ):
+            self.assertFalse(await moderation.check_and_handle_urls(_msg(" ".join(urls))))
+            self.assertEqual([call.args[1] for call in vt.await_args_list], urls)
+
     async def test_disguised_executable_after_first_four_attachments_is_inspected(self):
         class Attachment:
             def __init__(self, identifier, filename, content_type, data):

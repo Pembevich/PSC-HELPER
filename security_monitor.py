@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from datetime import datetime
 from typing import Any
 
@@ -262,6 +263,31 @@ def security_snapshot_hash(snapshot: dict[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _last_successful_items(section: dict[str, Any]) -> list[Any] | None:
+    items = section.get("items" if section.get("available") else "last_successful_items")
+    return items if isinstance(items, list) else None
+
+
+def preserve_security_observations(
+    previous: dict[str, Any] | None,
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep the last successful REST observations through partial outages.
+
+    ``available`` still describes the latest attempt. The retained items are
+    only a comparison baseline, never represented as a successful current scan.
+    """
+    merged = deepcopy(current)
+    for name in ("webhooks", "automod"):
+        section = _mapping(merged.get(name))
+        if section.get("available"):
+            continue
+        last_items = _last_successful_items(_mapping((previous or {}).get(name)))
+        if last_items is not None:
+            merged[name] = {**section, "last_successful_items": deepcopy(last_items)}
+    return merged
+
+
 def _index_by_id(items: object) -> dict[int, dict[str, Any]]:
     if not isinstance(items, list):
         return {}
@@ -502,8 +528,9 @@ def diff_security_snapshots(
 
     old_webhooks = _mapping(previous.get("webhooks"))
     new_webhooks = _mapping(current.get("webhooks"))
-    if old_webhooks.get("available") and new_webhooks.get("available"):
-        old_items = _index_by_id(old_webhooks.get("items"))
+    old_webhook_items = _last_successful_items(old_webhooks)
+    if old_webhook_items is not None and new_webhooks.get("available"):
+        old_items = _index_by_id(old_webhook_items)
         new_items = _index_by_id(new_webhooks.get("items"))
         for webhook_id in sorted(set(new_items) - set(old_items)):
             alerts.append({
@@ -526,9 +553,10 @@ def diff_security_snapshots(
 
     old_automod = _mapping(previous.get("automod"))
     new_automod = _mapping(current.get("automod"))
-    if old_automod.get("available") and new_automod.get("available"):
+    old_automod_items = _last_successful_items(old_automod)
+    if old_automod_items is not None and new_automod.get("available"):
         compare_rule_details = _enum_level(previous.get("schema", 1)) >= 3
-        old_items = _index_by_id(old_automod.get("items"))
+        old_items = _index_by_id(old_automod_items)
         new_items = _index_by_id(new_automod.get("items"))
         for rule_id, old_rule in old_items.items():
             if not old_rule.get("enabled"):

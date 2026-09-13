@@ -386,7 +386,11 @@ async def undo_exact_action(
                 pass
             return True, "бан снят"
         if operation == "ban_user":
-            await guild.ban(discord.Object(id=user_id), reason=str(args.get("reason") or reason)[:512])
+            await guild.ban(
+                discord.Object(id=user_id),
+                reason=str(args.get("reason") or reason)[:512],
+                delete_message_seconds=0,
+            )
             return True, "бан восстановлен"
         if operation == "restore_timeout_user":
             target = await _member(guild, user_id)
@@ -637,7 +641,7 @@ async def undo_recent_action_group(
     irreversible = 0
     for action in actions:
         label = action_labels.get(str(action.get("operation") or ""), "действие")
-        if action.get("undo_status") == "not_reversible":
+        if not action.get("inverse_operation"):
             irreversible += 1
             result = "у Discord нет безопасной автоматической обратной операции"
             await finish_pos_action_undo(action["id"], status="acknowledged", result=result)
