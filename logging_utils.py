@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Dict, List, TypedDict
+from weakref import WeakKeyDictionary, WeakValueDictionary
 
 import discord
 from discord import Embed, Color
@@ -86,6 +88,12 @@ LOG_CHANNEL_CONFIGS: List[LogChannelConfig] = [
 
 _LOG_CHANNEL_CACHE: Dict[int, Dict[str, int]] = {}
 _LOG_INIT_DONE: set[int] = set()
+# Keep one send in flight per destination, including discord.py's rate-limit
+# retries. Waiting senders retain their lock; finished channels retain no lock,
+# so visiting more channels over time cannot grow an idle-lock cache.
+_LOG_SEND_LOCKS: WeakKeyDictionary[
+    asyncio.AbstractEventLoop, WeakValueDictionary[int, asyncio.Lock]
+] = WeakKeyDictionary()
 LOG_TYPE_LABELS = {
     "moderation": "Модерация",
     "security": "Безопасность",
@@ -379,6 +387,19 @@ def _truncate_log_text(value: object, limit: int, fallback: str = "") -> str:
     return text[:max(0, limit)]
 
 
+def _log_send_lock(channel_id: int) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    locks = _LOG_SEND_LOCKS.get(loop)
+    if locks is None:
+        locks = WeakValueDictionary()
+        _LOG_SEND_LOCKS[loop] = locks
+    lock = locks.get(channel_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[channel_id] = lock
+    return lock
+
+
 def _build_log_embed(
     log_type: str,
     title: str,
@@ -480,14 +501,15 @@ async def send_log_embed(
     )
 
     try:
-        if files:
-            await channel.send(
-                embed=emb,
-                files=files[:10],
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        else:
-            await channel.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+        async with _log_send_lock(channel.id):
+            if files:
+                await channel.send(
+                    embed=emb,
+                    files=files[:10],
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            else:
+                await channel.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
         return True
     except Exception as exc:
         logger.warning(
