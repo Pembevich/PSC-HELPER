@@ -8,6 +8,7 @@ import discord
 from discord import Embed, Color
 from discord.ext import commands
 import logging
+import math
 
 from config import (
     FORM_CHANNEL_ID,
@@ -200,11 +201,14 @@ class FormsCog(commands.Cog):
             category = message.channel.category if isinstance(message.channel, discord.TextChannel) else None
             cooldown_key = (guild.id, message.author.id)
             now = time.monotonic()
-            last_submit = self._complaint_last_submit.get(cooldown_key, 0.0)
-            remaining = COMPLAINT_COOLDOWN_SECONDS - (now - last_submit)
+            last_submit = self._complaint_last_submit.get(cooldown_key)
+            remaining = (
+                COMPLAINT_COOLDOWN_SECONDS - (now - last_submit)
+                if last_submit is not None else 0.0
+            )
             if remaining > 0:
                 await message.reply(
-                    f"⏳ Новую жалобу можно отправить через {max(1, int(remaining // 60) + 1)} мин.",
+                    f"⏳ Новую жалобу можно отправить через {math.ceil(remaining / 60)} мин.",
                     mention_author=False,
                 )
                 return

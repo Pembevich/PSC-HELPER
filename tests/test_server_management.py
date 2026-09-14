@@ -514,7 +514,7 @@ class ToolExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prepared_args["reason"], "По распоряжению Пумбы")
 
     async def test_outsider_action_is_sent_to_owner_without_execution(self):
-        pos_ai._owner_approval_last_requested.clear()
+        clock = SimpleNamespace(now=0.0)
         guild = SimpleNamespace(id=1, name="Test")
         message = SimpleNamespace(
             guild=guild,
@@ -539,7 +539,9 @@ class ToolExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(pos_ai, "_prepare_mutating_tool_action", new=prepare), \
              patch.object(pos_ai, "_perform_tool_action", new=perform), \
              patch.object(pos_ai, "_get_creator_user", new=AsyncMock(return_value=owner)), \
-             patch("forms.PosActionConfirmView", return_value=view):
+             patch("forms.PosActionConfirmView", return_value=view), \
+             patch.object(pos_ai, "_owner_approval_last_requested", {}), \
+             patch.object(pos_ai, "time", SimpleNamespace(monotonic=lambda: clock.now)):
             result = await pos_ai.execute_pos_tool(
                 bot,
                 message,
@@ -547,15 +549,12 @@ class ToolExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
                 allowed_tool_names=frozenset({"kick_user"}),
             )
 
-        self.assertIn("отправлен Пумбе на подтверждение", result)
-        owner.send.assert_awaited_once()
-        view.bind_message.assert_called_once_with(owner_message)
-        perform.assert_not_awaited()
+            self.assertIn("отправлен Пумбе на подтверждение", result)
+            owner.send.assert_awaited_once()
+            view.bind_message.assert_called_once_with(owner_message)
+            perform.assert_not_awaited()
 
-        with patch.object(pos_ai, "_prepare_mutating_tool_action", new=prepare), \
-             patch.object(pos_ai, "_perform_tool_action", new=perform), \
-             patch.object(pos_ai, "_get_creator_user", new=AsyncMock(return_value=owner)), \
-             patch("forms.PosActionConfirmView", return_value=view):
+            clock.now = 29.0
             repeated = await pos_ai.execute_pos_tool(
                 bot,
                 message,
@@ -563,9 +562,20 @@ class ToolExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
                 allowed_tool_names=frozenset({"kick_user"}),
             )
 
-        self.assertIn("Предыдущий запрос", repeated)
-        owner.send.assert_awaited_once()
-        pos_ai._owner_approval_last_requested.clear()
+            self.assertIn("Предыдущий запрос", repeated)
+            owner.send.assert_awaited_once()
+            perform.assert_not_awaited()
+
+            clock.now = 30.0
+            after_expiry = await pos_ai.execute_pos_tool(
+                bot,
+                message,
+                self._kick_call(),
+                allowed_tool_names=frozenset({"kick_user"}),
+            )
+            self.assertIn("отправлен Пумбе на подтверждение", after_expiry)
+            self.assertEqual(owner.send.await_count, 2)
+            perform.assert_not_awaited()
 
     async def test_edit_role_can_grant_and_revoke_permissions(self):
         original_permissions = discord.Permissions.none()

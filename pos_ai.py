@@ -3909,10 +3909,10 @@ async def execute_pos_tool(
         if not is_owner:
             approval_key = (message.guild.id, message.author.id)
             now = time.monotonic()
+            last_requested = _owner_approval_last_requested.get(approval_key)
             remaining = (
-                _owner_approval_last_requested.get(approval_key, 0.0)
-                + _OWNER_APPROVAL_COOLDOWN_SECONDS
-                - now
+                last_requested + _OWNER_APPROVAL_COOLDOWN_SECONDS - now
+                if last_requested is not None else 0.0
             )
             if remaining > 0:
                 return (
@@ -4520,7 +4520,8 @@ async def _record_prompt_security_event(
         logger.warning("Не удалось сохранить событие prompt injection: %s", exc)
 
     now = time.monotonic()
-    if now - _prompt_security_log_at.get(message.guild.id, 0.0) < 60.0:
+    last_logged = _prompt_security_log_at.get(message.guild.id)
+    if last_logged is not None and now - last_logged < 60.0:
         return
     _prompt_security_log_at[message.guild.id] = now
     try:

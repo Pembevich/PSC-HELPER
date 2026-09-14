@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -25,12 +26,44 @@ with patch("storage.add_entry"), \
         _enforce_pos_identity_reply,
         _guard_model_output,
         _sanitize_prompt_injection_for_memory,
+        _record_prompt_security_event,
         _should_skip_message,
         _validate_tool_arguments,
     )
 
 
 class PromptInjectionGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_security_alert_is_not_suppressed_by_machine_uptime(self):
+        message = SimpleNamespace(
+            id=1, content="test payload", guild=SimpleNamespace(id=10),
+            author=SimpleNamespace(id=20, display_name="Guest", mention="<@20>"),
+            channel=SimpleNamespace(id=30),
+        )
+        clock = SimpleNamespace(now=0.0)
+        persist = AsyncMock()
+        mirror = AsyncMock()
+        with patch.dict(_record_prompt_security_event.__globals__, {
+            "add_ai_event": persist,
+            "_prompt_security_events_seen": set(),
+            "_prompt_security_log_at": {},
+            "time": SimpleNamespace(monotonic=lambda: clock.now),
+        }), patch("logging_utils.send_log_embed", mirror):
+            await _record_prompt_security_event(message, ["test signal"])
+            mirror.assert_awaited_once()
+            persist.assert_awaited_once()
+
+            message.id = 2
+            clock.now = 59.0
+            await _record_prompt_security_event(message, ["test signal"])
+            mirror.assert_awaited_once()
+            self.assertEqual(persist.await_count, 2)
+
+            message.id = 3
+            clock.now = 60.0
+            await _record_prompt_security_event(message, ["test signal"])
+            self.assertEqual(mirror.await_count, 2)
+            self.assertEqual(persist.await_count, 3)
+
     def test_identity_is_positive_and_implementation_neutral(self):
         identity = POS_IDENTITY_PROMPT.casefold()
 

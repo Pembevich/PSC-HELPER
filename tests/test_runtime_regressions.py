@@ -211,7 +211,7 @@ class GifCancellationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ComplaintArchiveTests(unittest.IsolatedAsyncioTestCase):
-    async def test_long_complaint_is_published_without_invalid_fields(self):
+    def _complaint_submission(self):
         target = MagicMock(spec=discord.TextChannel)
         target.id = 123
         target.send = AsyncMock()
@@ -227,17 +227,53 @@ class ComplaintArchiveTests(unittest.IsolatedAsyncioTestCase):
         message = types.SimpleNamespace(id=99, content=content, guild=guild, author=author, channel=source,
                                         attachments=[], delete=AsyncMock(), reply=AsyncMock())
         cog = FormsCog(types.SimpleNamespace())
+        return cog, message, target
+
+    async def test_long_complaint_is_published_without_invalid_fields(self):
+        cog, message, target = self._complaint_submission()
         # Extension-loading tests may replace cogs.forms in sys.modules after
         # collection; patch the globals of the class actually under test.
         with patch.dict(FormsCog.on_message.__globals__, {
             "wait_for_moderation": AsyncMock(return_value=False),
             "send_log_embed": AsyncMock(),
+            # A fresh Linux VM can have less uptime than the complaint cooldown.
+            "time": types.SimpleNamespace(monotonic=lambda: 100.0),
         }):
             await cog.on_message(message)
+        target.send.assert_awaited_once()
         embed = target.send.await_args.kwargs["embed"]
-        self.assertEqual(embed.description, content.strip())
+        self.assertEqual(embed.description, message.content.strip())
         self.assertTrue(all(len(field.value) <= 1024 for field in embed.fields))
         message.delete.assert_awaited_once()
+
+    async def test_complaint_submitted_at_zero_observes_cooldown_until_expiry(self):
+        cog, message, target = self._complaint_submission()
+        clock = types.SimpleNamespace(now=0.0)
+        with patch.dict(FormsCog.on_message.__globals__, {
+            "wait_for_moderation": AsyncMock(return_value=False),
+            "send_log_embed": AsyncMock(),
+            "time": types.SimpleNamespace(monotonic=lambda: clock.now),
+        }):
+            await cog.on_message(message)
+            target.send.assert_awaited_once()
+            message.reply.assert_not_awaited()
+
+            for now, remaining_minutes in ((0.0, 10), (540.0, 1), (599.0, 1)):
+                with self.subTest(now=now):
+                    clock.now = now
+                    message.reply.reset_mock()
+                    await cog.on_message(message)
+                    target.send.assert_awaited_once()
+                    message.guild.create_text_channel.assert_awaited_once()
+                    message.delete.assert_awaited_once()
+                    message.reply.assert_awaited_once()
+                    self.assertIn(f"через {remaining_minutes} мин.", message.reply.await_args.args[0])
+
+            clock.now = 600.0
+            await cog.on_message(message)
+            self.assertEqual(target.send.await_count, 2)
+            self.assertEqual(message.guild.create_text_channel.await_count, 2)
+            self.assertEqual(message.delete.await_count, 2)
 
     def _channel(self, messages):
         channel = MagicMock(spec=discord.TextChannel)
