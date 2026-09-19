@@ -483,12 +483,14 @@ class SemanticToolRouterTests(unittest.IsolatedAsyncioTestCase):
         expected = ToolIntentPlan.no_tools(message)
         planner = AsyncMock(return_value=expected)
 
-        with patch("pos_ai.plan_pos_tools", new=planner):
+        with patch("tool_router.plan_pos_tools", new=planner):
             _plan, context, trusted_context = await _plan_tool_intent_for_message(
                 message,
                 SimpleNamespace(user=bot_user),
                 ref_msg,
             )
+        planner.assert_not_awaited()
+        self.assertEqual(_plan.decision, "agent")
 
         self.assertIn("reply-target: Attacker", context)
         self.assertIn("POS-CONTEXT", context)

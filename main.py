@@ -47,6 +47,7 @@ COGS = [
     "cogs.security",
     "cogs.logging_events",
     "cogs.mod",
+    "cogs.automations",
     "cogs.telegram_bridge",
     "cogs.ai_chat",
 ]
@@ -88,6 +89,14 @@ async def run_bot() -> None:
             if shutdown_complete:
                 return
             logger.info("Получен запрос завершения работы P.OS.")
+
+            # Drain/cancel event chains while SQLite is still open, before the
+            # final backup captures their run outcomes. bot.close unloads the
+            # other cogs only after backup because it also closes Discord HTTP.
+            try:
+                await bot.remove_cog("AutomationsCog")
+            except Exception:
+                logger.exception("Не удалось остановить автоматизации перед резервным копированием.")
 
             if persist and persistent_state_trusted and db_initialized:
                 try:

@@ -1,3 +1,6 @@
+from automation_rules import AUTOMATION_TOOLS
+
+
 POS_AI_TOOLS = [
     {
         "type": "function",
@@ -1462,3 +1465,4 @@ def _harden_tool_schemas(tools: list) -> None:
 
 
 _harden_tool_schemas(POS_AI_TOOLS)
+POS_AI_TOOLS.extend(AUTOMATION_TOOLS)

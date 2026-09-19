@@ -67,7 +67,22 @@ class ToolIntentPlan:
 
     @property
     def has_tools(self) -> bool:
-        return self.decision == "tool" and bool(self.tool_names)
+        return self.decision in {"tool", "agent"} and bool(self.tool_names)
+
+    @classmethod
+    def for_agent(cls, message: Any, tool_names: frozenset[str]) -> "ToolIntentPlan":
+        """Bind available capabilities to the actor, without classifying intent.
+
+        The execution model discovers tools and decides what to do throughout
+        the turn. This snapshot conveys identity, never a precomputed workflow.
+        """
+        bound = cls.for_tools(message, tool_names)
+        return cls(
+            decision="agent", tool_names=bound.tool_names, confidence=1.0,
+            explicit_request=False, contextual_followup=False,
+            message_id=bound.message_id, actor_id=bound.actor_id,
+            request_sha256=bound.request_sha256, reason_code="direct_request",
+        )
 
     def is_bound_to(self, message: Any) -> bool:
         return bool(

@@ -27,7 +27,8 @@ The project is free to self-host on Railway or other infrastructure; operators p
 
 - **Automated moderation** — canonical URL screening with Google Safe Browsing/VirusTotal support, attachment magic/archive checks, normalized spam detection, AI-assisted review, mass-mention protection, and persistent anti-raid state
 - **P.OS AI assistant** — responds to mentions and replies, keeps conversational context, understands images and representative GIF/video frames, and can transcribe supported audio/video through Gemini
-- **Multi-step tool use** — the model receives each tool result, can use it in the next call, and writes the final answer. Missing targets lead to clarification. Plain-text pseudo-commands and invented fallback calls never execute.
+- **Model-driven agent** — the model discovers tools from an actor-scoped capability catalog, reads their schemas, executes multi-step tasks, and uses actual results to decide what to do next. Missing targets lead to clarification. Plain-text pseudo-commands never execute.
+- **Persistent event workflows** — the owner can ask P.OS to post custom embeds on member joins/leaves, assign roles on joins, or react to messages matching a condition. The model creates the wording and ordered actions through tools; rules and run receipts survive restarts in the backed-up database.
 - **Owner-gated tools** — factual server inspection plus bans, timeouts, roles, channels, settings, and cross-server actions; owner commands execute directly, third-party requests require approval
 - **Application workflows** — interactive forms for applications, reports, and staff review
 - **Continuous security posture** — an initial audit plus persisted baselines for Discord MFA, verification/media filters, privileged roles, channel overwrites, bot permissions, webhooks, and AutoMod rules, with owner alerts on dangerous changes
@@ -37,11 +38,15 @@ The project is free to self-host on Railway or other infrastructure; operators p
 
 ## Security model (important)
 
-High-privilege operations are **never delegated directly to the LLM**. The model may request actions through tool calls; `pos_ai.py` validates every argument against a closed schema, resolves targets to canonical Discord IDs, checks the current message's intent, permissions and role hierarchy, limits actions per turn, and protects the owner and bot before execution. Mutating requests do not expose channel history or visual payloads to the action-selection context.
+High-privilege operations are **never delegated directly to the LLM**. The model may request actions through native tool calls; `pos_ai.py` validates arguments against a closed schema, resolves targets to canonical Discord IDs, verifies the real actor, permissions and role hierarchy, and protects the owner and bot. Each turn is bound to the original message and author. History, media, object names and tool observations are untrusted data and cannot grant authority; only the current user's request defines the task.
 
 The only direct privileged operator is Pumba, identified by the immutable Discord user ID `968698192411652176`. This trust boundary cannot be expanded through an environment variable. Pumba's verified Discord actions execute immediately; factual API results return to the model for the next step or final answer. A state-changing request from anyone else is sent to Pumba's DM for explicit button approval and expires after 10 minutes. Process shutdown still requires Pumba's separate confirmation.
 
-The actor-bound router selects available capabilities, not a mandatory execution checklist. An agent turn allows up to six model rounds and eight tool attempts, suppresses identical repeated calls, and keeps completed-action receipts if a later model call fails. Message operations use exact IDs or typed `reply`/`current` references; bulk deletion is bounded before the requesting message so newly arriving messages are preserved. An explicit user target is never overwritten with the author of a reply.
+The execution model selects its own tools through `discover_tools`; a preliminary intent classifier no longer restricts production turns. A turn allows up to 16 model rounds, 24 operation attempts and 240 seconds. It suppresses repeated mutations, retains receipts if the provider fails, and finishes through `finish_response` with references to actual operation results. Refusals, pending approval and unknown outcomes cannot be reported as a completed workflow. Message operations use exact IDs or typed `reply`/`current` references; bulk deletion is bounded before the requesting message. An explicit user target is never overwritten with the author of a reply.
+
+The five automation tools create, inspect, update/pause, delete and inspect runs of persistent rules. Supported triggers are `member_join`, `member_remove` and `message_create`; each rule contains up to eight ordered `send_message`, `add_role` or `remove_role` actions. For example, «в этом канале пиши embed, когда кто-то входит или выходит» creates a saved rule targeting the current channel, with model-authored templates for each event. Template placeholders insert event data without executing code or making another AI request on every event. Conditions can restrict the source channel, a member's role, bots and a text substring. Rules are managed only by Pumba; role actions respect Discord hierarchy and the join security gate. Message triggers wait for moderation and ignore bots/webhooks to avoid loops.
+
+Rules are versioned, and event runs are claimed atomically before delivery. Concurrent duplicate events, cooldowns, paused rules and stale rule versions cannot start another run. A failed step stops its chain; uncertain effects are recorded without automatic replay. This provides at-most-once attempts, not guaranteed delivery: events missed while the bot is offline are not backfilled. Schedules, arbitrary programs and arbitrary external integrations are not part of these event workflows; new capabilities require an implemented tool and authorization checks.
 
 AI moderation findings are advisory unless a deterministic signal or independently confirmed visual signal reaches the required confidence threshold. URL and file reputation also require corroborated verdicts before automatic punishment. This prevents a model response, one outlier scanner, or prompt-injected message from becoming an automatic punishment by itself.
 
@@ -157,6 +162,8 @@ See `.env.example` for the full list.
 | `antiraid.py` | Join-rate raid detection and reactions |
 | `security_monitor.py` | Persisted Discord security posture snapshots and deterministic diffs |
 | `pos_ai.py` | P.OS orchestration, context, tool execution policy |
+| `agent_runtime.py`, `agent_tools.py` | Native discovery, bounded tool loop and result-backed completion |
+| `automation_rules.py`, `cogs/automations.py` | Persistent event rules, templates and Discord event adapters |
 | `ai_client.py` | OpenAI-compatible client with provider pooling |
 | `media_intelligence.py` | Bounded image/GIF/video sampling and Gemini audio/video understanding |
 | `web_research.py` | SSRF-safe public page reading and grounded owner-only research |

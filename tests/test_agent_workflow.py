@@ -1,7 +1,10 @@
 """Exercise the model/tool protocol without contacting Discord or AI providers."""
 import copy
 import json
+import datetime
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -9,6 +12,8 @@ import discord
 
 import pos_ai
 import tool_router
+import storage
+import automation_rules
 from tool_router import ToolIntentPlan
 
 
@@ -278,8 +283,14 @@ class AgentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         references = json.loads(context.split("\n[SAME_USER_CONTEXT]", 1)[0].split("\n", 1)[1])
         self.assertEqual(references["reply"]["message_id"], str(target.id))
         self.assertTrue(references["reply"]["author_is_pos"])
-        self.assertEqual(plan.tool_names, frozenset({"manage_message"}))
-        provider = AsyncMock(side_effect=[_response(_call("manage_message", {"action": "delete", "message_id": "reply"})), {"content": "Этот ответ удалён."}])
+        planner.assert_not_awaited()
+        self.assertEqual(plan.decision, "agent")
+        self.assertIn("manage_message", plan.tool_names)
+        provider = AsyncMock(side_effect=[
+            _response(_call("discover_tools", {"names": ["manage_message"]}, call_id="discover")),
+            _response(_call("manage_message", {"action": "delete", "message_id": "reply"}, call_id="delete")),
+            _response(_call("finish_response", {"text": "Этот ответ удалён.", "outcome": "completed", "evidence_call_ids": ["delete"]}, call_id="finish")),
+        ])
 
         result = await self._run(plan.tool_names, provider, plan=plan)
 
@@ -287,6 +298,91 @@ class AgentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.channel.fetch_message.assert_awaited_once_with(target.id)
         self.channel.purge.assert_not_awaited()
         self.assertEqual(result, "Этот ответ удалён.")
+
+    async def test_native_agent_assigns_role_through_real_executor(self):
+        self.message.content = "P.OS, выдай участнику alice роль Художник"
+        role = SimpleNamespace(id=900000000000000030, name="Художник", position=2,
+                               managed=False, is_default=lambda: False)
+        member = SimpleNamespace(id=900000000000000040, name="alice", display_name="Alice",
+                                 roles=[], top_role=SimpleNamespace(id=10, position=1),
+                                 add_roles=AsyncMock())
+        self.guild.roles = [role]
+        self.guild.members = [member]
+        self.guild.owner = self.owner
+        self.guild.me.top_role = SimpleNamespace(id=900000000000000060, position=10)
+        self.guild.get_member = lambda ident: member if ident == member.id else None
+        self.guild.get_role = lambda ident: role if ident == role.id else None
+        provider = AsyncMock(side_effect=[
+            _response(_call("discover_tools", {"names": ["add_role"]}, call_id="discover")),
+            _response(_call("add_role", {"user_identifier": "alice", "role_id_or_name": "Художник"}, call_id="assign")),
+            _response(_call("finish_response", {"text": "Роль Художник выдана Alice.", "outcome": "completed", "evidence_call_ids": ["assign"]}, call_id="finish")),
+        ])
+        result = await self._run(set(), provider, plan=ToolIntentPlan.for_agent(self.message, pos_ai._eligible_tool_names_for_message(self.message)))
+        member.add_roles.assert_awaited_once_with(role, reason="Выдано P.OS")
+        self.assertEqual(result, "Роль Художник выдана Alice.")
+        self.assertEqual(self.state["tool_results"][0]["status"], "success")
+
+    async def test_native_agent_saves_rule_then_restart_delivers_join_and_leave_embeds(self):
+        self.message.content = "P.OS, пиши здесь embed, когда кто-то заходит или выходит. Текст придумай сам."
+        self.channel.permissions_for.return_value = discord.Permissions.all()
+        self.channel.send = AsyncMock(side_effect=[SimpleNamespace(id=1001), SimpleNamespace(id=1002)])
+        self.guild.member_count = 2
+        member = SimpleNamespace(id=900000000000000080, name="alice", display_name="Alice",
+                                 guild=self.guild, roles=[], bot=False,
+                                 joined_at=datetime.datetime(2026, 9, 19, tzinfo=datetime.timezone.utc),
+                                 created_at=datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc))
+        definition = {"name": "Входы и выходы", "channel_id": "current",
+                      "trigger_events": ["member_join", "member_remove"],
+                      "actions": [
+                          {"type": "send_message", "events": ["member_join"], "embed": {"title": "Добро пожаловать", "description": "{member.display_name} вошёл в {guild.name}."}},
+                          {"type": "send_message", "events": ["member_remove"], "embed": {"title": "До встречи", "description": "{member.display_name} покинул сервер."}},
+                      ]}
+        provider = AsyncMock(side_effect=[
+            _response(_call("discover_tools", {"names": ["create_automation", "list_automations"]}, call_id="discover")),
+            _response(_call("create_automation", definition, call_id="save-rule")),
+            _response(_call("list_automations", {}, call_id="verify")),
+            _response(_call("finish_response", {"text": "Сохранил правило: здесь будут embed о входах и выходах.", "outcome": "completed", "evidence_call_ids": ["save-rule"]}, call_id="finish")),
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "rules.db")
+            original_get_conn = storage._get_conn
+
+            async def test_connection(_path=storage.DEFAULT_DB_PATH):
+                return await original_get_conn(path)
+
+            await storage.init_db(path)
+            try:
+                with patch.object(storage, "_get_conn", new=test_connection):
+                    result = await self._run(set(), provider, plan=ToolIntentPlan.for_agent(self.message, pos_ai._eligible_tool_names_for_message(self.message)))
+                    self.assertIn("Сохранил правило", result)
+                    rules = await storage.list_pos_automations(self.guild.id)
+                    self.assertEqual(len(rules), 1)
+                    self.assertEqual(rules[0]["channel_id"], self.channel.id)
+                    await storage.close_all_connections()
+                    await storage.init_db(path)
+                    runtime = automation_rules.AutomationRuntime(self.bot)
+                    with patch.object(automation_rules, "wait_for_join_security", new=AsyncMock(return_value=False)):
+                        await runtime.handle_event("member_join", member)
+                        await runtime.handle_event("member_join", member)
+                        await runtime.handle_event("member_remove", member)
+                    await runtime.close()
+                    self.assertEqual(self.channel.send.await_count, 2)
+                    self.assertEqual([call.kwargs["embed"].title for call in self.channel.send.await_args_list], ["Добро пожаловать", "До встречи"])
+                    self.assertIn("Alice", self.channel.send.await_args_list[0].kwargs["embed"].description)
+                    for call in self.channel.send.await_args_list:
+                        self.assertEqual(call.kwargs["allowed_mentions"].to_dict(), {"parse": []})
+                    runs = await storage.list_pos_automation_runs(self.guild.id)
+                    self.assertEqual([run["status"] for run in runs], ["completed", "completed"])
+            finally:
+                await storage.close_all_connections()
+
+    async def test_nonowner_cannot_install_persistent_authority(self):
+        self.message.author = SimpleNamespace(id=900000000000000081)
+        self.assertTrue(pos_ai._eligible_tool_names_for_message(self.message).isdisjoint(automation_rules.AUTOMATION_WRITE_TOOLS))
+        with patch.object(pos_ai, "execute_automation_tool", new=AsyncMock()) as execute:
+            result = await pos_ai.execute_pos_tool(self.bot, self.message, _call("create_automation", {}), allowed_tool_names=frozenset({"create_automation"}))
+        self.assertIn("Отказано", result)
+        execute.assert_not_awaited()
 
     async def test_explicit_username_is_not_replaced_by_reply_author(self):
         alice = SimpleNamespace(id=900000000000000040, name="alice", display_name="Alice")

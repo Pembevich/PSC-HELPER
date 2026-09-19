@@ -252,10 +252,354 @@ async def _init_db_unlocked(db_path: str) -> None:
             decided_at INTEGER NOT NULL
         )
     """)
+    # Rules and their delivery ledger share the backed-up database. A reserved
+    # run is deliberately never retried: Discord may have accepted its action
+    # before the process stopped without recording the response.
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS pos_automations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            name_key TEXT NOT NULL,
+            trigger_events_json TEXT NOT NULL,
+            channel_id INTEGER NOT NULL,
+            definition_json TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 1,
+            UNIQUE (guild_id, owner_id, name_key)
+        )
+    """)
+    # Seconds-resolution timestamps cannot identify two edits in one second.
+    # A persisted revision also protects queued work across process restarts.
+    cursor = await conn.execute("PRAGMA table_info(pos_automations)")
+    if "revision" not in {row[1] for row in await cursor.fetchall()}:
+        await conn.execute("ALTER TABLE pos_automations ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pos_automations_guild_enabled "
+        "ON pos_automations(guild_id, enabled)"
+    )
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS pos_automation_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            automation_id INTEGER NOT NULL,
+            event_key TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result_json TEXT NOT NULL DEFAULT '{}',
+            created_at INTEGER NOT NULL,
+            finished_at INTEGER,
+            UNIQUE (automation_id, event_key)
+        )
+    """)
+    # No cascading delete: a rule's history and deduplication keys outlive it.
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pos_automation_runs_guild "
+        "ON pos_automation_runs(guild_id, id DESC)"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pos_automation_runs_time "
+        "ON pos_automation_runs(automation_id, created_at DESC)"
+    )
     # Чистим устаревшие таблицы со старых версий (plaintext-пароли и т.п.).
     await conn.execute("DROP TABLE IF EXISTS private_chats")
     await conn.execute("DROP TABLE IF EXISTS chat_messages")
     await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Persistent P.OS event automations
+# ---------------------------------------------------------------------------
+
+_AUTOMATION_JSON_LIMIT = 32_768
+_AUTOMATION_MAX_PER_GUILD = 50
+_AUTOMATION_TERMINAL_STATUSES = {"completed", "failed", "partial", "skipped", "unknown"}
+
+
+def _automation_json(value: dict) -> str:
+    """Preserve JSON exactly or reject it; never stringify unknown objects."""
+    if not isinstance(value, dict):
+        raise ValueError("automation payload must be a JSON object")
+
+    def validate(item: Any, depth: int = 0) -> None:
+        if depth > 20:
+            raise ValueError("automation payload is nested too deeply")
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if not isinstance(key, str):
+                    raise ValueError("automation JSON keys must be strings")
+                validate(child, depth + 1)
+        elif isinstance(item, list):
+            for child in item:
+                validate(child, depth + 1)
+        elif item is not None and not isinstance(item, (str, int, float, bool)):
+            raise ValueError("automation payload contains a non-JSON value")
+
+    validate(value)
+    try:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        size = len(text.encode("utf-8"))
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ValueError("automation payload must be valid JSON") from exc
+    if size > _AUTOMATION_JSON_LIMIT:
+        raise ValueError("automation payload exceeds 32768 bytes")
+    return text
+
+
+def _automation_id(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value < 2**63:
+        raise ValueError("automation IDs must be positive SQLite integers")
+    return value
+
+
+def _automation_row_to_dict(row: Any) -> dict:
+    item = dict(zip(
+        (
+            "id", "guild_id", "owner_id", "name", "trigger_events_json", "channel_id",
+            "definition_json", "enabled", "created_at", "updated_at", "revision",
+        ),
+        row,
+    ))
+    item["trigger_events"] = json.loads(item.pop("trigger_events_json"))
+    item["definition"] = json.loads(item.pop("definition_json"))
+    item["enabled"] = bool(item["enabled"])
+    return item
+
+
+async def upsert_pos_automation(
+    guild_id: int,
+    owner_id: int,
+    name: str,
+    trigger_events: list[str],
+    channel_id: int,
+    definition: dict,
+    automation_id: int | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+    *,
+    enabled: bool | None = None,
+) -> dict:
+    """Save definition and optional state atomically for this guild and owner."""
+    guild_id = _automation_id(guild_id)
+    owner_id = _automation_id(owner_id)
+    channel_id = _automation_id(channel_id)
+    if automation_id is not None:
+        automation_id = _automation_id(automation_id)
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ValueError("automation enabled state must be boolean")
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 100:
+        raise ValueError("automation name must contain 1 to 100 characters")
+    name = name.strip()
+    if not isinstance(trigger_events, list) or not 1 <= len(trigger_events) <= 16:
+        raise ValueError("automation must have 1 to 16 trigger events")
+    if any(not isinstance(event, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", event) is None
+           for event in trigger_events):
+        raise ValueError("invalid automation trigger event")
+    events_json = json.dumps(list(dict.fromkeys(trigger_events)), separators=(",", ":"))
+    definition_json = _automation_json(definition)
+    now = int(time.time())
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            if automation_id is None:
+                cursor = await conn.execute(
+                    "SELECT id FROM pos_automations WHERE guild_id = ? AND owner_id = ? AND name_key = ?",
+                    (guild_id, owner_id, name.casefold()),
+                )
+                row = await cursor.fetchone()
+                if row is not None:
+                    automation_id = int(row[0])
+            if automation_id is not None:
+                cursor = await conn.execute(
+                    "UPDATE pos_automations SET name = ?, name_key = ?, trigger_events_json = ?, "
+                    "channel_id = ?, definition_json = ?, updated_at = ?, revision = revision + 1, "
+                    "enabled = COALESCE(?, enabled) "
+                    "WHERE id = ? AND guild_id = ? AND owner_id = ?",
+                    (
+                        name, name.casefold(), events_json, channel_id, definition_json, now, enabled,
+                        automation_id, guild_id, owner_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("automation does not belong to this guild and owner")
+            else:
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM pos_automations WHERE guild_id = ?", (guild_id,),
+                )
+                count_row = await cursor.fetchone()
+                if count_row is not None and int(count_row[0]) >= _AUTOMATION_MAX_PER_GUILD:
+                    raise ValueError("guild has reached its limit of 50 automations")
+                cursor = await conn.execute(
+                    "INSERT INTO pos_automations (guild_id, owner_id, name, name_key, "
+                    "trigger_events_json, channel_id, definition_json, created_at, updated_at, enabled) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (guild_id, owner_id, name, name.casefold(), events_json, channel_id, definition_json,
+                     now, now, enabled if enabled is not None else True),
+                )
+                automation_id = cursor.lastrowid
+                if automation_id is None:
+                    raise RuntimeError("SQLite did not return an automation ID")
+            cursor = await conn.execute(
+                "SELECT id, guild_id, owner_id, name, trigger_events_json, channel_id, "
+                "definition_json, enabled, created_at, updated_at, revision "
+                "FROM pos_automations WHERE id = ?", (automation_id,),
+            )
+            saved_row = await cursor.fetchone()
+            if saved_row is None:
+                raise RuntimeError("SQLite did not return the saved automation")
+            result = _automation_row_to_dict(saved_row)
+            await conn.commit()
+            return result
+        except sqlite3.IntegrityError as exc:
+            await conn.rollback()
+            raise ValueError("an automation with this name already belongs to this owner") from exc
+        except BaseException:
+            await conn.rollback()
+            raise
+
+
+async def list_pos_automations(
+    guild_id: int,
+    *,
+    enabled_only: bool = False,
+    trigger_event: str | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> list[dict]:
+    conn = await _get_conn(db_path)
+    cursor = await conn.execute(
+        "SELECT id, guild_id, owner_id, name, trigger_events_json, channel_id, "
+        "definition_json, enabled, created_at, updated_at, revision FROM pos_automations "
+        "WHERE guild_id = ? AND (? = 0 OR enabled = 1) ORDER BY id",
+        (_automation_id(guild_id), int(bool(enabled_only))),
+    )
+    rules = [_automation_row_to_dict(row) for row in await cursor.fetchall()]
+    if trigger_event is not None:
+        rules = [rule for rule in rules if trigger_event in rule["trigger_events"]]
+    return rules
+
+
+async def set_pos_automation_enabled(
+    guild_id: int,
+    automation_id: int,
+    enabled: bool,
+    db_path: str = DEFAULT_DB_PATH,
+) -> bool:
+    if not isinstance(enabled, bool):
+        raise ValueError("automation enabled state must be boolean")
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        cursor = await conn.execute(
+            "UPDATE pos_automations SET enabled = ?, updated_at = ?, revision = revision + 1 "
+            "WHERE id = ? AND guild_id = ?",
+            (int(enabled), int(time.time()), _automation_id(automation_id), _automation_id(guild_id)),
+        )
+        await conn.commit()
+        return cursor.rowcount == 1
+
+
+async def delete_pos_automation(
+    guild_id: int,
+    automation_id: int,
+    db_path: str = DEFAULT_DB_PATH,
+) -> bool:
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        cursor = await conn.execute(
+            "DELETE FROM pos_automations WHERE id = ? AND guild_id = ?",
+            (_automation_id(automation_id), _automation_id(guild_id)),
+        )
+        await conn.commit()
+        return cursor.rowcount == 1
+
+
+async def claim_pos_automation_run(
+    guild_id: int,
+    automation_id: int,
+    event_key: str,
+    *,
+    cooldown_seconds: int = 0,
+    expected_revision: int | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> int | None:
+    """Reserve an enabled rule's event once, including after unknown outcomes."""
+    guild_id = _automation_id(guild_id)
+    automation_id = _automation_id(automation_id)
+    if expected_revision is not None:
+        expected_revision = _automation_id(expected_revision)
+    if not isinstance(event_key, str) or not event_key.strip() or len(event_key) > 256:
+        raise ValueError("automation event key must contain 1 to 256 characters")
+    if isinstance(cooldown_seconds, bool) or not isinstance(cooldown_seconds, int) or not 0 <= cooldown_seconds <= 604_800:
+        raise ValueError("automation cooldown must be between 0 and 604800 seconds")
+    now = int(time.time())
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        cursor = await conn.execute(
+            """
+            INSERT INTO pos_automation_runs (guild_id, automation_id, event_key, status, created_at)
+            SELECT guild_id, id, ?, 'reserved', ? FROM pos_automations
+            WHERE guild_id = ? AND id = ? AND enabled = 1
+              AND (? IS NULL OR revision = ?)
+              AND (? = 0 OR NOT EXISTS (
+                SELECT 1 FROM pos_automation_runs
+                WHERE automation_id = ? AND created_at > ? AND status != 'skipped'
+              ))
+            ON CONFLICT (automation_id, event_key) DO NOTHING
+            """,
+            (event_key, now, guild_id, automation_id, expected_revision, expected_revision,
+             cooldown_seconds, automation_id, now - cooldown_seconds),
+        )
+        await conn.commit()
+        return int(cursor.lastrowid) if cursor.rowcount == 1 and cursor.lastrowid is not None else None
+
+
+async def finish_pos_automation_run(
+    run_id: int,
+    *,
+    status: str,
+    result: dict,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    run_id = _automation_id(run_id)
+    if not isinstance(status, str) or status not in _AUTOMATION_TERMINAL_STATUSES:
+        raise ValueError("invalid terminal automation run status")
+    result_json = _automation_json(result)
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        await conn.execute(
+            "UPDATE pos_automation_runs SET status = ?, result_json = ?, finished_at = ? "
+            "WHERE id = ? AND status = 'reserved'",
+            (status, result_json, int(time.time()), run_id),
+        )
+        await conn.commit()
+
+
+async def list_pos_automation_runs(
+    guild_id: int,
+    automation_id: int | None = None,
+    limit: int = 10,
+    db_path: str = DEFAULT_DB_PATH,
+) -> list[dict]:
+    guild_id = _automation_id(guild_id)
+    if automation_id is not None:
+        automation_id = _automation_id(automation_id)
+    conn = await _get_conn(db_path)
+    cursor = await conn.execute(
+        "SELECT id, guild_id, automation_id, event_key, status, result_json, created_at, finished_at "
+        "FROM pos_automation_runs WHERE guild_id = ? AND (? IS NULL OR automation_id = ?) "
+        "ORDER BY id DESC LIMIT ?",
+        (guild_id, automation_id, automation_id, max(1, min(int(limit), 50))),
+    )
+    results = []
+    for row in await cursor.fetchall():
+        item = dict(zip(
+            ("id", "guild_id", "automation_id", "event_key", "status", "result_json", "created_at", "finished_at"),
+            row,
+        ))
+        item["result"] = json.loads(item.pop("result_json"))
+        results.append(item)
+    return results
 
 
 # ---------------------------------------------------------------------------
