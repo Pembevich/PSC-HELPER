@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import logging
@@ -1395,6 +1396,45 @@ async def _post_ai_payload(
         return response.status, dict(response.headers), response_text
 
 
+def _provider_tool_schemas(tools: list[dict[str, Any]], provider: Mapping[str, str]) -> list[dict[str, Any]]:
+    """Adapt wire-only hints; the original schemas remain executor authority.
+
+    Gemini's OpenAI compatibility bridge accepts a JSON Schema subset and
+    rejects uniqueItems. Discovery enforces uniqueness locally in every case.
+    """
+    if provider.get("provider") != "gemini":
+        return tools
+    adapted = copy.deepcopy(tools)
+
+    def visit(schema: Any) -> None:
+        if not isinstance(schema, dict):
+            return
+        schema.pop("uniqueItems", None)
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            for child in properties.values():
+                visit(child)
+        visit(schema.get("items"))
+        for key in ("anyOf", "allOf", "oneOf"):
+            for child in schema.get(key, []) if isinstance(schema.get(key), list) else []:
+                visit(child)
+
+    for tool in adapted:
+        function = tool.get("function")
+        if isinstance(function, dict):
+            visit(function.get("parameters"))
+    return adapted
+
+
+def _upstream_error_diagnostic(body: str) -> str:
+    """Log only fixed diagnostic labels, never provider text or echoed secrets."""
+    lowered = body.lower()
+    fields = ("uniqueitems", "maxitems", "minitems", "maxlength", "additionalproperties",
+              "tool_choice", "function_declarations", "thought_signature", "parameters",
+              "system", "messages", "enum", "model", "region", "location", "billing")
+    return ",".join(field for field in fields if field in lowered) or "unclassified"
+
+
 async def pos_chat_completion(
     messages: list[dict[str, Any]],
     *,
@@ -1493,7 +1533,7 @@ async def pos_chat_completion(
                     payload["frequency_penalty"] = 0.35
                     payload["presence_penalty"] = 0.2
                 if tools:
-                    payload["tools"] = tools
+                    payload["tools"] = _provider_tool_schemas(tools, provider)
                     if request_tool_choice:
                         payload["tool_choice"] = request_tool_choice
                 headers = {
@@ -1597,10 +1637,11 @@ async def pos_chat_completion(
                         ):
                             logger.error("P.OS GitHub Models authentication failed.")
                         logger.warning(
-                            "P.OS API error %s (%s), body_sha256=%s",
+                            "P.OS API error %s (%s), body_sha256=%s diagnostic=%s",
                             response_status,
                             provider["name"],
                             _upstream_body_fingerprint(response_text),
+                            _upstream_error_diagnostic(response_text),
                         )
                         # 400/413/422 are request-specific and must not take a
                         # healthy provider out of rotation. Auth and endpoint

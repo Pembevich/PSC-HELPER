@@ -134,6 +134,8 @@ async def run_agent_turn(
             return _incomplete(receipts, "AI не смог завершить ответ.")
         if not is_current():
             return _incomplete(receipts, "Запрос изменился; продолжение остановлено.")
+        if response is None:
+            return _incomplete(receipts, "AI-провайдер не смог обработать запрос.")
         calls = _native_calls(response or {})
         if not calls:
             malformed += 1

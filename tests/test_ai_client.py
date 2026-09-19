@@ -597,6 +597,35 @@ class ProviderRoutingRegressionTests(unittest.IsolatedAsyncioTestCase):
     def _requested_urls(self):
         return [call.args[1] for call in self.http.await_args_list]
 
+    async def test_gemini_discovery_uses_supported_schema_without_weakening_local_validation(self):
+        from agent_tools import make_discovery_tool, discover_tool_schemas
+        tool = make_discovery_tool(frozenset({"add_role"}))
+        self._pool("gemini")
+        self.http.return_value = self.success
+        await ai_client.pos_chat_completion([{"role": "user", "content": "Выдай роль"}], tools=[tool], tool_choice="required")
+        payload = self.http.await_args.kwargs["payload"]
+        self.assertEqual(payload["tool_choice"], "required")
+        names = payload["tools"][0]["function"]["parameters"]["properties"]["names"]
+        self.assertNotIn("uniqueItems", names)
+        self.assertEqual(names["items"]["enum"], ["add_role"])
+        self.assertTrue(tool["function"]["parameters"]["properties"]["names"]["uniqueItems"])
+        _schemas, error = discover_tool_schemas({"names": ["add_role", "add_role"]}, {}, frozenset({"add_role"}))
+        self.assertIsNotNone(error)
+
+    def test_schema_adapter_preserves_property_named_unique_items(self):
+        tools = [{"function": {"parameters": {"type": "object", "properties": {
+            "uniqueItems": {"type": "array", "uniqueItems": True, "items": {"type": "string"}},
+        }}}}]
+        adapted = ai_client._provider_tool_schemas(tools, {"provider": "gemini"})
+        self.assertIn("uniqueItems", adapted[0]["function"]["parameters"]["properties"])
+        self.assertNotIn("uniqueItems", adapted[0]["function"]["parameters"]["properties"]["uniqueItems"])
+        self.assertEqual(ai_client._provider_tool_schemas(tools, {"provider": "github_models"}), tools)
+
+    def test_error_diagnostic_never_echoes_provider_content_or_secrets(self):
+        body = '{"error":{"message":"Unknown uniqueItems in parameters; authorization=secret-token; private user message"}}'
+        self.assertEqual(ai_client._upstream_error_diagnostic(body), "uniqueitems,parameters")
+        self.assertEqual(ai_client._upstream_error_diagnostic("private-secret"), "unclassified")
+
     async def test_timeout_tries_healthy_lower_priority_provider(self):
         self._pool("gemini", "github_models")
         self.http.side_effect = [asyncio.TimeoutError(), self.success]
