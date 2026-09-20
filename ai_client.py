@@ -12,6 +12,8 @@ import ssl
 import time
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -56,6 +58,41 @@ _MAX_INLINE_MEDIA_BYTES = 14 * 1024 * 1024
 _SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _SUPPORTED_TOOL_CHOICES = frozenset({"auto", "required", "none"})
+
+
+@dataclass
+class _ToolchainProviderAffinity:
+    owner_task: asyncio.Task[Any] | None
+    provider_index: int | None = None
+    active: bool = True
+
+
+_toolchain_provider_affinity: ContextVar[_ToolchainProviderAffinity | None] = ContextVar(
+    "toolchain_provider_affinity", default=None,
+)
+
+
+@asynccontextmanager
+async def toolchain_provider_affinity():
+    """Keep native tool transcripts on the provider that produced their calls.
+
+    The state is mutable because wait_for runs completions in child tasks: a
+    ContextVar.set inside such a completion would not reach the next round.
+    Nested loops in the same task share the scope; independently spawned turns
+    get their own scope even when they inherit a parent's context.
+    """
+    existing = _toolchain_provider_affinity.get()
+    owner_task = asyncio.current_task()
+    if existing is not None and existing.active and existing.owner_task is owner_task:
+        yield
+        return
+    affinity = _ToolchainProviderAffinity(owner_task=owner_task)
+    token = _toolchain_provider_affinity.set(affinity)
+    try:
+        yield
+    finally:
+        affinity.active = False
+        _toolchain_provider_affinity.reset(token)
 
 
 class _AIQueueTimeout(Exception):
@@ -1326,17 +1363,54 @@ def _compact_visual_content(content: list[Any]) -> tuple[list[Any], int, int]:
 def _compact_messages_for_oversize(
     messages: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], int, int]:
-    """Shrink one rejected request while preserving authority-bearing context."""
+    """Shrink observations/media without splitting the current tool turn.
+
+    Old user turns are removable only as complete groups. The latest user
+    request, its tool calls (including opaque signatures), and every matching
+    result must survive together, even when that exceeds the history target.
+    """
+    authority_roles = {"system", "developer"}
+    user_indices = [
+        index for index, message in enumerate(messages)
+        if message.get("role") == "user"
+    ]
+    current_user_index = user_indices[-1] if user_indices else None
     keep_indices = set(range(len(messages)))
-    if len(messages) > 36:
+    if len(messages) > 36 and current_user_index is not None:
         keep_indices = {
             index
             for index, message in enumerate(messages)
-            if message.get("role") == "system"
+            if message.get("role") in authority_roles
         }
-        keep_indices.update(range(max(0, len(messages) - 28), len(messages)))
-        keep_indices.add(0)
-        keep_indices.add(len(messages) - 1)
+        keep_indices.update(range(current_user_index, len(messages)))
+        history_size = len(messages) - current_user_index
+        turn_end = current_user_index
+        for turn_start in reversed(user_indices[:-1]):
+            turn_size = turn_end - turn_start
+            if history_size + turn_size > 28:
+                break
+            keep_indices.update(range(turn_start, turn_end))
+            history_size += turn_size
+            turn_end = turn_start
+
+    def compact_tool_result(content: str, maximum: int) -> str:
+        if len(content) <= maximum:
+            return content
+        marker = "\n[…результат сокращён из-за размера запроса…]"
+        try:
+            payload = json.loads(content)
+        except ValueError:
+            return content[:maximum - len(marker)] + marker
+        # These are the receipt envelopes emitted by both agent loops. Keep
+        # status, call IDs, and other evidence intact; slicing serialized JSON
+        # would corrupt escaping and potentially remove the actual outcome.
+        if isinstance(payload, dict) and isinstance(payload.get("result"), str):
+            if len(payload["result"]) > maximum // 2:
+                payload["result"] = payload["result"][:maximum // 2] + marker
+                return json.dumps(payload, ensure_ascii=False)
+        # Unknown structured observations are kept intact rather than silently
+        # changing their schema or losing identifiers by trimming a JSON tail.
+        return content
 
     compacted: list[dict[str, Any]] = []
     visuals_before = 0
@@ -1346,13 +1420,18 @@ def _compact_messages_for_oversize(
             continue
         cloned = dict(message)
         content = cloned.get("content")
+        preserve_text = (
+            index == current_user_index
+            or cloned.get("role") in authority_roles
+            or bool(cloned.get("tool_calls") or cloned.get("function_call"))
+        )
         if isinstance(content, list):
             compact_content, before, after = _compact_visual_content(content)
             visuals_before += before
             visuals_after += after
             bounded_parts: list[Any] = []
             for part in compact_content:
-                if isinstance(part, Mapping) and isinstance(part.get("text"), str):
+                if not preserve_text and isinstance(part, Mapping) and isinstance(part.get("text"), str):
                     bounded = dict(part)
                     bounded["text"] = str(part["text"])[:24_000]
                     bounded_parts.append(bounded)
@@ -1360,9 +1439,13 @@ def _compact_messages_for_oversize(
                     bounded_parts.append(part)
             cloned["content"] = bounded_parts
         elif isinstance(content, str):
-            if cloned.get("role") != "system":
+            if not preserve_text:
                 maximum = 24_000 if index == len(messages) - 1 else 12_000
-                cloned["content"] = content[:maximum]
+                cloned["content"] = (
+                    compact_tool_result(content, maximum)
+                    if cloned.get("role") in {"tool", "function"}
+                    else content[:maximum]
+                )
         compacted.append(cloned)
     return compacted, visuals_before, visuals_after
 
@@ -1399,8 +1482,9 @@ async def _post_ai_payload(
 def _provider_tool_schemas(tools: list[dict[str, Any]], provider: Mapping[str, str]) -> list[dict[str, Any]]:
     """Adapt wire-only hints; the original schemas remain executor authority.
 
-    Gemini's OpenAI compatibility bridge accepts a JSON Schema subset and
-    rejects uniqueItems. Discovery enforces uniqueness locally in every case.
+    Gemini's bridge rejects bounded discovery arrays with a large item enum.
+    The catalog still supplies the names; discovery enforces the exact allowed
+    set and uniqueness locally. These wire hints never grant tool authority.
     """
     if provider.get("provider") != "gemini":
         return tools
@@ -1423,6 +1507,11 @@ def _provider_tool_schemas(tools: list[dict[str, Any]], provider: Mapping[str, s
         function = tool.get("function")
         if isinstance(function, dict):
             visit(function.get("parameters"))
+            if function.get("name") == "discover_tools":
+                names = function.get("parameters", {}).get("properties", {}).get("names", {})
+                items = names.get("items")
+                if isinstance(items, dict):
+                    items.pop("enum", None)
     return adapted
 
 
@@ -1459,6 +1548,17 @@ async def pos_chat_completion(
         else None
     )
     requires_vision = _messages_have_visual_inputs(messages)
+    # Auxiliary plain-text model calls made by a tool (for example a search
+    # summary) are separate conversations and must not read or alter this pin.
+    uses_tool_protocol = bool(tools) or any(
+        message.get("tool_calls") or message.get("function_call")
+        or message.get("role") in {"tool", "function"}
+        for message in messages
+    )
+    affinity = _toolchain_provider_affinity.get() if uses_tool_protocol else None
+    if affinity is not None and not affinity.active:
+        affinity = None
+    pinned_index = affinity.provider_index if affinity is not None else None
     if requires_vision:
         max_attempts = sum(
             1
@@ -1472,6 +1572,11 @@ async def pos_chat_completion(
             return None
     else:
         max_attempts = len(_AI_PROVIDER_POOL)
+    if pinned_index is not None:
+        # Once native calls enter the transcript, even a read/discovery call
+        # can carry opaque model-specific signatures. Never fail over this
+        # transcript to a different provider, before or after side effects.
+        max_attempts = 1
 
     attempted: set[int] = set()
     for attempt in range(max_attempts):
@@ -1486,15 +1591,28 @@ async def pos_chat_completion(
                     )
                     return None
 
-                provider_index = (
-                    await _reserve_exact_provider_index(
-                        "gemini", exclude_indices=frozenset(attempted)
+                if pinned_index is not None:
+                    if (
+                        not 0 <= pinned_index < len(_AI_PROVIDER_POOL)
+                        or _provider_cooldown_remaining(pinned_index) > 0
+                        or (
+                            requires_vision
+                            and _AI_PROVIDER_POOL[pinned_index].get("provider") != "gemini"
+                        )
+                    ):
+                        logger.warning("P.OS toolchain provider is unavailable; continuation stopped.")
+                        return None
+                    provider_index = pinned_index
+                else:
+                    provider_index = (
+                        await _reserve_exact_provider_index(
+                            "gemini", exclude_indices=frozenset(attempted)
+                        )
+                        if requires_vision
+                        else await _reserve_provider_index(
+                            provider_type, exclude_indices=frozenset(attempted)
+                        )
                     )
-                    if requires_vision
-                    else await _reserve_provider_index(
-                        provider_type, exclude_indices=frozenset(attempted)
-                    )
-                )
                 if provider_index is None:
                     eligible_indices = [
                         index
@@ -1710,6 +1828,12 @@ async def pos_chat_completion(
             if attempt < max_attempts - 1:
                 continue
             return None
+        if (
+            affinity is not None and affinity.provider_index is None
+            and provider_index is not None
+            and (msg.get("tool_calls") or msg.get("function_call"))
+        ):
+            affinity.provider_index = provider_index
         return msg
 
     return None

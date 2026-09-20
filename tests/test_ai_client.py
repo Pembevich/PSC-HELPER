@@ -607,9 +607,12 @@ class ProviderRoutingRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["tool_choice"], "required")
         names = payload["tools"][0]["function"]["parameters"]["properties"]["names"]
         self.assertNotIn("uniqueItems", names)
-        self.assertEqual(names["items"]["enum"], ["add_role"])
+        self.assertNotIn("enum", names["items"])
+        self.assertEqual(tool["function"]["parameters"]["properties"]["names"]["items"]["enum"], ["add_role"])
         self.assertTrue(tool["function"]["parameters"]["properties"]["names"]["uniqueItems"])
         _schemas, error = discover_tool_schemas({"names": ["add_role", "add_role"]}, {}, frozenset({"add_role"}))
+        self.assertIsNotNone(error)
+        _schemas, error = discover_tool_schemas({"names": ["ban_user"]}, {}, frozenset({"add_role"}))
         self.assertIsNotNone(error)
 
     def test_schema_adapter_preserves_property_named_unique_items(self):

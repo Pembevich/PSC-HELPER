@@ -1588,8 +1588,14 @@ def _safe_env_int(name: str, default: int = 0) -> int:
 BACKUP_CHANNEL_ID = _safe_env_int("DB_BACKUP_CHANNEL_ID") or 0
 _SQLITE_MAGIC = b"SQLite format 3"  # первые 15 байт любого валидного файла SQLite
 _BACKUP_MARKER = "[DATABASE_BACKUP]"
+_BACKUP_PART_MARKER = "[DATABASE_BACKUP_PART]"
+_BACKUP_MANIFEST_FILENAME = "bot_data.db.manifest.json"
 _BACKUP_HASH_RE = re.compile(r"\bsha256=([0-9a-f]{64})\b", re.IGNORECASE)
 _MAX_BACKUP_BYTES = 100 * 1024 * 1024
+_MAX_BACKUP_PARTS = 32
+_MAX_BACKUP_MANIFEST_BYTES = 32 * 1024
+_DEFAULT_BACKUP_UPLOAD_BYTES = 10 * 1024 * 1024
+_BACKUP_HISTORY_LIMIT = 1000
 # Сколько последних бэкапов держать в канале (бэкап каждые 10 минут копится вечно
 # и захламляет канал — старые сообщения подчищаем после успешной загрузки).
 _BACKUP_KEEP_LAST = 50
@@ -1708,6 +1714,125 @@ async def _resolve_backup_channel(bot: discord.Client) -> discord.TextChannel | 
     return channel if isinstance(channel, discord.TextChannel) else None
 
 
+def _parse_backup_manifest(raw: bytes) -> dict[str, Any]:
+    """Validate bounded metadata before fetching any referenced Discord messages."""
+    if not raw or len(raw) > _MAX_BACKUP_MANIFEST_BYTES:
+        raise ValueError("invalid backup manifest size")
+    manifest = json.loads(raw)
+    if not isinstance(manifest, dict) or manifest.get("version") != 1 or manifest.get("encoding") != "gzip":
+        raise ValueError("unsupported backup manifest")
+    for key in ("size", "original_size"):
+        value = manifest.get(key)
+        if type(value) is not int or not 0 < value <= _MAX_BACKUP_BYTES:
+            raise ValueError(f"invalid manifest {key}")
+    digest = manifest.get("sha256")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("invalid manifest SHA-256")
+    parts = manifest.get("parts")
+    if not isinstance(parts, list) or not 1 <= len(parts) <= _MAX_BACKUP_PARTS:
+        raise ValueError("invalid backup part count")
+    message_ids: set[int] = set()
+    total_size = 0
+    for index, part in enumerate(parts, 1):
+        if not isinstance(part, dict):
+            raise ValueError("invalid backup part metadata")
+        message_id = part.get("message_id")
+        if type(message_id) is not int or message_id <= 0 or message_id in message_ids:
+            raise ValueError("invalid or duplicate backup part message ID")
+        message_ids.add(message_id)
+        if part.get("filename") != f"bot_data.db.gz.part-{index:04d}":
+            raise ValueError("invalid backup part order or filename")
+        part_size = part.get("size")
+        if type(part_size) is not int or not 0 < part_size <= _MAX_BACKUP_BYTES:
+            raise ValueError("invalid backup part size")
+        part_hash = part.get("sha256")
+        if not isinstance(part_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", part_hash):
+            raise ValueError("invalid backup part SHA-256")
+        total_size += part_size
+    if total_size != manifest["size"]:
+        raise ValueError("backup parts do not match manifest size")
+    return manifest
+
+
+async def _assemble_backup_parts(
+    channel: discord.TextChannel, manifest: dict[str, Any], bot_user_id: int,
+) -> bytes:
+    payload = bytearray()
+    for part in manifest["parts"]:
+        message = await channel.fetch_message(part["message_id"])
+        if message.author.id != bot_user_id or not str(message.content or "").startswith(_BACKUP_PART_MARKER):
+            raise ValueError("backup part is not an authenticated bot upload")
+        if len(message.attachments) != 1:
+            raise ValueError("backup part attachment missing or ambiguous")
+        attachment = message.attachments[0]
+        if attachment.filename != part["filename"] or attachment.size != part["size"]:
+            raise ValueError("backup part attachment metadata mismatch")
+        raw = await attachment.read()
+        if len(raw) != part["size"] or hashlib.sha256(raw).hexdigest() != part["sha256"]:
+            raise ValueError("backup part size or SHA-256 mismatch")
+        payload.extend(raw)
+    if len(payload) != manifest["size"] or hashlib.sha256(payload).hexdigest() != manifest["sha256"]:
+        raise ValueError("assembled backup size or SHA-256 mismatch")
+    return bytes(payload)
+
+
+async def _upload_multipart_backup(
+    channel: discord.TextChannel, compressed_path: str, *, upload_limit: int,
+    compressed_size: int, snapshot_size: int, snapshot_hash: str,
+) -> None:
+    """Publish the manifest last: interrupted part uploads are never restore points."""
+    part_count = (compressed_size + upload_limit - 1) // upload_limit
+    if part_count > _MAX_BACKUP_PARTS:
+        raise ValueError("Discord upload limit requires too many backup parts")
+    manifest: dict[str, Any] = {
+        "version": 1, "encoding": "gzip", "size": compressed_size,
+        "original_size": snapshot_size, "sha256": snapshot_hash, "parts": [],
+    }
+    uploaded: list[discord.Message] = []
+    committed = False
+    try:
+        with open(compressed_path, "rb") as source:
+            for index in range(1, part_count + 1):
+                raw = source.read(upload_limit)
+                filename = f"bot_data.db.gz.part-{index:04d}"
+                file = discord.File(io.BytesIO(raw), filename=filename)
+                try:
+                    message = await channel.send(
+                        content=f"{_BACKUP_PART_MARKER} sha256={snapshot_hash} part={index}/{part_count}",
+                        file=file,
+                    )
+                finally:
+                    file.close()
+                uploaded.append(message)
+                manifest["parts"].append({
+                    "message_id": message.id, "filename": filename, "size": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                })
+        manifest_raw = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+        _parse_backup_manifest(manifest_raw)
+        if len(manifest_raw) > upload_limit:
+            raise ValueError("backup manifest exceeds Discord upload limit")
+        file = discord.File(io.BytesIO(manifest_raw), filename=_BACKUP_MANIFEST_FILENAME)
+        try:
+            await channel.send(
+                content=(f"{_BACKUP_MARKER} encoding=manifest-v1 "
+                         f"sha256={hashlib.sha256(manifest_raw).hexdigest()} parts={part_count}"),
+                file=file,
+            )
+            committed = True
+        finally:
+            file.close()
+    finally:
+        if not committed:
+            # Only messages created by this attempt are disposable. Prior backups
+            # remain intact even when a part/manifest upload fails or is cancelled.
+            for message in uploaded:
+                try:
+                    await message.delete()
+                except Exception:
+                    logger.warning("Could not remove incomplete database backup part %s.", message.id)
+
+
 async def backup_db_to_discord(bot: discord.Client, db_path: str = DEFAULT_DB_PATH) -> bool:
     """Upload a consistent snapshot of the DB to the dedicated backup channel."""
     async with _loop_lock(_backup_locks):
@@ -1744,26 +1869,27 @@ async def backup_db_to_discord(bot: discord.Client, db_path: str = DEFAULT_DB_PA
                 logger.error("Database backup rejected: invalid compressed size %s bytes.", compressed_size)
                 return False
             upload_limit = int(getattr(getattr(channel, "guild", None), "filesize_limit", 0) or 0)
-            if upload_limit > 0 and compressed_size > upload_limit:
-                logger.error(
-                    "Database backup is %s bytes after gzip, above Discord limit %s bytes.",
-                    compressed_size,
-                    upload_limit,
-                )
-                return False
+            upload_limit = min(upload_limit or _DEFAULT_BACKUP_UPLOAD_BYTES, _DEFAULT_BACKUP_UPLOAD_BYTES)
             snapshot_hash = await asyncio.to_thread(_sha256_file, compressed_path)
-            file = discord.File(compressed_path, filename="bot_data.db.gz")
-            try:
-                await channel.send(
-                    content=(
-                        f"{_BACKUP_MARKER} Automatic database backup encoding=gzip "
-                        f"sha256={snapshot_hash} size={compressed_size} "
-                        f"original_size={snapshot_size}"
-                    ),
-                    file=file,
+            if compressed_size > upload_limit:
+                await _upload_multipart_backup(
+                    channel, compressed_path, upload_limit=upload_limit,
+                    compressed_size=compressed_size, snapshot_size=snapshot_size,
+                    snapshot_hash=snapshot_hash,
                 )
-            finally:
-                file.close()
+            else:
+                file = discord.File(compressed_path, filename="bot_data.db.gz")
+                try:
+                    await channel.send(
+                        content=(
+                            f"{_BACKUP_MARKER} Automatic database backup encoding=gzip "
+                            f"sha256={snapshot_hash} size={compressed_size} "
+                            f"original_size={snapshot_size}"
+                        ),
+                        file=file,
+                    )
+                finally:
+                    file.close()
             logger.info("Database backup uploaded to Discord successfully.")
             try:
                 await _prune_old_backups(channel, bot)
@@ -1787,7 +1913,7 @@ async def _prune_old_backups(channel: discord.TextChannel, bot: discord.Client) 
     if bot_user_id is None:
         return
     backups: list[discord.Message] = []
-    async for msg in channel.history(limit=200):
+    async for msg in channel.history(limit=_BACKUP_HISTORY_LIMIT):
         if msg.author.id != bot_user_id:
             continue
         if not msg.content.startswith(_BACKUP_MARKER):
@@ -1796,7 +1922,18 @@ async def _prune_old_backups(channel: discord.TextChannel, bot: discord.Client) 
     # history отдаёт от новых к старым — всё после первых _BACKUP_KEEP_LAST удаляем.
     for msg in backups[_BACKUP_KEEP_LAST:]:
         try:
+            part_ids: list[int] = []
+            if msg.attachments and msg.attachments[0].filename == _BACKUP_MANIFEST_FILENAME:
+                attachment = msg.attachments[0]
+                if attachment.size > _MAX_BACKUP_MANIFEST_BYTES:
+                    continue
+                manifest = _parse_backup_manifest(await attachment.read())
+                part_ids = [part["message_id"] for part in manifest["parts"]]
             await msg.delete()
+            for message_id in part_ids:
+                part_message = await channel.fetch_message(message_id)
+                if part_message.author.id == bot_user_id and str(part_message.content or "").startswith(_BACKUP_PART_MARKER):
+                    await part_message.delete()
         except Exception:
             pass
 
@@ -1831,34 +1968,46 @@ async def restore_db_from_discord(bot: discord.Client, db_path: str = DEFAULT_DB
         saw_candidate = False
         rejected_candidates: list[str] = []
         try:
-            async for msg in channel.history(limit=50):
+            async for msg in channel.history(limit=_BACKUP_HISTORY_LIMIT):
                 if msg.author.id != bot_user_id:
                     continue
                 content = str(msg.content or "")
+                if content.startswith(_BACKUP_PART_MARKER):
+                    # A process may stop before publishing its manifest. With no
+                    # older complete backup, this is unsafe rather than an empty channel.
+                    saw_candidate = True
+                    continue
                 if not content.startswith(_BACKUP_MARKER) or not msg.attachments:
                     continue
                 att = msg.attachments[0]
-                if att.filename not in {"bot_data.db", "bot_data.db.gz"}:
+                if att.filename not in {"bot_data.db", "bot_data.db.gz", _BACKUP_MANIFEST_FILENAME}:
                     continue
                 saw_candidate = True
                 candidate_label = f"message={msg.id}"
 
                 try:
-                    if att.size and att.size > _MAX_BACKUP_BYTES:
+                    is_manifest = att.filename == _BACKUP_MANIFEST_FILENAME
+                    size_limit = _MAX_BACKUP_MANIFEST_BYTES if is_manifest else _MAX_BACKUP_BYTES
+                    if att.size and att.size > size_limit:
                         raise ValueError(f"file too large: {att.size} bytes")
                     raw = await att.read()
-                    if not raw or len(raw) > _MAX_BACKUP_BYTES:
+                    if not raw or len(raw) > size_limit:
                         raise ValueError(f"invalid downloaded size: {len(raw)} bytes")
-                    compressed = att.filename == "bot_data.db.gz"
-                    if not compressed and not raw.startswith(_SQLITE_MAGIC):
-                        raise ValueError("SQLite magic bytes missing")
-
                     expected_match = _BACKUP_HASH_RE.search(content)
                     if "sha256=" in content.lower() and not expected_match:
                         raise ValueError("malformed SHA-256 metadata")
                     actual_hash = hashlib.sha256(raw).hexdigest()
                     if expected_match and actual_hash.lower() != expected_match.group(1).lower():
                         raise ValueError("SHA-256 mismatch")
+
+                    manifest = _parse_backup_manifest(raw) if is_manifest else None
+                    if manifest is not None:
+                        if not expected_match:
+                            raise ValueError("backup manifest SHA-256 metadata missing")
+                        raw = await _assemble_backup_parts(channel, manifest, bot_user_id)
+                    compressed = is_manifest or att.filename == "bot_data.db.gz"
+                    if not compressed and not raw.startswith(_SQLITE_MAGIC):
+                        raise ValueError("SQLite magic bytes missing")
 
                     db_dir = os.path.dirname(os.path.abspath(db_path)) or "."
                     fd, temp_path = tempfile.mkstemp(prefix=".pos-restore-", suffix=".db", dir=db_dir)
@@ -1872,6 +2021,8 @@ async def restore_db_from_discord(bot: discord.Client, db_path: str = DEFAULT_DB
                         )
                         if restored_size <= 0:
                             raise ValueError("restored database is empty")
+                        if manifest is not None and restored_size != manifest["original_size"]:
+                            raise ValueError("restored database size does not match manifest")
                         with open(temp_path, "rb") as restored_file:
                             if not restored_file.read(len(_SQLITE_MAGIC)).startswith(_SQLITE_MAGIC):
                                 raise ValueError("SQLite magic bytes missing")

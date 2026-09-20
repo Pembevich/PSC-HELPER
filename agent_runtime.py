@@ -8,6 +8,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
+from ai_client import toolchain_provider_affinity
 from agent_tools import (
     DISCOVERY_INSTRUCTION,
     FINISH_RESPONSE_TOOL,
@@ -83,6 +84,7 @@ def _incomplete(receipts: list[dict[str, Any]], reason: str) -> str:
     return reason + " Серверные изменения не выполнялись."
 
 
+@toolchain_provider_affinity()
 async def run_agent_turn(
     messages: list[dict], *,
     schemas: Mapping[str, dict], eligible_names: frozenset[str], mutating_names: frozenset[str],

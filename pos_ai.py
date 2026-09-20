@@ -37,6 +37,7 @@ from ai_client import (
     ai_is_temporarily_unavailable,
     ai_unavailable_reason,
     pos_chat_completion,
+    toolchain_provider_affinity,
 )
 from config import (
     BOT_COMMAND_PREFIX,
@@ -5872,6 +5873,7 @@ def _tool_receipt_fallback(results: list[dict[str, str]]) -> str:
     return "Данные получены, но AI не смог подготовить ответ. Серверные изменения не выполнялись."
 
 
+@toolchain_provider_affinity()
 async def request_pos_reply(
     bot: discord.Client | None,
     message: discord.Message | None,
