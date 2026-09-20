@@ -624,6 +624,30 @@ class ProviderRoutingRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("uniqueItems", adapted[0]["function"]["parameters"]["properties"]["uniqueItems"])
         self.assertEqual(ai_client._provider_tool_schemas(tools, {"provider": "github_models"}), tools)
 
+    def test_nested_array_bounds_remain_local_and_are_described_on_gemini_wire(self):
+        import copy
+        from automation_rules import AUTOMATION_TOOLS
+        tools = copy.deepcopy(AUTOMATION_TOOLS)
+        original = copy.deepcopy(tools)
+        adapted = ai_client._provider_tool_schemas(tools, {"provider": "gemini"})
+        properties = adapted[0]["function"]["parameters"]["properties"]
+        actions = properties["actions"]
+        self.assertNotIn("maxItems", actions)
+        self.assertIn("maxItems=8", actions["description"])
+        fields = actions["items"]["properties"]["embed"]["properties"]["fields"]
+        self.assertNotIn("maxItems", fields)
+        self.assertIn("maxItems=10", fields["description"])
+        self.assertEqual(actions["items"]["properties"]["type"]["enum"], ["send_message", "add_role", "remove_role"])
+        self.assertEqual(tools, original)
+        self.assertEqual(ai_client._provider_tool_schemas(tools, {"provider": "generic_openai_compatible"}), original)
+
+    def test_schema_adapter_does_not_strip_properties_named_like_array_keywords(self):
+        tools = [{"function": {"parameters": {"type": "object", "properties": {
+            "maxItems": {"type": "integer"}, "minItems": {"type": "integer"},
+        }}}}]
+        adapted = ai_client._provider_tool_schemas(tools, {"provider": "gemini"})
+        self.assertEqual(adapted, tools)
+
     def test_error_diagnostic_never_echoes_provider_content_or_secrets(self):
         body = '{"error":{"message":"Unknown uniqueItems in parameters; authorization=secret-token; private user message"}}'
         self.assertEqual(ai_client._upstream_error_diagnostic(body), "uniqueitems,parameters")

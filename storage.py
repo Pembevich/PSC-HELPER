@@ -1931,9 +1931,12 @@ async def _prune_old_backups(channel: discord.TextChannel, bot: discord.Client) 
                 part_ids = [part["message_id"] for part in manifest["parts"]]
             await msg.delete()
             for message_id in part_ids:
-                part_message = await channel.fetch_message(message_id)
-                if part_message.author.id == bot_user_id and str(part_message.content or "").startswith(_BACKUP_PART_MARKER):
-                    await part_message.delete()
+                try:
+                    part_message = await channel.fetch_message(message_id)
+                    if part_message.author.id == bot_user_id and str(part_message.content or "").startswith(_BACKUP_PART_MARKER):
+                        await part_message.delete()
+                except Exception:
+                    logger.warning("Could not prune retired database backup part %s.", message_id)
         except Exception:
             pass
 

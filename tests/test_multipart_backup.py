@@ -242,3 +242,13 @@ class MultipartBackupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(not message.deleted for message in self.channel.messages[len(old):]))
         self.assertTrue(await storage.restore_db_from_discord(self.bot, self.target_path))
         self.assertEqual(self._read_sentinel(), self.payload)
+
+    async def test_missing_retired_part_does_not_prevent_other_parts_being_pruned(self):
+        await self._upload()
+        old = list(self.channel.messages)
+        old[0].deleted = True
+        with patch.object(storage, "_BACKUP_KEEP_LAST", 1):
+            latest = await self._upload()
+        self.assertTrue(all(message.deleted for message in old))
+        self.assertFalse(latest.deleted)
+        self.assertTrue(await storage.restore_db_from_discord(self.bot, self.target_path))

@@ -1482,9 +1482,10 @@ async def _post_ai_payload(
 def _provider_tool_schemas(tools: list[dict[str, Any]], provider: Mapping[str, str]) -> list[dict[str, Any]]:
     """Adapt wire-only hints; the original schemas remain executor authority.
 
-    Gemini's bridge rejects bounded discovery arrays with a large item enum.
-    The catalog still supplies the names; discovery enforces the exact allowed
-    set and uniqueness locally. These wire hints never grant tool authority.
+    Gemini's bridge rejects combinations of deeply bounded arrays, even when
+    each tool works alone. Keep bounds as prose on the wire; local executors
+    retain the canonical limits. Discovery also validates exact allowed names
+    and uniqueness locally. These wire hints never grant tool authority.
     """
     if provider.get("provider") != "gemini":
         return tools
@@ -1494,6 +1495,10 @@ def _provider_tool_schemas(tools: list[dict[str, Any]], provider: Mapping[str, s
         if not isinstance(schema, dict):
             return
         schema.pop("uniqueItems", None)
+        bounds = {key: schema.pop(key) for key in ("minItems", "maxItems") if key in schema}
+        if bounds:
+            limits = ", ".join(f"{key}={value}" for key, value in bounds.items())
+            schema["description"] = (str(schema.get("description") or "") + " Количество элементов: " + limits + ".").strip()
         properties = schema.get("properties")
         if isinstance(properties, dict):
             for child in properties.values():
@@ -1675,6 +1680,17 @@ async def pos_chat_completion(
                         headers=headers,
                         payload=payload,
                     )
+                    if pinned_index is not None and response_status in {500, 502, 503, 504}:
+                        retry_delay = _parse_retry_after(response_headers) or 1.0
+                        if retry_delay <= 2.0:
+                            # Only the model request is repeated. Its transcript
+                            # already contains every executed tool receipt, and
+                            # no new tool response was accepted from this 5xx.
+                            logger.info("P.OS retrying transient toolchain request on the same provider (%s).", provider["name"])
+                            await asyncio.sleep(retry_delay)
+                            response_status, response_headers, response_text = await _post_ai_payload(
+                                session, provider["api_url"], headers=headers, payload=payload,
+                            )
                     if response_status == 413:
                         compacted, visuals_before, visuals_after = (
                             _compact_messages_for_oversize(messages)
@@ -1725,7 +1741,7 @@ async def pos_chat_completion(
                         return None
 
                     if response_status >= 500:
-                        await _mark_provider_backoff(provider_index, 8.0)
+                        await _mark_provider_backoff(provider_index, max(8.0, _parse_retry_after(response_headers) or 0.0))
                         logger.warning(
                             "P.OS upstream error %s (%s), body_sha256=%s",
                             response_status,

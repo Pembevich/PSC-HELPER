@@ -55,11 +55,19 @@ class ProviderAffinityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(ai_client._toolchain_provider_affinity.get())
 
     async def test_pinned_failure_never_sends_transcript_to_other_provider(self):
-        self.http.side_effect = [reply(), (500, {}, "down")]
+        self.http.side_effect = [reply(), (500, {}, "down"), (500, {}, "still down")]
         async with ai_client.toolchain_provider_affinity():
             await self.complete()
             self.assertIsNone(await self.complete())
-        self.assertEqual(self.routes(), [self.providers[0]["api_url"]] * 2)
+        self.assertEqual(self.routes(), [self.providers[0]["api_url"]] * 3)
+
+    async def test_retry_after_is_respected_instead_of_retrying_early(self):
+        self.http.side_effect = [reply(), (503, {"Retry-After": "30"}, "busy")]
+        async with ai_client.toolchain_provider_affinity():
+            await self.complete()
+            self.assertIsNone(await self.complete())
+        self.assertEqual(len(self.routes()), 2)
+        self.assertGreater(ai_client._provider_cooldown_remaining(0), 29)
 
     async def test_auxiliary_plain_request_does_not_change_pin(self):
         async with ai_client.toolchain_provider_affinity():
@@ -110,7 +118,7 @@ class ProviderAffinityTests(unittest.IsolatedAsyncioTestCase):
     async def test_live_loop_reports_effect_once_after_provider_failure(self):
         self.http.side_effect = [
             reply("discover_tools", {"names": ["send_message"]}, "discover"),
-            reply(call_id="write"), (503, {}, "down"),
+            reply(call_id="write"), (503, {}, "down"), (503, {}, "still down"),
         ]
         execute = AsyncMock(return_value={"status": "success", "result": "Сообщение отправлено."})
         answer = await run_agent_turn(
@@ -122,4 +130,23 @@ class ProviderAffinityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Сообщение отправлено", answer)
         self.assertIn("не смог", answer)
         execute.assert_awaited_once()
-        self.assertEqual(self.routes(), [self.providers[0]["api_url"]] * 3)
+        self.assertEqual(self.routes(), [self.providers[0]["api_url"]] * 4)
+
+    async def test_transient_retry_finishes_without_repeating_successful_effect(self):
+        self.http.side_effect = [
+            reply("discover_tools", {"names": ["send_message"]}, "discover"),
+            reply(call_id="write"), (503, {}, "busy"),
+            reply("finish_response", {"text": "Отправлено.", "outcome": "completed", "evidence_call_ids": ["write"]}, "finish"),
+        ]
+        execute = AsyncMock(return_value={"status": "success", "result": "Сообщение отправлено."})
+        answer = await run_agent_turn(
+            REQUEST, schemas={"send_message": TOOLS[0]}, eligible_names=frozenset({"send_message"}),
+            mutating_names=frozenset({"send_message"}), ask_user_schema=TOOLS[0],
+            complete=ai_client.pos_chat_completion, execute=execute, is_current=lambda: True,
+            prepare_text=lambda text: text, has_internal_syntax=lambda text: False,
+        )
+        self.assertEqual(answer, "Отправлено.")
+        execute.assert_awaited_once()
+        calls = self.http.await_args_list
+        self.assertEqual(calls[-2].kwargs["payload"], calls[-1].kwargs["payload"])
+        self.assertEqual(self.routes(), [self.providers[0]["api_url"]] * 4)
