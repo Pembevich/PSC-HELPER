@@ -8,7 +8,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
-from ai_client import toolchain_provider_affinity
+from ai_client import ai_completion_retry_delay, toolchain_provider_affinity
 from agent_tools import (
     DISCOVERY_INSTRUCTION,
     FINISH_RESPONSE_TOOL,
@@ -114,6 +114,7 @@ async def run_agent_turn(
     deadline = asyncio.get_running_loop().time() + timeout
     attempts = 0
     malformed = 0
+    completion_retries = 0
 
     def remaining() -> float:
         return max(0.0, deadline - asyncio.get_running_loop().time())
@@ -125,19 +126,39 @@ async def run_agent_turn(
             break
         options = dict(completion_options or {})
         available_this_step = frozenset(loaded)
-        options["timeout"] = max(1, int(min(float(options.get("timeout", 60)), remaining())))
-        try:
-            response = await asyncio.wait_for(complete(
-                copy.deepcopy(conversation), tools=copy.deepcopy(base_tools + list(loaded.values())),
-                tool_choice="required", **options,
-            ), timeout=remaining())
-        except Exception as exc:
-            logger.warning("Agent completion failed at round %s (%s)", round_index, type(exc).__name__)
-            return _incomplete(receipts, "AI не смог завершить ответ.")
+        response = None
+        failure_reason = "AI-провайдер не смог обработать запрос."
+        for completion_attempt in range(2):
+            options["timeout"] = max(1, int(min(float(options.get("timeout", 60)), remaining())))
+            try:
+                response = await asyncio.wait_for(complete(
+                    copy.deepcopy(conversation), tools=copy.deepcopy(base_tools + list(loaded.values())),
+                    tool_choice="required", **options,
+                ), timeout=remaining())
+                retry_delay = ai_completion_retry_delay() if response is None else None
+            except (TimeoutError, ConnectionError) as exc:
+                logger.warning("Agent completion interrupted at round %s (%s)", round_index, type(exc).__name__)
+                failure_reason = "AI не смог завершить ответ."
+                retry_delay = 0.5
+            except Exception as exc:
+                logger.warning("Agent completion failed at round %s (%s)", round_index, type(exc).__name__)
+                failure_reason = "AI не смог завершить ответ."
+                retry_delay = None
+            if response is not None or not is_current():
+                break
+            # Retry only the model request, retaining receipts and signatures.
+            # Permanent request/auth errors must not loop; writes never replay.
+            if (completion_attempt or completion_retries >= 3 or retry_delay is None
+                    or retry_delay > 10 or remaining() <= retry_delay + 1):
+                break
+            completion_retries += 1
+            await asyncio.sleep(max(0.0, retry_delay))
+            if not is_current() or remaining() <= 0:
+                break
         if not is_current():
             return _incomplete(receipts, "Запрос изменился; продолжение остановлено.")
         if response is None:
-            return _incomplete(receipts, "AI-провайдер не смог обработать запрос.")
+            return _incomplete(receipts, failure_reason)
         calls = _native_calls(response or {})
         if not calls:
             malformed += 1

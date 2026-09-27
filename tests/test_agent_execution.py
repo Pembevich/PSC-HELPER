@@ -4,7 +4,7 @@ import asyncio
 import copy
 import json
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from agent_runtime import run_agent_turn
 from agent_tools import compact_tool_catalog, make_discovery_tool
@@ -165,6 +165,49 @@ class AgentExecutionTests(unittest.IsolatedAsyncioTestCase):
         observation = _observations(self.messages_seen(1))["unproved-finish"]
         self.assertEqual(observation["status"], "error")
         self.assertIn("не подтверждено", observation["result"])
+
+    async def test_transient_completion_retries_same_transcript_without_replaying_write(self):
+        with patch("agent_runtime.ai_completion_retry_delay", return_value=0):
+            answer = await self.run_turn(
+                _discover("add_role"),
+                _response(_call("add_role", {"user_id": "123", "role_id_or_name": "A"}, "assigned")),
+                None,
+                _finish("Роль выдана.", "completed", ["assigned"]),
+            )
+        self.assertEqual(answer, "Роль выдана.")
+        self.execute.assert_awaited_once()
+        self.assertEqual(self.messages_seen(2), self.messages_seen(3))
+        self.assertEqual(_observations(self.messages_seen(3))["assigned"]["status"], "success")
+
+    async def test_transient_initial_request_can_recover(self):
+        with patch("agent_runtime.ai_completion_retry_delay", return_value=0):
+            answer = await self.run_turn(None, _finish("На связи."))
+        self.assertEqual(answer, "На связи.")
+        self.execute.assert_not_awaited()
+        self.assertEqual(self.messages_seen(0), self.messages_seen(1))
+
+    async def test_completion_retry_is_bounded_and_permanent_failures_do_not_retry(self):
+        for delay, count in [(None, 1), (60, 1), (0, 2)]:
+            with self.subTest(delay=delay), patch("agent_runtime.ai_completion_retry_delay", return_value=delay):
+                self.complete.reset_mock()
+                answer = await self.run_turn(None, None)
+                self.assertIn("AI-провайдер", answer)
+                self.assertEqual(self.complete.await_count, count)
+                self.execute.assert_not_awaited()
+
+    async def test_changed_request_during_backoff_never_retries(self):
+        current = True
+
+        async def sleep(_delay):
+            nonlocal current
+            current = False
+
+        with patch("agent_runtime.ai_completion_retry_delay", return_value=0.5), \
+                patch("agent_runtime.asyncio.sleep", side_effect=sleep):
+            answer = await self.run_turn(None, is_current=lambda: current)
+        self.assertIn("Запрос изменился", answer)
+        self.complete.assert_awaited_once()
+        self.execute.assert_not_awaited()
 
     async def test_hidden_and_unloaded_tools_never_reach_executor(self):
         answer = await self.run_turn(

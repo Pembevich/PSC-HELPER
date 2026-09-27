@@ -51,6 +51,8 @@ _ai_backoff_reason = ""
 _ai_last_backoff_log_at = 0.0
 _provider_cursor = 0
 _provider_backoff_until: dict[int, float] = {}
+_transient_provider_backoff_until: dict[int, float] = {}
+_grounding_provider_backoff_until: dict[int, float] = {}
 _missing_media_provider_logged = False
 _missing_web_provider_logged = False
 _MAX_UPSTREAM_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -65,11 +67,25 @@ class _ToolchainProviderAffinity:
     owner_task: asyncio.Task[Any] | None
     provider_index: int | None = None
     active: bool = True
+    retry_at: float | None = None
 
 
 _toolchain_provider_affinity: ContextVar[_ToolchainProviderAffinity | None] = ContextVar(
     "toolchain_provider_affinity", default=None,
 )
+
+
+def ai_completion_retry_delay() -> float | None:
+    """Retry hint for the last completion in the current agent scope.
+
+    None means no retry was justified. Mutable scope state survives wait_for's
+    child task without mixing concurrent turns. Only the model request may be
+    repeated; its transcript and already executed tool receipts must be kept.
+    """
+    scope = _toolchain_provider_affinity.get()
+    if scope is None or not scope.active or scope.retry_at is None:
+        return None
+    return max(0.0, scope.retry_at - time.monotonic())
 
 
 @asynccontextmanager
@@ -366,11 +382,26 @@ async def _reserve_exact_provider_index(
         return None
 
 
-async def _mark_provider_backoff(index: int, seconds: float) -> None:
+async def _mark_provider_backoff(index: int, seconds: float, *, retryable: bool = False) -> None:
     """#14: Атомарно продлить кулдаун провайдера под локом."""
     async with _provider_lock:
+        now = time.monotonic()
         _provider_backoff_until[index] = max(
-            _provider_backoff_until.get(index, 0.0), time.monotonic() + seconds
+            _provider_backoff_until.get(index, 0.0), now + seconds
+        )
+        if retryable and _provider_backoff_until[index] - now <= 10.0:
+            _transient_provider_backoff_until[index] = _provider_backoff_until[index]
+        else:
+            _transient_provider_backoff_until.pop(index, None)
+
+
+async def _mark_grounding_provider_backoff(index: int, seconds: float) -> None:
+    # Google Search has its own quotas and feature availability. A failed
+    # auxiliary search must not prevent the pinned chat from using its result
+    # (or a fallback search result) and finishing the user's turn.
+    async with _provider_lock:
+        _grounding_provider_backoff_until[index] = max(
+            _grounding_provider_backoff_until.get(index, 0.0), time.monotonic() + seconds
         )
 
 
@@ -978,7 +1009,10 @@ async def pos_gemini_grounded_search(
         try:
             async with _request_slot(request_timeout):
                 provider_index = await _reserve_exact_provider_index(
-                    "gemini", exclude_indices=frozenset(attempted)
+                    "gemini", exclude_indices=frozenset(attempted) | frozenset(
+                        index for index, until in _grounding_provider_backoff_until.items()
+                        if until > time.monotonic()
+                    )
                 )
                 if provider_index is None or provider_index in attempted:
                     return None
@@ -986,7 +1020,7 @@ async def pos_gemini_grounded_search(
                 provider = _AI_PROVIDER_POOL[provider_index]
                 endpoint = _gemini_generate_content_url(provider)
                 if endpoint is None:
-                    await _mark_provider_backoff(provider_index, 300.0)
+                    await _mark_grounding_provider_backoff(provider_index, 300.0)
                     continue
                 payload = {
                     "contents": [
@@ -1046,15 +1080,15 @@ async def pos_gemini_grounded_search(
                                 _parse_retry_after(response.headers)
                                 or POS_AI_RATE_LIMIT_FALLBACK_SECONDS
                             )
-                            await _mark_provider_backoff(provider_index, retry_after)
+                            await _mark_grounding_provider_backoff(provider_index, retry_after)
                             continue
                         if response.status >= 500:
-                            await _mark_provider_backoff(provider_index, 15.0)
+                            await _mark_grounding_provider_backoff(provider_index, 15.0)
                             continue
                         if response.status in {401, 403}:
-                            await _mark_provider_backoff(provider_index, 3600.0)
+                            await _mark_grounding_provider_backoff(provider_index, 3600.0)
                         elif 300 <= response.status < 400:
-                            await _mark_provider_backoff(provider_index, 300.0)
+                            await _mark_grounding_provider_backoff(provider_index, 300.0)
                         logger.warning(
                             "P.OS Gemini search API error %s (%s), body_sha256=%s",
                             response.status,
@@ -1065,10 +1099,10 @@ async def pos_gemini_grounded_search(
             return None
         except (asyncio.TimeoutError, TimeoutError):
             if provider_index is not None:
-                await _mark_provider_backoff(provider_index, 15.0)
+                await _mark_grounding_provider_backoff(provider_index, 15.0)
         except Exception as exc:
             if provider_index is not None:
-                await _mark_provider_backoff(provider_index, 60.0)
+                await _mark_grounding_provider_backoff(provider_index, 60.0)
             logger.warning(
                 "P.OS Gemini search request failed (%s): %s",
                 provider["name"] if provider else "unknown",
@@ -1479,6 +1513,61 @@ async def _post_ai_payload(
         return response.status, dict(response.headers), response_text
 
 
+def _retryable_empty_response(body: str) -> bool:
+    """A malformed transport response is different from an explicit refusal."""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return True
+    if not isinstance(data, dict):
+        return True
+    if _extract_message_from_payload(data):
+        return False
+    feedback = data.get("promptFeedback") or data.get("prompt_feedback")
+    if isinstance(feedback, dict) and (feedback.get("blockReason") or feedback.get("block_reason")):
+        return False
+    candidates = data.get("candidates") or data.get("choices") or []
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if isinstance(candidate, dict) and str(
+                candidate.get("finishReason") or candidate.get("finish_reason") or ""
+            ).upper() in {"SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST", "CONTENT_FILTER"}:
+                return False
+    return "error" not in data
+
+
+async def _post_chat_payload_with_retry(
+    session: aiohttp.ClientSession, url: str, *,
+    headers: Mapping[str, str], payload: Mapping[str, Any],
+) -> tuple[int, dict[str, str], str]:
+    """At most two model requests on one route; never executes any tools."""
+    for attempt in range(2):
+        try:
+            response = await _post_ai_payload(session, url, headers=headers, payload=payload)
+        except (aiohttp.ClientConnectorCertificateError, aiohttp.ClientSSLError):
+            raise
+        except (asyncio.TimeoutError, aiohttp.ClientConnectionError):
+            if attempt:
+                raise
+            logger.info("P.OS retrying transient AI transport failure on the same provider.")
+            await asyncio.sleep(0.5)
+            continue
+        status, response_headers, body = response
+        retry_after = _parse_retry_after(response_headers)
+        transient = status in {408, 425, 500, 502, 503, 504}
+        # Without an explicit short interval, a quota failure must wait for the
+        # regular provider cooldown instead of immediately spending more quota.
+        transient = transient or (status == 429 and retry_after is not None)
+        transient = transient or (status == 200 and _retryable_empty_response(body))
+        delay = retry_after if retry_after is not None else 0.5
+        if not attempt and transient and delay <= 2.0:
+            logger.info("P.OS retrying transient AI response on the same provider (status=%s).", status)
+            await asyncio.sleep(delay)
+            continue
+        return response
+    raise RuntimeError("AI retry loop exhausted without a result")
+
+
 def _provider_tool_schemas(tools: list[dict[str, Any]], provider: Mapping[str, str]) -> list[dict[str, Any]]:
     """Adapt wire-only hints; the original schemas remain executor authority.
 
@@ -1540,9 +1629,6 @@ async def pos_chat_completion(
     timeout: int = POS_AI_TIMEOUT_SECONDS,
     provider_type: str | None = None,
 ) -> dict[str, Any] | None:
-    if not ai_has_configured_provider():
-        return None
-
     request_max_tokens = _bounded_int(max_tokens, POS_AI_MAX_TOKENS, 1, 32_768)
     request_temperature = _bounded_float(temperature, POS_AI_TEMPERATURE, 0.0, 2.0)
     request_top_p = _bounded_float(top_p, POS_AI_TOP_P, 0.0, 1.0)
@@ -1563,7 +1649,27 @@ async def pos_chat_completion(
     affinity = _toolchain_provider_affinity.get() if uses_tool_protocol else None
     if affinity is not None and not affinity.active:
         affinity = None
+    if affinity is not None:
+        affinity.retry_at = None
     pinned_index = affinity.provider_index if affinity is not None else None
+
+    def note_retry(delay: float) -> None:
+        if affinity is not None and 0 <= delay <= 10.0:
+            retry_at = time.monotonic() + delay
+            affinity.retry_at = min(affinity.retry_at or retry_at, retry_at)
+
+    def note_cooling_retry() -> None:
+        for index, candidate in enumerate(_AI_PROVIDER_POOL):
+            if pinned_index is not None and index != pinned_index:
+                continue
+            if requires_vision and candidate.get("provider") != "gemini":
+                continue
+            until = _transient_provider_backoff_until.get(index, 0.0)
+            if until and until == _provider_backoff_until.get(index) and until > time.monotonic():
+                note_retry(until - time.monotonic())
+
+    if not ai_has_configured_provider():
+        return None
     if requires_vision:
         max_attempts = sum(
             1
@@ -1591,6 +1697,7 @@ async def pos_chat_completion(
         try:
             async with _request_slot(request_timeout):
                 if ai_is_temporarily_unavailable():
+                    note_cooling_retry()
                     _log_ai_backoff_once(
                         f"P.OS AI cooldown active: {ai_unavailable_reason()} ({ai_cooldown_remaining():.0f}s remaining)."
                     )
@@ -1606,6 +1713,7 @@ async def pos_chat_completion(
                         )
                     ):
                         logger.warning("P.OS toolchain provider is unavailable; continuation stopped.")
+                        note_cooling_retry()
                         return None
                     provider_index = pinned_index
                 else:
@@ -1638,6 +1746,7 @@ async def pos_chat_completion(
                     _log_ai_backoff_once(
                         "P.OS AI request has no remaining compatible provider."
                     )
+                    note_cooling_retry()
                     return None
 
                 attempted.add(provider_index)
@@ -1674,23 +1783,12 @@ async def pos_chat_completion(
                     connector=connector,
                     trust_env=False,
                 ) as session:
-                    response_status, response_headers, response_text = await _post_ai_payload(
+                    response_status, response_headers, response_text = await _post_chat_payload_with_retry(
                         session,
                         provider["api_url"],
                         headers=headers,
                         payload=payload,
                     )
-                    if pinned_index is not None and response_status in {500, 502, 503, 504}:
-                        retry_delay = _parse_retry_after(response_headers) or 1.0
-                        if retry_delay <= 2.0:
-                            # Only the model request is repeated. Its transcript
-                            # already contains every executed tool receipt, and
-                            # no new tool response was accepted from this 5xx.
-                            logger.info("P.OS retrying transient toolchain request on the same provider (%s).", provider["name"])
-                            await asyncio.sleep(retry_delay)
-                            response_status, response_headers, response_text = await _post_ai_payload(
-                                session, provider["api_url"], headers=headers, payload=payload,
-                            )
                     if response_status == 413:
                         compacted, visuals_before, visuals_after = (
                             _compact_messages_for_oversize(messages)
@@ -1726,7 +1824,8 @@ async def pos_chat_completion(
                             _parse_retry_after(response_headers)
                             or POS_AI_RATE_LIMIT_FALLBACK_SECONDS
                         )
-                        await _mark_provider_backoff(provider_index, retry_after)
+                        await _mark_provider_backoff(provider_index, retry_after, retryable=True)
+                        note_retry(_provider_cooldown_remaining(provider_index))
                         _log_ai_backoff_once(
                             f"P.OS API rate limited ({provider['name']}): pause for {retry_after:.0f}s."
                         )
@@ -1741,7 +1840,11 @@ async def pos_chat_completion(
                         return None
 
                     if response_status >= 500:
-                        await _mark_provider_backoff(provider_index, max(8.0, _parse_retry_after(response_headers) or 0.0))
+                        delay = max(8.0, _parse_retry_after(response_headers) or 0.0)
+                        retryable = response_status in {500, 502, 503, 504}
+                        await _mark_provider_backoff(provider_index, delay, retryable=retryable)
+                        if retryable:
+                            note_retry(_provider_cooldown_remaining(provider_index))
                         logger.warning(
                             "P.OS upstream error %s (%s), body_sha256=%s",
                             response_status,
@@ -1785,28 +1888,29 @@ async def pos_chat_completion(
                         elif response_status == 404:
                             await _mark_provider_backoff(provider_index, 300.0)
                         elif response_status in {408, 409, 425}:
-                            await _mark_provider_backoff(provider_index, 10.0)
+                            await _mark_provider_backoff(provider_index, 10.0, retryable=True)
+                            note_retry(_provider_cooldown_remaining(provider_index))
                         if attempt < max_attempts - 1:
                             continue
                         return None
         except _AIQueueTimeout:
             _log_ai_backoff_once("P.OS AI queue is full; request rejected before provider call.")
+            note_retry(0.5)
             return None
         except asyncio.TimeoutError:
             name = provider["name"] if provider else "unknown"
             logger.warning("P.OS API timeout for %s; attempting fallback.", name)
+            note_retry(0.5)
             if attempt < max_attempts - 1:
                 continue
             return None
         except Exception as exc:
             # provider_index может быть не присвоен, если исключение случилось до
             # выбора провайдера — иначе тут вылетал NameError вместо возврата None.
-            if provider_index is not None:
-                exc_str = str(exc).lower()
-                if "rate" in exc_str or "limit" in exc_str or "quota" in exc_str:
-                    await _mark_provider_backoff(provider_index, 20.0)
-                else:
-                    await _mark_provider_backoff(provider_index, 60.0)
+            if isinstance(exc, aiohttp.ClientConnectionError) and not isinstance(
+                exc, (aiohttp.ClientConnectorCertificateError, aiohttp.ClientSSLError)
+            ):
+                note_retry(0.5)
             name = provider["name"] if provider else "unknown"
             logger.warning(
                 "P.OS API request failed (%s, %s); attempting fallback.",
@@ -1826,8 +1930,7 @@ async def pos_chat_completion(
                 provider["name"] if provider else "unknown",
                 _upstream_body_fingerprint(response_text),
             )
-            if provider_index is not None:
-                await _mark_provider_backoff(provider_index, 8.0)
+            note_retry(0.5)
             if attempt < max_attempts - 1:
                 continue
             return None
@@ -1839,8 +1942,8 @@ async def pos_chat_completion(
                 _upstream_body_fingerprint(response_text),
                 _response_shape_summary(data) if isinstance(data, Mapping) else "non-object",
             )
-            if provider_index is not None:
-                await _mark_provider_backoff(provider_index, 8.0)
+            if _retryable_empty_response(response_text):
+                note_retry(0.5)
             if attempt < max_attempts - 1:
                 continue
             return None
@@ -1850,6 +1953,8 @@ async def pos_chat_completion(
             and (msg.get("tool_calls") or msg.get("function_call"))
         ):
             affinity.provider_index = provider_index
+        if affinity is not None:
+            affinity.retry_at = None
         return msg
 
     return None

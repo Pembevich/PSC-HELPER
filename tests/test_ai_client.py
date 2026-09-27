@@ -655,13 +655,13 @@ class ProviderRoutingRegressionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_timeout_tries_healthy_lower_priority_provider(self):
         self._pool("gemini", "github_models")
-        self.http.side_effect = [asyncio.TimeoutError(), self.success]
+        self.http.side_effect = [asyncio.TimeoutError(), asyncio.TimeoutError(), self.success]
 
         result = await self._chat()
 
         self.assertEqual(result["content"], "Ответ получен.")
         self.assertEqual(
-            self._requested_urls(), [provider["api_url"] for provider in self.providers]
+            self._requested_urls(), [self.providers[index]["api_url"] for index in (0, 0, 1)]
         )
 
     async def test_request_specific_errors_try_each_route_once(self):
