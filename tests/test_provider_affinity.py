@@ -248,7 +248,11 @@ class ProviderAffinityTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(ai_client.ai_completion_retry_delay())
 
     async def test_empty_transport_response_can_recover_without_switching_provider(self):
-        for body in ('<html>proxy error</html>', '{"choices": []}'):
+        bodies = ['<html>proxy error</html>', '{"choices": []}']
+        bodies.extend(json.dumps({"choices": [{"finish_reason": "stop", "message": {
+            "role": "assistant", "content": content,
+        }}]}) for content in (None, "", " \n ", [], [{"type": "text", "text": "  "}]))
+        for body in bodies:
             with self.subTest(body=body):
                 self.http.reset_mock()
                 self.http.side_effect = [(200, {}, body), reply()]
@@ -256,6 +260,40 @@ class ProviderAffinityTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNotNone(await self.complete())
                     self.assertIsNone(ai_client.ai_completion_retry_delay())
                 self.assertEqual(self.routes(), [self.providers[0]["api_url"]] * 2)
+
+    async def test_consecutive_empty_messages_return_a_transient_hint(self):
+        self.providers[:] = self.providers[:1]
+        for content in (None, " \n ", []):
+            with self.subTest(content=content):
+                self.http.reset_mock()
+                self.http.return_value = (200, {}, json.dumps({"choices": [{"message": {
+                    "role": "assistant", "content": content,
+                }}]}))
+                async with ai_client.toolchain_provider_affinity():
+                    self.assertIsNone(await self.complete())
+                    self.assertEqual(ai_client.ai_completion_retry_delay(), 0.5)
+                self.assertEqual(self.http.await_count, 2)
+
+    async def test_refusal_with_empty_message_never_retries_or_switches_provider(self):
+        bodies = [
+            {"choices": [{"finish_reason": "content_filter", "message": {
+                "role": "assistant", "content": None,
+            }}]},
+            {"choices": [{"message": {
+                "role": "assistant", "content": "", "refusal": "Request declined.",
+            }}]},
+            {"choices": [{"message": {"role": "assistant", "content": [
+                {"type": "refusal", "refusal": "Request declined."},
+            ]}}]},
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                self.http.reset_mock()
+                self.http.return_value = (200, {}, json.dumps(body))
+                async with ai_client.toolchain_provider_affinity():
+                    self.assertIsNone(await self.complete())
+                    self.assertIsNone(ai_client.ai_completion_retry_delay())
+                self.http.assert_awaited_once()
 
     async def test_explicit_filtered_response_is_not_treated_as_transport_failure(self):
         self.providers[:] = self.providers[:1]
@@ -272,6 +310,18 @@ class ProviderAffinityTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNone(await self.complete())
                     self.assertIsNone(ai_client.ai_completion_retry_delay())
                 self.http.assert_awaited_once()
+
+    async def test_fallback_refusal_clears_an_earlier_transient_retry_hint(self):
+        self.http.side_effect = [
+            (503, {}, "busy"), (503, {}, "still busy"),
+            (200, {}, json.dumps({"choices": [{"message": {
+                "role": "assistant", "content": None, "refusal": "Request declined.",
+            }}]})),
+        ]
+        async with ai_client.toolchain_provider_affinity():
+            self.assertIsNone(await self.complete())
+            self.assertIsNone(ai_client.ai_completion_retry_delay())
+        self.assertEqual(self.routes(), [self.providers[index]["api_url"] for index in (0, 0, 1)])
 
     async def test_turn_level_retry_retains_tool_receipt_and_does_not_repeat_effect(self):
         self.http.side_effect = [
@@ -292,4 +342,27 @@ class ProviderAffinityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payloads[0], payloads[1])
         self.assertEqual(payloads[1], payloads[2])
         self.assertTrue(any(message.get("tool_call_id") == "write" for message in payloads[2]["messages"]))
+        self.assertEqual(self.routes(), [self.providers[0]["api_url"]] * 5)
+
+    async def test_turn_level_retry_recovers_two_empty_messages_after_a_write(self):
+        empty = (200, {}, json.dumps({"choices": [{"message": {
+            "role": "assistant", "content": None,
+        }}]}))
+        self.http.side_effect = [
+            reply("discover_tools", {"names": ["send_message"]}, "discover"),
+            reply(call_id="write"), empty, empty,
+            reply("finish_response", {"text": "Отправлено.", "outcome": "completed", "evidence_call_ids": ["write"]}, "finish"),
+        ]
+        execute = AsyncMock(return_value={"status": "success", "result": "Сообщение отправлено."})
+        answer = await run_agent_turn(
+            REQUEST, schemas={"send_message": TOOLS[0]}, eligible_names=frozenset({"send_message"}),
+            mutating_names=frozenset({"send_message"}), ask_user_schema=TOOLS[0],
+            complete=ai_client.pos_chat_completion, execute=execute, is_current=lambda: True,
+            prepare_text=lambda text: text, has_internal_syntax=lambda text: False,
+        )
+        self.assertEqual(answer, "Отправлено.")
+        execute.assert_awaited_once()
+        payloads = [call.kwargs["payload"] for call in self.http.await_args_list[-3:]]
+        self.assertEqual(payloads[0], payloads[1])
+        self.assertEqual(payloads[1], payloads[2])
         self.assertEqual(self.routes(), [self.providers[0]["api_url"]] * 5)

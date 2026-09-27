@@ -1513,6 +1513,48 @@ async def _post_ai_payload(
         return response.status, dict(response.headers), response_text
 
 
+def _message_has_output(message: Mapping[str, Any] | None) -> bool:
+    if not message:
+        return False
+    if message.get("tool_calls") or message.get("function_call"):
+        return True
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for part in content:
+            value = part.get("text") if isinstance(part, Mapping) and "text" in part else part
+            if (isinstance(value, str) and value.strip()) or (not isinstance(value, str) and value):
+                return True
+        return False
+    return bool(content)
+
+
+def _response_is_refused(data: Mapping[str, Any]) -> bool:
+    feedback = data.get("promptFeedback") or data.get("prompt_feedback")
+    if isinstance(feedback, Mapping) and (feedback.get("blockReason") or feedback.get("block_reason")):
+        return True
+    message = _extract_message_from_payload(dict(data))
+    if message:
+        if message.get("refusal"):
+            return True
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(part, Mapping) and part.get("type") == "refusal" for part in content
+        ):
+            return True
+    for key in ("candidates", "choices"):
+        candidates = data.get(key)
+        if isinstance(candidates, list):
+            for candidate in candidates:
+                if isinstance(candidate, Mapping) and str(
+                    candidate.get("finishReason") or candidate.get("finish_reason") or ""
+                ).upper() in {"SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST", "CONTENT_FILTER"}:
+                    return True
+    result = data.get("result")
+    return isinstance(result, Mapping) and _response_is_refused(result)
+
+
 def _retryable_empty_response(body: str) -> bool:
     """A malformed transport response is different from an explicit refusal."""
     try:
@@ -1521,18 +1563,8 @@ def _retryable_empty_response(body: str) -> bool:
         return True
     if not isinstance(data, dict):
         return True
-    if _extract_message_from_payload(data):
+    if _response_is_refused(data) or _message_has_output(_extract_message_from_payload(data)):
         return False
-    feedback = data.get("promptFeedback") or data.get("prompt_feedback")
-    if isinstance(feedback, dict) and (feedback.get("blockReason") or feedback.get("block_reason")):
-        return False
-    candidates = data.get("candidates") or data.get("choices") or []
-    if isinstance(candidates, list):
-        for candidate in candidates:
-            if isinstance(candidate, dict) and str(
-                candidate.get("finishReason") or candidate.get("finish_reason") or ""
-            ).upper() in {"SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST", "CONTENT_FILTER"}:
-                return False
     return "error" not in data
 
 
@@ -1935,8 +1967,13 @@ async def pos_chat_completion(
                 continue
             return None
 
+        if isinstance(data, Mapping) and _response_is_refused(data):
+            logger.info("P.OS AI provider explicitly declined the request; no retry or fallback.")
+            if affinity is not None:
+                affinity.retry_at = None
+            return None
         msg = _extract_message_from_payload(dict(data)) if isinstance(data, Mapping) else None
-        if not msg:
+        if not msg or not _message_has_output(msg):
             logger.warning(
                 "P.OS API response had no message: body_sha256=%s shape=%s",
                 _upstream_body_fingerprint(response_text),
