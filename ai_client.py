@@ -1600,6 +1600,41 @@ async def _post_chat_payload_with_retry(
     raise RuntimeError("AI retry loop exhausted without a result")
 
 
+def _provider_messages(messages: list[dict[str, Any]], provider: Mapping[str, str]) -> list[dict[str, Any]]:
+    """Keep all system instructions in Gemini's single system-instruction slot.
+
+    The agent adds protocol/catalog instructions after its persona and actor
+    context. Sending them as separate system turns through Gemini's OpenAI
+    bridge can lose earlier instructions. Only system content is consolidated;
+    user data and signed assistant/tool turns retain their roles and order.
+    """
+    if provider.get("provider") != "gemini":
+        return messages
+    system_messages = [message for message in messages if message.get("role") == "system"]
+    if not system_messages or (len(system_messages) == 1 and messages[0].get("role") == "system"):
+        return messages
+    contents = [message.get("content") for message in system_messages]
+    content: Any
+    if all(isinstance(item, str) for item in contents):
+        content = "\n\n".join(str(item) for item in contents)
+    else:
+        content = []
+        for item in contents:
+            if content:
+                content.append({"type": "text", "text": "\n\n"})
+            if isinstance(item, list):
+                content.extend(copy.deepcopy(item))
+            elif isinstance(item, str):
+                content.append({"type": "text", "text": item})
+            elif item is not None:
+                # Leave unsupported content for upstream validation rather
+                # than silently dropping a caller's authority instructions.
+                return messages
+    return [{"role": "system", "content": content}] + [
+        copy.deepcopy(message) for message in messages if message.get("role") != "system"
+    ]
+
+
 def _provider_tool_schemas(tools: list[dict[str, Any]], provider: Mapping[str, str]) -> list[dict[str, Any]]:
     """Adapt wire-only hints; the original schemas remain executor authority.
 
@@ -1786,7 +1821,7 @@ async def pos_chat_completion(
 
                 accept_header = "application/vnd.github+json" if provider["provider"] == "github_models" else "application/json"
                 payload = {
-                    "messages": messages,
+                    "messages": _provider_messages(messages, provider),
                     "model": provider["model"],
                     "max_tokens": request_max_tokens,
                     "temperature": request_temperature,
@@ -1827,7 +1862,7 @@ async def pos_chat_completion(
                         )
                         if compacted != messages:
                             retry_payload = dict(payload)
-                            retry_payload["messages"] = compacted
+                            retry_payload["messages"] = _provider_messages(compacted, provider)
                             logger.info(
                                 "P.OS retrying oversized AI request with bounded context "
                                 "(%s->%s messages, %s->%s visuals, %s->%s bytes).",
