@@ -90,7 +90,7 @@ class PromptInjectionGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("раскрывай подробно", prompt)
         self.assertIn("не замыкайся в сухой реакции", prompt)
         self.assertIn("проявляй собственную позицию", prompt)
-        self.assertIn("входи в выбранную манеру полноценно", prompt)
+        self.assertIn("могут содержать требуемый текст и эмодзи как часть материала", prompt)
         self.assertNotIn("короткий вопрос — короткий ответ", prompt)
 
     def test_identity_output_guard_replaces_only_self_disclosure(self):

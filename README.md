@@ -121,6 +121,11 @@ or model. Other providers remain pinned after their first native tool call.
 Gemini [rate limits apply per project, not per API key](https://ai.google.dev/gemini-api/docs/rate-limits),
 so multiple keys from one project do not add quota or guarantee availability.
 
+Native tool turns on `gemini-3.1-flash-lite` (including its preview alias) use
+`reasoning_effort=medium` to improve instruction following in the agent context.
+This can use more reasoning tokens than the model default. Plain completions
+and other models retain their default reasoning settings.
+
 An entry whose endpoint is on `googleapis.com` is treated as Gemini. P.OS uses
 that entry first and can send bounded audio/video to Gemini's native
 `generateContent` API; image/GIF/video-frame understanding still works when the

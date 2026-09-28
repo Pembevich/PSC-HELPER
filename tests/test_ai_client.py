@@ -632,6 +632,7 @@ class ProviderRoutingRegressionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_gemini_413_retry_keeps_persona_actor_and_catalog(self):
         self._pool("gemini")
+        self.providers[0]["model"] = "gemini-3.1-flash-lite"
         self.http.side_effect = [(413, {}, "request too large"), self.success]
         messages = self._agent_conversation()
         messages[1:1] = [{"role": "user", "content": f"Old turn {index}"} for index in range(40)]
@@ -640,12 +641,59 @@ class ProviderRoutingRegressionTests(unittest.IsolatedAsyncioTestCase):
         await ai_client.pos_chat_completion(messages)
 
         self.assertEqual(self.http.await_count, 2)
+        self.assertEqual([
+            call.kwargs["payload"].get("reasoning_effort")
+            for call in self.http.await_args_list
+        ], ["medium", "medium"])
         first, retry = [call.kwargs["payload"]["messages"] for call in self.http.await_args_list]
         self.assertLess(len(retry), len(first))
         self.assertEqual(retry[0], first[0])
         self.assertEqual(sum(item["role"] == "system" for item in retry), 1)
         self.assertEqual(retry[-3:], [original[-5], *original[-2:]])
         self.assertEqual(messages, original)
+
+    async def test_reasoning_effort_is_scoped_to_flash_lite_tool_protocol(self):
+        tool = {"type": "function", "function": {
+            "name": "read_status",
+            "parameters": {"type": "object", "properties": {}},
+        }}
+        cases = [
+            ("gemini", "gemini-3.1-flash-lite", "tools", "medium"),
+            ("gemini", "gemini-3.1-flash-lite-preview", "tools", "medium"),
+            ("gemini", "gemini-3.1-flash-lite", "history", "medium"),
+            ("gemini", "gemini-3.1-flash-lite-preview", "history", "medium"),
+            ("gemini", "gemini-3.1-flash-lite", "plain", None),
+            ("gemini", "gemini-3.1-flash-lite-preview", "plain", None),
+            ("gemini", "gemini-other-model", "tools", None),
+            ("generic_openai_compatible", "gemini-3.1-flash-lite", "tools", None),
+            ("github_models", "gemini-3.1-flash-lite", "tools", None),
+        ]
+        for kind, model, mode, expected in cases:
+            with self.subTest(provider=kind, model=model, mode=mode):
+                self.providers.clear()
+                self._pool(kind)
+                self.providers[0]["model"] = model
+                self.http.reset_mock()
+                self.http.return_value = self.success
+                messages = (
+                    self._agent_conversation() if mode == "history"
+                    else [{"role": "user", "content": "Проверь состояние."}]
+                )
+                original = copy.deepcopy(messages)
+
+                result = await ai_client.pos_chat_completion(
+                    messages, tools=[tool] if mode == "tools" else None,
+                )
+
+                self.assertIsNotNone(result)
+                self.http.assert_awaited_once()
+                payload = self.http.await_args.kwargs["payload"]
+                self.assertEqual(payload["model"], model)
+                if expected is None:
+                    self.assertNotIn("reasoning_effort", payload)
+                else:
+                    self.assertEqual(payload["reasoning_effort"], expected)
+                self.assertEqual(messages, original)
 
     async def test_other_provider_retains_system_turn_layout(self):
         self._pool("generic_openai_compatible")

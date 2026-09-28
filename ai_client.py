@@ -1865,6 +1865,12 @@ async def pos_chat_completion(
                     "top_p": request_top_p,
                     "stream": False,
                 }
+                if (uses_tool_protocol and provider["provider"] == "gemini"
+                        and provider["model"] in {"gemini-3.1-flash-lite", "gemini-3.1-flash-lite-preview"}):
+                    # Flash-Lite's fast default misses actor/persona boundaries
+                    # in the agent's larger context. Keep moderate reasoning
+                    # for native tool turns; other routes retain their defaults.
+                    payload["reasoning_effort"] = "medium"
                 if "googleapis.com" not in provider["api_url"] and provider["provider"] != "gemini":
                     payload["frequency_penalty"] = 0.35
                     payload["presence_penalty"] = 0.2
