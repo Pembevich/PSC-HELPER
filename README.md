@@ -94,7 +94,7 @@ Configure environment variables in Railway. A local `.env` is for development on
 
 Legacy-compatible variables still work: `POS_AI_API_KEY`, `POS_AI_API_URL`, `POS_AI_MODEL`, `NVIDIA_API_KEY`, etc.
 
-### Provider pool (rate-limit spreading)
+### Provider pool and failover
 
 | Variable | Description |
 | --- | --- |
@@ -109,6 +109,17 @@ POS_AI_PROVIDER_KEYS=gemini_key,github_models_token
 POS_AI_PROVIDER_URLS=https://generativelanguage.googleapis.com/v1beta/openai/chat/completions,https://models.github.ai/inference/chat/completions
 POS_AI_PROVIDER_MODELS=gemini-3.6-flash,openai/gpt-4.1
 ```
+
+For interchangeable Gemini keys, add each key with the **exact same endpoint
+and model** to the three CSV lists. Supplied URL/model lists must each have one
+entry per key; duplicate key/endpoint/model combinations are ignored.
+
+Transient failures receive bounded retries and per-route cooldowns. An active
+Gemini tool chain can switch credentials while preserving its transcript,
+thought signatures and completed actions; it never switches to another endpoint
+or model. Other providers remain pinned after their first native tool call.
+Gemini [rate limits apply per project, not per API key](https://ai.google.dev/gemini-api/docs/rate-limits),
+so multiple keys from one project do not add quota or guarantee availability.
 
 An entry whose endpoint is on `googleapis.com` is treated as Gemini. P.OS uses
 that entry first and can send bounded audio/video to Gemini's native

@@ -90,7 +90,7 @@ def ai_completion_retry_delay() -> float | None:
 
 @asynccontextmanager
 async def toolchain_provider_affinity():
-    """Keep native tool transcripts on the provider that produced their calls.
+    """Keep native tool transcripts on their original endpoint and model.
 
     The state is mutable because wait_for runs completions in child tasks: a
     ContextVar.set inside such a completion would not reach the next round.
@@ -172,6 +172,7 @@ def _build_provider_pool() -> list[dict[str, str]]:
             )
             return []
         pool: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
         for index, key in enumerate(POS_AI_PROVIDER_KEYS):
             url = POS_AI_PROVIDER_URLS[index] if index < len(POS_AI_PROVIDER_URLS) else POS_AI_API_URL
             model = POS_AI_PROVIDER_MODELS[index] if index < len(POS_AI_PROVIDER_MODELS) else POS_AI_MODEL
@@ -181,6 +182,10 @@ def _build_provider_pool() -> list[dict[str, str]]:
             if not key.strip() or not model.strip():
                 logger.error("AI provider %s is missing a key or model and was skipped.", index + 1)
                 continue
+            identity = (key.strip(), url, model.strip())
+            if identity in seen:
+                continue
+            seen.add(identity)
             pool.append(
                 {
                     "name": f"provider_{index + 1}",
@@ -379,6 +384,42 @@ async def _reserve_exact_provider_index(
             ):
                 _provider_cursor = (idx + 1) % total
                 return idx
+        return None
+
+
+def _compatible_toolchain_indices(pinned_index: int) -> frozenset[int]:
+    """Gemini credentials may share a signed transcript, not other models.
+
+    Keep the exact endpoint/model and all opaque signatures intact. Other
+    providers stay pinned until their credential portability is verified.
+    """
+    if not 0 <= pinned_index < len(_AI_PROVIDER_POOL):
+        return frozenset()
+    pinned = _AI_PROVIDER_POOL[pinned_index]
+    if pinned.get("provider") != "gemini":
+        return frozenset({pinned_index}) if pinned.get("api_key") else frozenset()
+    return frozenset(
+        index for index, candidate in enumerate(_AI_PROVIDER_POOL)
+        if candidate.get("api_key") and candidate.get("provider") == "gemini"
+        and candidate.get("api_url") == pinned.get("api_url")
+        and candidate.get("model") == pinned.get("model")
+    )
+
+
+async def _reserve_toolchain_provider_index(
+    pinned_index: int, *, exclude_indices: frozenset[int] = frozenset(),
+) -> int | None:
+    """Prefer the current credential, then an available compatible reserve."""
+    global _provider_cursor
+    async with _provider_lock:
+        compatible = _compatible_toolchain_indices(pinned_index)
+        total = len(_AI_PROVIDER_POOL)
+        order = [pinned_index] + [(_provider_cursor + offset) % total for offset in range(total)]
+        for index in order:
+            if (index in compatible and index not in exclude_indices
+                    and _provider_cooldown_remaining(index) <= 0):
+                _provider_cursor = (index + 1) % total
+                return index
         return None
 
 
@@ -1719,6 +1760,9 @@ async def pos_chat_completion(
     if affinity is not None:
         affinity.retry_at = None
     pinned_index = affinity.provider_index if affinity is not None else None
+    compatible_indices = (
+        _compatible_toolchain_indices(pinned_index) if pinned_index is not None else None
+    )
 
     def note_retry(delay: float) -> None:
         if affinity is not None and 0 <= delay <= 10.0:
@@ -1727,7 +1771,7 @@ async def pos_chat_completion(
 
     def note_cooling_retry() -> None:
         for index, candidate in enumerate(_AI_PROVIDER_POOL):
-            if pinned_index is not None and index != pinned_index:
+            if compatible_indices is not None and index not in compatible_indices:
                 continue
             if requires_vision and candidate.get("provider") != "gemini":
                 continue
@@ -1750,11 +1794,10 @@ async def pos_chat_completion(
             return None
     else:
         max_attempts = len(_AI_PROVIDER_POOL)
-    if pinned_index is not None:
-        # Once native calls enter the transcript, even a read/discovery call
-        # can carry opaque model-specific signatures. Never fail over this
-        # transcript to a different provider, before or after side effects.
-        max_attempts = 1
+    if compatible_indices is not None:
+        # Credential failover preserves the entire signed transcript; it must
+        # never restart the agent loop or send it to a different model.
+        max_attempts = len(compatible_indices)
 
     attempted: set[int] = set()
     for attempt in range(max_attempts):
@@ -1771,18 +1814,12 @@ async def pos_chat_completion(
                     return None
 
                 if pinned_index is not None:
-                    if (
-                        not 0 <= pinned_index < len(_AI_PROVIDER_POOL)
-                        or _provider_cooldown_remaining(pinned_index) > 0
-                        or (
-                            requires_vision
-                            and _AI_PROVIDER_POOL[pinned_index].get("provider") != "gemini"
-                        )
-                    ):
-                        logger.warning("P.OS toolchain provider is unavailable; continuation stopped.")
-                        note_cooling_retry()
+                    provider_index = await _reserve_toolchain_provider_index(
+                        pinned_index, exclude_indices=frozenset(attempted)
+                    )
+                    if (provider_index is not None and requires_vision
+                            and _AI_PROVIDER_POOL[provider_index].get("provider") != "gemini"):
                         return None
-                    provider_index = pinned_index
                 else:
                     provider_index = (
                         await _reserve_exact_provider_index(
@@ -1797,8 +1834,8 @@ async def pos_chat_completion(
                     eligible_indices = [
                         index
                         for index, candidate in enumerate(_AI_PROVIDER_POOL)
-                        if not requires_vision
-                        or candidate.get("provider") == "gemini"
+                        if (compatible_indices is None or index in compatible_indices)
+                        and (not requires_vision or candidate.get("provider") == "gemini")
                     ]
                     shortest = min(
                         (
@@ -1957,6 +1994,12 @@ async def pos_chat_completion(
                         elif response_status in {408, 409, 425}:
                             await _mark_provider_backoff(provider_index, 10.0, retryable=True)
                             note_retry(_provider_cooldown_remaining(provider_index))
+                        if pinned_index is not None and response_status in {400, 413, 422}:
+                            # Another credential cannot repair a malformed
+                            # signed transcript. Preserve it for diagnostics.
+                            if affinity is not None:
+                                affinity.retry_at = None
+                            return None
                         if attempt < max_attempts - 1:
                             continue
                         return None
@@ -2020,9 +2063,8 @@ async def pos_chat_completion(
                 continue
             return None
         if (
-            affinity is not None and affinity.provider_index is None
-            and provider_index is not None
-            and (msg.get("tool_calls") or msg.get("function_call"))
+            affinity is not None and provider_index is not None
+            and (pinned_index is not None or msg.get("tool_calls") or msg.get("function_call"))
         ):
             affinity.provider_index = provider_index
         if affinity is not None:
