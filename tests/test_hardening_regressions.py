@@ -406,6 +406,7 @@ class PlainReplyTests(unittest.IsolatedAsyncioTestCase):
             get_member=lambda user_id: member if user_id == member.id else None,
         )
         message = SimpleNamespace(
+            id=900000000000000099,
             guild=guild,
             reply=AsyncMock(),
             channel=SimpleNamespace(send=AsyncMock()),

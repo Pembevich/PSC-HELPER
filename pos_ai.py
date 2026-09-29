@@ -4749,14 +4749,19 @@ async def _send_plain_response(message: discord.Message, text: str) -> bool:
         return False
     for index, chunk in enumerate(chunks):
         allowed_mentions = _allowed_user_mentions_for_text(chunk, message.guild)
+        # discord.py sends enforce_nonce=True for an explicit nonce. A stable
+        # source/chunk key also deduplicates delivery across overlapping bot
+        # instances; different chunks and different user messages stay distinct.
+        nonce = f"pos:{message.id:x}:{index:x}"
         if index == 0:
             await message.reply(
                 chunk,
                 mention_author=False,
                 allowed_mentions=allowed_mentions,
+                nonce=nonce,
             )
         else:
-            await message.channel.send(chunk, allowed_mentions=allowed_mentions)
+            await message.channel.send(chunk, allowed_mentions=allowed_mentions, nonce=nonce)
     return True
 
 
