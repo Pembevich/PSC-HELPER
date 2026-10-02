@@ -8,6 +8,7 @@ import discord
 
 from cogs.ai_tools import POS_AI_TOOLS
 from automation_rules import AUTOMATION_READ_TOOLS, AUTOMATION_WRITE_TOOLS
+from beta_access import BETA_ACCESS_READ_TOOLS, BETA_MANAGEMENT_TOOLS
 from discord_capabilities import (
     EXTENDED_CAPABILITY_NAMES,
     execute_extended_capability,
@@ -28,7 +29,8 @@ class ExtendedDiscordToolContractTests(unittest.IsolatedAsyncioTestCase):
             for node in module.body
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_perform_tool_action"
         )
-        handled = set(EXTENDED_CAPABILITY_NAMES) | AUTOMATION_READ_TOOLS | AUTOMATION_WRITE_TOOLS
+        handled = (set(EXTENDED_CAPABILITY_NAMES) | AUTOMATION_READ_TOOLS | AUTOMATION_WRITE_TOOLS
+                   | BETA_ACCESS_READ_TOOLS | BETA_MANAGEMENT_TOOLS)
         for node in ast.walk(performer):
             if not isinstance(node, ast.Compare):
                 continue

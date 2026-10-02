@@ -614,7 +614,7 @@ class ToolExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_list_servers_hides_internal_cache_name(self):
         current_guild = SimpleNamespace(id=1, name="Test", member_count=3)
-        message = SimpleNamespace(guild=current_guild)
+        message = SimpleNamespace(guild=current_guild, author=SimpleNamespace(id=pos_ai.POS_CREATOR_ID))
         bot = SimpleNamespace(guilds=[current_guild], user=None)
 
         result = await pos_ai._perform_tool_action(

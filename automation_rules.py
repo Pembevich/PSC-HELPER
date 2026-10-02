@@ -17,6 +17,7 @@ import discord
 import aiohttp
 
 from config import POS_CREATOR_ID, POS_OWNER_USER_IDS
+from beta_access import beta_can_manage_guild, get_beta_access
 from join_gate import join_token_for_member, wait_for_join_security
 from logging_utils import is_log_channel
 from message_gate import wait_for_moderation
@@ -275,21 +276,45 @@ def _can_read_rule(message: discord.Message, rule: dict) -> bool:
 
 async def execute_automation_tool(bot: Any, message: discord.Message, name: str, args: dict) -> str:
     """No write is permitted on the strength of a model-supplied owner identity."""
-    del bot
     guild = message.guild
     if guild is None:
         return "Ошибка: постоянные автоматизации доступны только на сервере."
-    if name in AUTOMATION_WRITE_TOOLS and message.author.id != POS_CREATOR_ID:
+    source_guild_id = guild.id
+    ident = str(args.get("server_id_or_name") or "").strip()
+    if ident:
+        from pos_ai import _resolve_guild_by_ident
+
+        guild = _resolve_guild_by_ident(bot, ident)
+        if guild is None:
+            return "Ошибка: целевой сервер автоматизации не найден однозначно."
+    is_owner = message.author.id == POS_CREATOR_ID
+    try:
+        access = None if is_owner else await get_beta_access(message.author.id, source_guild_id)
+    except Exception:
+        access = None
+    is_beta = access is not None and access.allows(guild.id)
+    if not is_owner and ident and not is_beta:
+        return "Отказано: целевой сервер автоматизации недоступен в назначенной бета-группе."
+    if name in AUTOMATION_WRITE_TOOLS and not (is_owner or is_beta):
         return "Ошибка: постоянные автоматизации настраивает только владелец P.OS."
     try:
         properties = next(item["function"]["parameters"]["properties"] for item in AUTOMATION_TOOLS if item["function"]["name"] == name)
-        _object(args, set(properties), "Аргументы")
+        _object(args, set(properties) | {"server_id_or_name"}, "Аргументы")
         rule_id = _integer(args["automation_id"], "automation_id", 1, 2**63 - 1) if "automation_id" in args else None
         rules = await storage.list_pos_automations(guild.id)
-        visible = [rule for rule in rules if _can_read_rule(message, rule)]
+        if is_beta:
+            try:
+                access = await get_beta_access(message.author.id, source_guild_id)
+            except Exception:
+                access = None
+            if access is None or not access.allows(guild.id):
+                return "Отказано: бета-доступ отозван или сервер исключён из группы."
+        visible = [rule for rule in rules if is_beta or _can_read_rule(message, rule)]
         existing = next((rule for rule in visible if rule["id"] == rule_id), None)
-        if rule_id is not None and existing is None and not (name == "automation_runs" and message.author.id == POS_CREATOR_ID):
+        if rule_id is not None and existing is None and not (name == "automation_runs" and is_owner):
             return "Ошибка: автоматизация с этим ID не найдена или недоступна на этом сервере."
+        if name in AUTOMATION_WRITE_TOOLS and existing is not None and not is_owner and existing["owner_id"] != message.author.id:
+            return "Отказано: бета-администратор может менять только свои автоматизации."
         if name == "list_automations":
             if existing:
                 return _json(existing)
@@ -299,8 +324,15 @@ async def execute_automation_tool(bot: Any, message: discord.Message, name: str,
         if name == "automation_runs":
             limit = _integer(args.get("limit", 10), "limit", 1, 20)
             runs = await storage.list_pos_automation_runs(guild.id, automation_id=rule_id, limit=limit)
+            if is_beta:
+                try:
+                    access = await get_beta_access(message.author.id, source_guild_id)
+                except Exception:
+                    access = None
+                if access is None or not access.allows(guild.id):
+                    return "Отказано: бета-доступ отозван или сервер исключён из группы."
             visible_ids = {rule["id"] for rule in visible}
-            return _json({"runs": [run for run in runs if message.author.id == POS_CREATOR_ID or run["automation_id"] in visible_ids]})
+            return _json({"runs": [run for run in runs if is_owner or run["automation_id"] in visible_ids]})
         if name == "delete_automation":
             if rule_id is None:
                 raise ValueError("Требуется automation_id.")
@@ -310,14 +342,14 @@ async def execute_automation_tool(bot: Any, message: discord.Message, name: str,
             raise ValueError("Неизвестный инструмент автоматизации.")
         if name == "update_automation" and existing is None:
             raise ValueError("Требуется automation_id существующего правила.")
-        if existing is not None and name == "update_automation" and set(args) == {"automation_id", "enabled"} and args["enabled"] is False:
+        if existing is not None and name == "update_automation" and set(args) - {"server_id_or_name"} == {"automation_id", "enabled"} and args["enabled"] is False:
             # A broken destination/removed role must never prevent stopping a
             # rule. Resuming still validates all live Discord resources below.
             stopped = await storage.set_pos_automation_enabled(guild.id, existing["id"], False)
             return _json({"status": "paused", "automation_id": rule_id}) if stopped else "Ошибка: правило уже удалено."
         merged = ({"name": existing["name"], "trigger_events": existing["trigger_events"],
                    "channel_id": str(existing["channel_id"]), **existing["definition"]} if existing else {})
-        merged.update({key: value for key, value in args.items() if key not in {"automation_id", "enabled"}})
+        merged.update({key: value for key, value in args.items() if key not in {"automation_id", "enabled", "server_id_or_name"}})
         rule_name = _text(merged.get("name"), 100, "name", required=True).strip()
         triggers, channel_id, definition = normalize_workflow(guild, message.channel, merged)
         enabled = args.get("enabled", existing["enabled"] if existing else True)
@@ -325,7 +357,8 @@ async def execute_automation_tool(bot: Any, message: discord.Message, name: str,
             raise ValueError("enabled должен быть boolean.")
         if name == "create_automation" and any(rule["name"].casefold() == rule_name.casefold() for rule in rules):
             raise ValueError("Правило с таким именем уже существует. Прочитай его ID и используй update_automation.")
-        rule = await storage.upsert_pos_automation(guild.id, POS_CREATOR_ID, rule_name, triggers, channel_id, definition,
+        rule_owner = existing["owner_id"] if existing is not None else message.author.id
+        rule = await storage.upsert_pos_automation(guild.id, rule_owner, rule_name, triggers, channel_id, definition,
                                                   automation_id=rule_id, enabled=enabled)
         return _json({"status": "created" if existing is None else "updated", "automation": rule})
     except (ValueError, TypeError, KeyError, StopIteration) as exc:
@@ -450,7 +483,8 @@ class AutomationRuntime:
             self._active.add(task)
         try:
             rules = await storage.list_pos_automations(guild.id, enabled_only=True, trigger_event=event)
-            rules = [rule for rule in rules if rule["owner_id"] == POS_CREATOR_ID and _matches(rule, event, member, message)]
+            rules = [rule for rule in rules if _matches(rule, event, member, message)
+                     and (rule["owner_id"] == POS_CREATOR_ID or await beta_can_manage_guild(rule["owner_id"], guild.id))]
             if not rules:
                 return
             if event == "message_create" and await wait_for_moderation(message.id) is not False:
@@ -484,7 +518,8 @@ class AutomationRuntime:
             for index, action in enumerate(actions):
                 # Disabling/deleting a rule also stops a previously queued chain.
                 live = await storage.list_pos_automations(member.guild.id, enabled_only=True)
-                if self._closing or not any(item["id"] == rule["id"] and item["revision"] == rule["revision"] for item in live):
+                authorized = rule["owner_id"] == POS_CREATOR_ID or await beta_can_manage_guild(rule["owner_id"], member.guild.id)
+                if self._closing or not authorized or not any(item["id"] == rule["id"] and item["revision"] == rule["revision"] for item in live):
                     results.append({"step": index + 1, "status": "skipped", "reason": "Правило остановлено или изменено."})
                     status = "partial" if results[:-1] else "skipped"
                     break
@@ -492,7 +527,7 @@ class AutomationRuntime:
                     results.append({"step": index + 1, "status": "skipped", "reason": "Антирейд не разрешил изменение ролей."})
                     status = "partial" if results[:-1] else "skipped"
                     break
-                result = await asyncio.wait_for(self._execute_action(member, action, rule["id"]), timeout=60)
+                result = await asyncio.wait_for(self._execute_action(member, action, rule["id"], actor_id=rule["owner_id"]), timeout=60)
                 results.append({"step": index + 1, "action": action["type"], "status": "completed", **result})
         except asyncio.CancelledError:
             status = "unknown"
@@ -509,13 +544,15 @@ class AutomationRuntime:
         finally:
             await storage.finish_pos_automation_run(run_id, status=status, result={"event": event, "steps": results})
 
-    async def _execute_action(self, member: Any, action: dict, automation_id: int) -> dict:
+    async def _execute_action(self, member: Any, action: dict, automation_id: int, *, actor_id: int = POS_CREATOR_ID) -> dict:
         guild = member.guild
         if action["type"] == "send_message":
             channel = guild.get_channel_or_thread(int(action["channel_id"]))
             if channel is None:
                 raise ValueError("Канал автоматизации удалён или недоступен.")
             _check_channel(channel, guild, embed="embed" in action)
+            if actor_id != POS_CREATOR_ID and not await beta_can_manage_guild(actor_id, guild.id):
+                raise ValueError("Бета-доступ автора автоматизации отозван.")
             sent = await channel.send(content=action.get("content") or None, embed=action.get("embed"), allowed_mentions=discord.AllowedMentions.none())
             return {"channel_id": channel.id, "message_id": sent.id}
         role = guild.get_role(int(action["role_id"]))
@@ -529,8 +566,10 @@ class AutomationRuntime:
         desired = action["type"] == "add_role"
         if has_role == desired:
             return {"member_id": target.id, "role_id": role.id, "unchanged": True}
+        if actor_id != POS_CREATOR_ID and not await beta_can_manage_guild(actor_id, guild.id):
+            raise ValueError("Бета-доступ автора автоматизации отозван.")
         if desired:
-            await target.add_roles(role, reason=f"P.OS automation {automation_id}; owner {POS_CREATOR_ID}")
+            await target.add_roles(role, reason=f"P.OS automation {automation_id}; owner {actor_id}")
         else:
-            await target.remove_roles(role, reason=f"P.OS automation {automation_id}; owner {POS_CREATOR_ID}")
+            await target.remove_roles(role, reason=f"P.OS automation {automation_id}; owner {actor_id}")
         return {"member_id": target.id, "role_id": role.id}

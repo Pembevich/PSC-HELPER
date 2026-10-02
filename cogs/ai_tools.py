@@ -1,4 +1,5 @@
 from automation_rules import AUTOMATION_TOOLS
+from beta_access import BETA_TOOLS
 
 
 POS_AI_TOOLS = [
@@ -1388,7 +1389,7 @@ def _inject_cross_server_param(tools: list) -> None:
                 "server_id_or_name",
                 {
                     "type": "string",
-                    "description": "Необязательно. Сервер (ID или имя), на котором выполнить действие. Если не указан — текущий. Для Пумбы выполняется сразу; запрос другого участника на другой сервер ждёт подтверждения Пумбы.",
+                    "description": "Необязательно. Сервер (ID или имя), на котором выполнить действие. Если не указан — текущий. Пумба действует напрямую; назначенный бета-администратор — только внутри своей группы серверов; остальные ждут подтверждения Пумбы.",
                 },
             )
 
@@ -1466,3 +1467,7 @@ def _harden_tool_schemas(tools: list) -> None:
 
 _harden_tool_schemas(POS_AI_TOOLS)
 POS_AI_TOOLS.extend(AUTOMATION_TOOLS)
+POS_AI_TOOLS.extend(BETA_TOOLS)
+_CROSS_SERVER_TOOLS.update(tool["function"]["name"] for tool in AUTOMATION_TOOLS)
+_inject_cross_server_param(POS_AI_TOOLS)
+_harden_tool_schemas(POS_AI_TOOLS)

@@ -19,3 +19,4 @@ AGENTS.md
 .codex/
 plugins/
 skills-lock.json
+/railway-backup-*.local.json

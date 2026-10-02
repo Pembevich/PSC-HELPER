@@ -93,6 +93,142 @@ async def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         await _init_db_unlocked(db_path)
 
 
+def _beta_group_id(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[a-z0-9_-]{1,64}", value):
+        raise ValueError("group_id: нужны 1–64 символа a-z, 0-9, _ или -.")
+    return value
+
+
+def _beta_snowflake(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError("Нужен точный числовой Discord ID.")
+    if not re.fullmatch(r"[0-9]{1,19}", str(value)) or not 0 < int(value) < 2**63:
+        raise ValueError("Нужен точный положительный Discord ID.")
+    return int(value)
+
+
+def _require_beta_owner(actor_id: int) -> None:
+    from config import POS_CREATOR_ID
+
+    if actor_id != POS_CREATOR_ID:
+        raise PermissionError("Бета-доступ назначает только Пумба по реальному Discord ID.")
+
+
+async def list_beta_server_groups(
+    actor_id: int, db_path: str = DEFAULT_DB_PATH,
+) -> list[dict[str, Any]]:
+    """Read one committed ACL snapshot; non-owners see only their own grants."""
+    from config import POS_CREATOR_ID
+
+    actor_id = _beta_snowflake(actor_id)
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        cursor = await conn.execute(
+            "SELECT group_id, name FROM pos_beta_groups WHERE ? = ? OR group_id IN "
+            "(SELECT group_id FROM pos_beta_administrators WHERE user_id = ?) ORDER BY group_id",
+            (actor_id, POS_CREATOR_ID, actor_id),
+        )
+        groups = {row[0]: {"group_id": row[0], "name": row[1], "server_ids": [],
+                           "administrator_ids": []} for row in await cursor.fetchall()}
+        cursor = await conn.execute("SELECT group_id, guild_id FROM pos_beta_group_guilds ORDER BY guild_id")
+        for group_id, guild_id in await cursor.fetchall():
+            if group_id in groups:
+                groups[group_id]["server_ids"].append(str(guild_id))
+        cursor = await conn.execute(
+            "SELECT group_id, user_id FROM pos_beta_administrators "
+            "WHERE ? = ? OR user_id = ? ORDER BY user_id", (actor_id, POS_CREATOR_ID, actor_id),
+        )
+        for group_id, user_id in await cursor.fetchall():
+            if group_id in groups:
+                groups[group_id]["administrator_ids"].append(str(user_id))
+        return list(groups.values())
+
+
+async def save_beta_server_group(
+    group_id: str, name: str, server_ids: list[str], *, actor_id: int,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    _require_beta_owner(actor_id)
+    group_id = _beta_group_id(group_id)
+    if not isinstance(name, str) or not name.strip() or len(name) > 100:
+        raise ValueError("Название группы должно содержать 1–100 символов.")
+    if not isinstance(server_ids, list) or not 1 <= len(server_ids) <= 50:
+        raise ValueError("Нужен список от 1 до 50 ID серверов.")
+    if any(not isinstance(value, str) for value in server_ids):
+        raise ValueError("Каждый ID сервера должен быть точной числовой строкой.")
+    guild_ids = [_beta_snowflake(value) for value in server_ids]
+    if len(set(guild_ids)) != len(guild_ids):
+        raise ValueError("ID серверов не должны повторяться.")
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        try:
+            await conn.execute(
+                "INSERT INTO pos_beta_groups(group_id, name, updated_by, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(group_id) DO UPDATE SET name=excluded.name, "
+                "updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+                (group_id, name.strip(), actor_id, int(time.time())),
+            )
+            await conn.execute("DELETE FROM pos_beta_group_guilds WHERE group_id = ?", (group_id,))
+            await conn.executemany(
+                "INSERT INTO pos_beta_group_guilds(group_id, guild_id) VALUES (?, ?)",
+                [(group_id, guild_id) for guild_id in guild_ids],
+            )
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
+
+
+async def delete_beta_server_group(
+    group_id: str, *, actor_id: int, db_path: str = DEFAULT_DB_PATH,
+) -> bool:
+    _require_beta_owner(actor_id)
+    group_id = _beta_group_id(group_id)
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        try:
+            await conn.execute("DELETE FROM pos_beta_administrators WHERE group_id = ?", (group_id,))
+            await conn.execute("DELETE FROM pos_beta_group_guilds WHERE group_id = ?", (group_id,))
+            cursor = await conn.execute("DELETE FROM pos_beta_groups WHERE group_id = ?", (group_id,))
+            await conn.commit()
+            return cursor.rowcount > 0
+        except BaseException:
+            await conn.rollback()
+            raise
+
+
+async def set_beta_administrator(
+    group_id: str, user_id: str, enabled: bool, *, actor_id: int,
+    db_path: str = DEFAULT_DB_PATH,
+) -> bool:
+    _require_beta_owner(actor_id)
+    group_id, member_id = _beta_group_id(group_id), _beta_snowflake(user_id)
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled должен быть boolean.")
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        try:
+            cursor = await conn.execute("SELECT 1 FROM pos_beta_groups WHERE group_id = ?", (group_id,))
+            if await cursor.fetchone() is None:
+                raise ValueError("Группа с таким group_id не существует.")
+            if enabled:
+                cursor = await conn.execute(
+                    "INSERT INTO pos_beta_administrators(group_id, user_id, granted_by, granted_at) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT(group_id, user_id) DO NOTHING",
+                    (group_id, member_id, actor_id, int(time.time())),
+                )
+            else:
+                cursor = await conn.execute(
+                    "DELETE FROM pos_beta_administrators WHERE group_id = ? AND user_id = ?",
+                    (group_id, member_id),
+                )
+            await conn.commit()
+            return cursor.rowcount > 0
+        except BaseException:
+            await conn.rollback()
+            raise
+
+
 async def _init_db_unlocked(db_path: str) -> None:
     conn = await _get_conn(db_path)
     await conn.execute("""
@@ -252,6 +388,36 @@ async def _init_db_unlocked(db_path: str) -> None:
             decided_at INTEGER NOT NULL
         )
     """)
+    # Beta administration grants are independent of Discord roles and model
+    # context. All three tables travel with the existing SQLite backup.
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS pos_beta_groups (
+            group_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            updated_by INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS pos_beta_group_guilds (
+            group_id TEXT NOT NULL,
+            guild_id INTEGER NOT NULL,
+            PRIMARY KEY (group_id, guild_id)
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS pos_beta_administrators (
+            group_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            granted_by INTEGER NOT NULL,
+            granted_at INTEGER NOT NULL,
+            PRIMARY KEY (group_id, user_id)
+        )
+    """)
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pos_beta_actor "
+        "ON pos_beta_administrators(user_id, group_id)"
+    )
     # Rules and their delivery ledger share the backed-up database. A reserved
     # run is deliberately never retried: Discord may have accepted its action
     # before the process stopped without recording the response.
